@@ -1,30 +1,41 @@
 import { Redis } from "ioredis";
 import "dotenv/config";
 
-// Create Redis client
-const redis = new Redis({
-  host: process.env.REDIS_HOST || "localhost",
-  port: parseInt(process.env.REDIS_PORT || "6379"),
-  password: process.env.REDIS_PASSWORD,
-  lazyConnect: true,
-});
+const REDIS_ENABLED = !!(process.env.REDIS_HOST || process.env.REDIS_URL);
 
-redis.on("error", (err) => {
-  console.error("Redis Client Error:", err);
-});
+let redis: Redis | null = null;
 
-redis.on("connect", () => {
-  console.log("✅ Redis connected");
-});
+if (REDIS_ENABLED) {
+  redis = process.env.REDIS_URL
+    ? new Redis(process.env.REDIS_URL, { lazyConnect: true })
+    : new Redis({
+        host: process.env.REDIS_HOST || "localhost",
+        port: parseInt(process.env.REDIS_PORT || "6379"),
+        password: process.env.REDIS_PASSWORD,
+        lazyConnect: true,
+      });
 
-// Connect on first use
+  redis.on("error", (err) => {
+    console.error("Redis Client Error:", err);
+  });
+
+  redis.on("connect", () => {
+    console.log("✅ Redis connected");
+  });
+} else {
+  console.log("ℹ️ Redis not configured — caching disabled");
+}
+
 const connectRedis = async () => {
+  if (!redis) return false;
   try {
     if (!redis.status || redis.status === "end") {
       await redis.connect();
     }
+    return true;
   } catch (error) {
     console.error("Redis connection error:", error);
+    return false;
   }
 };
 
@@ -36,8 +47,10 @@ export const cache = {
    * Get cached value
    */
   async get<T>(key: string): Promise<T | null> {
+    if (!redis) return null;
     try {
-      await connectRedis();
+      const connected = await connectRedis();
+      if (!connected) return null;
       const value = await redis.get(key);
       return value ? JSON.parse(value) : null;
     } catch (error) {
@@ -50,8 +63,10 @@ export const cache = {
    * Set cached value with TTL (default 1 hour)
    */
   async set(key: string, value: any, ttl: number = 3600): Promise<void> {
+    if (!redis) return;
     try {
-      await connectRedis();
+      const connected = await connectRedis();
+      if (!connected) return;
       await redis.setex(key, ttl, JSON.stringify(value));
     } catch (error) {
       console.error("Cache set error:", error);
@@ -62,8 +77,10 @@ export const cache = {
    * Delete cached value
    */
   async del(key: string): Promise<void> {
+    if (!redis) return;
     try {
-      await connectRedis();
+      const connected = await connectRedis();
+      if (!connected) return;
       await redis.del(key);
     } catch (error) {
       console.error("Cache delete error:", error);
@@ -74,8 +91,10 @@ export const cache = {
    * Delete multiple cached values by pattern
    */
   async delPattern(pattern: string): Promise<void> {
+    if (!redis) return;
     try {
-      await connectRedis();
+      const connected = await connectRedis();
+      if (!connected) return;
       const keys = await redis.keys(pattern);
       if (keys.length > 0) {
         await redis.del(...keys);
@@ -102,8 +121,8 @@ export const cache = {
     // Fetch fresh data
     const fresh = await fetcher();
 
-    // Cache it
-    await this.set(key, fresh, ttl);
+    // Cache it (fire-and-forget)
+    this.set(key, fresh, ttl);
 
     return fresh;
   },
@@ -160,4 +179,3 @@ export const cacheInvalidate = {
 };
 
 export default redis;
-

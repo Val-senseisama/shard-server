@@ -91,26 +91,24 @@ export default {
         };
       }
 
-      // Invalidate cache
-      await cacheInvalidate.friendship(context.id, friendId);
+      // Fire-and-forget: cache, notifications, audit trail
+      cacheInvalidate.friendship(context.id, friendId).catch((e) => logError("sendFriendRequest:cacheInvalidate", e));
 
-      // Send notification to the friend
-      await createNotification(
+      createNotification(
         friendId,
         `${friend.username} wants to be friends with you`,
         "friend_request"
-      );
+      ).catch((e) => logError("sendFriendRequest:createNotification", e));
 
-      // Send Push Notification
-      await sendNotificationToUser(
+      sendNotificationToUser(
         friendId,
         {
           title: "New Friend Request",
           body: `${friend.username} wants to be friends with you!`,
           data: { screen: "/(screens)/friends" }
         },
-        'friendRequests' // Check friend request notification preferences
-      );
+        'friendRequests'
+      ).catch((e) => logError("sendFriendRequest:pushNotification", e));
 
       SaveAuditTrail({
         userId: context.id,
