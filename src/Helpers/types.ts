@@ -9,7 +9,12 @@ export type AuditTrailType = {
 };
 
 export type LogType = {
-  task?: string;
+  task: string;
+  resolver?: string;
   errorMessage: string;
+  stack?: string;
+  userId?: string;
+  severity: "low" | "medium" | "high" | "critical";
+  metadata?: Record<string, any>;
   timestamp: string;
 };

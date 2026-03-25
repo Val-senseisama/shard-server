@@ -15,24 +15,81 @@ setInterval(() => {
   commitMemory();
 }, 1 * 60 * 1000);
 
-// Function to log messages.
-export const logError = async (task: string, msg: any): Promise<void> => {
-  // If the message is not a string, convert it to a string.
-  if (typeof msg != "string") msg = JSON.stringify(msg, null, 2);
+// ─── Error Logging ──────────────────────────────────────────────────
+
+interface LogErrorOptions {
+  resolver?: string;
+  userId?: string;
+  severity?: "low" | "medium" | "high" | "critical";
+  metadata?: Record<string, any>;
+}
+
+export const logError = async (
+  task: string,
+  err: any,
+  options?: LogErrorOptions
+): Promise<void> => {
+  const errorMessage =
+    err instanceof Error
+      ? err.message
+      : typeof err === "string"
+        ? err
+        : JSON.stringify(err, null, 2);
+
+  const stack = err instanceof Error ? err.stack : undefined;
 
   const now = DateTime.now().toSQL();
-  // Add the log to the log cache.
+
   logCache.push({
-    task: task,
-    errorMessage: msg,
+    task,
+    resolver: options?.resolver,
+    errorMessage,
+    stack,
+    userId: options?.userId,
+    severity: options?.severity || "medium",
+    metadata: options?.metadata,
     timestamp: now,
   });
 
-  // If the log cache exceeds the maximum stack size, commit memory.
+  // Also log to console for dev visibility
+  console.error(`[${options?.severity || "medium"}] ${task}:`, errorMessage);
+  if (stack) console.error(stack);
+
   if (logCache.length > 3) {
     commitMemory();
   }
 };
+
+// Wraps a resolver function with automatic error logging + context
+export function withErrorLogging(resolverName: string, fn: Function) {
+  return async (_: any, args: any, context: any, info: any) => {
+    try {
+      return await fn(_, args, context, info);
+    } catch (error: any) {
+      logError(resolverName, error, {
+        resolver: resolverName,
+        userId: context?.id,
+        severity: "high",
+        metadata: { args: sanitizeArgs(args) },
+      });
+      throw error;
+    }
+  };
+}
+
+// Strip sensitive fields (passwords, tokens) before logging args
+function sanitizeArgs(args: any): any {
+  if (!args || typeof args !== "object") return args;
+  const sanitized = { ...args };
+  const sensitive = ["password", "currentPassword", "newPassword", "token", "idToken", "accessToken", "refreshToken"];
+  for (const key of sensitive) {
+    if (key in sanitized) sanitized[key] = "[REDACTED]";
+  }
+  if (sanitized.input && typeof sanitized.input === "object") {
+    sanitized.input = sanitizeArgs(sanitized.input);
+  }
+  return sanitized;
+}
 
 // Function to commit memory (save logs and audit trails) to the database.
 async function commitMemory(): Promise<void> {

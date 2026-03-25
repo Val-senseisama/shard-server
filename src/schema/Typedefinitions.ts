@@ -268,8 +268,8 @@ export default `#graphql
     owner: ShardOwner
     minigoals: [MiniGoal!]!
     chatId: ID
-    isPrivate: Boolean!
-    isAnonymous: Boolean!
+    isPrivate: Boolean
+    isAnonymous: Boolean
     version: Int!
   }
 

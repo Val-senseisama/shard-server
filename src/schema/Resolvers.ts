@@ -11,16 +11,17 @@ import PushNotificationResolvers from "./resolvers/PushNotifications.js";
 import ReportResolvers from "./resolvers/Report.js";
 import SupportResolvers from "./resolvers/Support.js";
 import { GraphQLScalarType, Kind } from "graphql";
+import { withErrorLogging } from "../Helpers/Helpers.js";
 
 // Custom JSON scalar resolver
 const JSONScalar = new GraphQLScalarType({
     name: "JSON",
     description: "JSON scalar type",
     serialize(value) {
-        return value; // Send to client as-is
+        return value;
     },
     parseValue(value) {
-        return value; // Receive from client as-is
+        return value;
     },
     parseLiteral(ast) {
         if (ast.kind === Kind.OBJECT) {
@@ -30,33 +31,50 @@ const JSONScalar = new GraphQLScalarType({
     },
 });
 
+// Wraps every resolver function in a group with withErrorLogging
+function wrapResolvers(group: Record<string, Function>, prefix: string): Record<string, Function> {
+    const wrapped: Record<string, Function> = {};
+    for (const [name, fn] of Object.entries(group)) {
+        if (typeof fn === "function") {
+            wrapped[name] = withErrorLogging(`${prefix}.${name}`, fn);
+        } else {
+            wrapped[name] = fn;
+        }
+    }
+    return wrapped;
+}
+
+const allQueries: Record<string, Function> = {
+    ...UserResolvers.Query,
+    ...ShardResolvers.Query,
+    ...FriendshipResolvers.Query,
+    ...ChatResolvers.Query,
+    ...XPResolvers.Query,
+    ...ChallengeResolvers.Query,
+    ...SideQuestResolvers.Query,
+    ...AnalyticsResolvers.Query,
+    ...NotificationResolvers.Query,
+    ...ReportResolvers.Query,
+    ...SupportResolvers.Query,
+};
+
+const allMutations: Record<string, Function> = {
+    ...UserResolvers.Mutation,
+    ...ShardResolvers.Mutation,
+    ...FriendshipResolvers.Mutation,
+    ...ChatResolvers.Mutation,
+    ...XPResolvers.Mutation,
+    ...ChallengeResolvers.Mutation,
+    ...SideQuestResolvers.Mutation,
+    ...AnalyticsResolvers.Mutation,
+    ...NotificationResolvers.Mutation,
+    ...PushNotificationResolvers.Mutation,
+    ...ReportResolvers.Mutation,
+    ...SupportResolvers.Mutation,
+};
+
 export default {
     JSON: JSONScalar,
-    Query: {
-        ...UserResolvers.Query,
-        ...ShardResolvers.Query,
-        ...FriendshipResolvers.Query,
-        ...ChatResolvers.Query,
-        ...XPResolvers.Query,
-        ...ChallengeResolvers.Query,
-        ...SideQuestResolvers.Query,
-        ...AnalyticsResolvers.Query,
-        ...NotificationResolvers.Query,
-        ...ReportResolvers.Query,
-        ...SupportResolvers.Query,
-    },
-    Mutation: {
-        ...UserResolvers.Mutation,
-        ...ShardResolvers.Mutation,
-        ...FriendshipResolvers.Mutation,
-        ...ChatResolvers.Mutation,
-        ...XPResolvers.Mutation,
-        ...ChallengeResolvers.Mutation,
-        ...SideQuestResolvers.Mutation,
-        ...AnalyticsResolvers.Mutation,
-        ...NotificationResolvers.Mutation,
-        ...PushNotificationResolvers.Mutation,
-        ...ReportResolvers.Mutation,
-        ...SupportResolvers.Mutation,
-    },
+    Query: wrapResolvers(allQueries, "Query"),
+    Mutation: wrapResolvers(allMutations, "Mutation"),
 };
