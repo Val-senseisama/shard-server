@@ -32,6 +32,7 @@ export default `#graphql
     # XP & Progression queries
     getXP: XPResponse!
     getStreaks: StreaksResponse!
+    getAchievements: AchievementsResponse!
     
     # Challenge queries
     myChallenges: ChallengesResponse!
@@ -81,7 +82,8 @@ export default `#graphql
     removeShardParticipant(shardId: ID!, userId: ID!): MessageResponse!
     assignMiniGoal(miniGoalId: ID!, userId: ID!): MessageResponse!
     completeMiniGoal(miniGoalId: ID!): CompleteMiniGoalResponse!
-    generateWeeklyTasks(miniGoalId: ID!, weekNumber: Int!, action: String): GenerateTasksResponse!
+    scheduleTasks(shardId: ID!): GenerateTasksResponse!
+    generateWeeklyTasks(miniGoalId: ID!, weekNumber: Int, action: String): GenerateTasksResponse!
     deleteTask(miniGoalId: ID!, taskTitle: String!): MessageResponse!
     restoreTask(miniGoalId: ID!, taskTitle: String!): MessageResponse!
     
@@ -105,6 +107,7 @@ export default `#graphql
     
     # XP mutations
     completeTask(shardId: ID!, miniGoalId: ID!, taskIndex: Int!): CompleteTaskResponse!
+    clearPendingAchievements: MessageResponse!
     
     # Challenge mutations
     createChallenge(input: CreateChallengeInput!): ChallengeResponse!
@@ -270,7 +273,7 @@ export default `#graphql
     chatId: ID
     isPrivate: Boolean
     isAnonymous: Boolean
-    version: Int!
+    version: Int
   }
 
   type ShardProgress {
@@ -286,6 +289,8 @@ export default `#graphql
 
   type Participant {
     user: String!
+    username: String
+    profilePic: String
     role: String!
   }
 
@@ -577,6 +582,22 @@ export default `#graphql
     xpNeeded: Int!
     achievements: [String!]!
     pendingAchievements: [String!]!
+  }
+
+  type AchievementDetail {
+    id: String!
+    name: String!
+    description: String!
+    icon: String!
+    category: String!
+    rarity: String!
+    earned: Boolean!
+    pending: Boolean!
+  }
+
+  type AchievementsResponse {
+    success: Boolean!
+    achievements: [AchievementDetail!]!
   }
 
   type StreakInfo {
@@ -901,5 +922,207 @@ export default `#graphql
   type ReactionData {
     userId: ID!
     emoji: String!
+  }
+
+  # ─── Admin ────────────────────────────────────────────────────────────────
+
+  extend type Query {
+    # Admin — Dashboard
+    adminDashboard: AdminDashboardResponse!
+
+    # Admin — User Management
+    adminListUsers(search: String, page: Int, limit: Int): AdminUsersResponse!
+    adminGetUser(userId: ID!): AdminUserDetailResponse!
+
+    # Admin — Reports
+    adminGetReports(status: String, page: Int, limit: Int): AdminReportsResponse!
+
+    # Admin — Support
+    adminGetSupportFlags(status: String, priority: String, page: Int, limit: Int): AdminSupportFlagsResponse!
+
+    # Admin — Audit Trail
+    adminGetAuditTrail(userId: ID, page: Int, limit: Int): AdminAuditResponse!
+
+    # Admin — Shards
+    adminGetShardOverview(status: String, page: Int, limit: Int): AdminShardsResponse!
+  }
+
+  extend type Mutation {
+    # Admin OTP login
+    requestAdminOtp(email: String!): MessageResponse!
+    verifyAdminOtp(email: String!, otp: String!): AuthResponse!
+
+    # Admin — User Management
+    adminUpdateUser(userId: ID!, input: AdminUpdateUserInput!): AdminUpdateUserResponse!
+  }
+
+  input AdminUpdateUserInput {
+    isActive: Boolean
+    role: String
+    strength: Int
+    intelligence: Int
+    charisma: Int
+    endurance: Int
+    creativity: Int
+    xp: Int
+    level: Int
+    aiCredits: Int
+    forceLogout: Boolean
+  }
+
+  type AdminDashboardResponse {
+    success: Boolean!
+    totalUsers: Int!
+    activeToday: Int!
+    totalShards: Int!
+    shardsCreatedToday: Int!
+    pendingReports: Int!
+    openSupportFlags: Int!
+    bannedUsers: Int!
+    totalXPEarned: Float!
+  }
+
+  type AdminUserSummary {
+    id: ID!
+    username: String!
+    email: String!
+    role: String!
+    isActive: Boolean!
+    xp: Int!
+    level: Int!
+    currentStreak: Int!
+    subscriptionTier: String
+    lastLoginAt: String
+    createdAt: String!
+  }
+
+  type AdminUsersResponse {
+    success: Boolean!
+    total: Int!
+    page: Int!
+    limit: Int!
+    users: [AdminUserSummary!]!
+  }
+
+  type AdminUserDetail {
+    id: ID!
+    username: String!
+    email: String!
+    profilePic: String
+    bio: String
+    role: String!
+    isActive: Boolean!
+    emailVerified: Boolean!
+    authProvider: String!
+    xp: Int!
+    level: Int!
+    aiCredits: Int!
+    strength: Int!
+    intelligence: Int!
+    charisma: Int!
+    endurance: Int!
+    creativity: Int!
+    currentStreak: Int!
+    longestStreak: Int!
+    subscriptionTier: String
+    achievements: [String!]!
+    lastLoginAt: String
+    createdAt: String!
+  }
+
+  type AdminUserDetailResponse {
+    success: Boolean!
+    message: String
+    user: AdminUserDetail
+  }
+
+  type AdminUpdateUserResponse {
+    success: Boolean!
+    message: String!
+    user: UserInfo
+  }
+
+  type AdminReportData {
+    id: ID!
+    reporter: UserInfo
+    reportedUser: UserInfo
+    reason: String!
+    details: String
+    status: String!
+    resolution: String
+    reportedItemType: String
+    createdAt: String!
+    reviewedAt: String
+  }
+
+  type AdminReportsResponse {
+    success: Boolean!
+    total: Int!
+    page: Int!
+    limit: Int!
+    reports: [AdminReportData!]!
+  }
+
+  type AdminSupportUserInfo {
+    id: ID!
+    username: String!
+    email: String
+  }
+
+  type AdminSupportFlagData {
+    id: ID!
+    user: AdminSupportUserInfo
+    title: String!
+    issueType: String!
+    priority: String!
+    status: String!
+    description: String
+    resolution: String
+    createdAt: String!
+    updatedAt: String!
+  }
+
+  type AdminSupportFlagsResponse {
+    success: Boolean!
+    total: Int!
+    page: Int!
+    limit: Int!
+    flags: [AdminSupportFlagData!]!
+  }
+
+  type AuditEntry {
+    id: ID!
+    userId: String!
+    task: String!
+    details: String!
+    createdAt: String!
+  }
+
+  type AdminAuditResponse {
+    success: Boolean!
+    total: Int!
+    page: Int!
+    limit: Int!
+    entries: [AuditEntry!]!
+  }
+
+  type AdminShardSummary {
+    id: ID!
+    title: String!
+    status: String!
+    completion: Int!
+    isPrivate: Boolean!
+    isAnonymous: Boolean!
+    owner: UserInfo
+    createdAt: String!
+    endDate: String
+  }
+
+  type AdminShardsResponse {
+    success: Boolean!
+    total: Int!
+    page: Int!
+    limit: Int!
+    shards: [AdminShardSummary!]!
   }
 `;

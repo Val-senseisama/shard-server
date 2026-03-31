@@ -10,6 +10,7 @@ import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
 import { createNotification } from "./Notifications.js";
 import { sendNotificationToUser } from "../../Helpers/FirebaseMessaging.js";
 import { isUserOnline } from "../../server/WebSocketServer.js";
+import { checkAchievements } from "./XP.js";
 
 export default {
   Mutation: {
@@ -186,6 +187,10 @@ export default {
         task: "Accepted Friend Request",
         details: `Accepted friend request from ${friendId}`,
       });
+
+      // Check achievements for both sides (fire-and-forget)
+      checkAchievements(context.id).catch(() => {});
+      checkAchievements(friendId).catch(() => {});
 
       return {
         success: true,

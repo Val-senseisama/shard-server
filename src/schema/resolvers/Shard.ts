@@ -8,14 +8,97 @@ import Shard from "../../models/Shard.js";
 import MiniGoal from "../../models/MiniGoal.js";
 import Chat from "../../models/Chat.js";
 import { User } from "../../models/User.js";
-import { breakDownGoalWithAI, checkAIUsage, trackAIUsage, enrichManualShard, generateWeeklyTasks, generateReflectionMission } from "../../Helpers/AIHelper.js";
+import { breakDownGoalWithAI, checkAIUsage, trackAIUsage, enrichManualShard, generateReflectionMission } from "../../Helpers/AIHelper.js";
 import SideQuest from "../../models/SideQuest.js";
 import { createNotification } from "./Notifications.js";
 import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
 import { awardXP, checkAchievements } from "./XP.js";
 import { getCloudinarySignedUpload } from "../../Helpers/Cloudinary.js";
-import { calculateDueDate, distributeDatesEvenly } from "../../Helpers/DateHelper.js";
+import { calculateDueDate, distributeDatesEvenly, smartSchedule, SchedulableTask } from "../../Helpers/DateHelper.js";
 import { sendNotificationToUsers, sendNotificationToUser } from "../../Helpers/FirebaseMessaging.js";
+
+// ─── Standalone schedule helper (called by both scheduleTasks + generateWeeklyTasks) ───
+
+async function _scheduleShardTasks(shardId: string, userId: string) {
+  if (!userId) ThrowError("Please login to continue.");
+
+  const [shardError, shard] = await catchError(Shard.findById(shardId).lean());
+  if (shardError || !shard) return { success: false, message: "Quest not found." };
+
+  const isOwner = shard.owner.toString() === userId;
+  const isParticipant = shard.participants.some((p: any) => p.user.toString() === userId);
+  if (!isOwner && !isParticipant) return { success: false, message: "You don't have access to this quest." };
+
+  const [mgError, miniGoals] = await catchError(
+    MiniGoal.find({ shardId, completed: false }).sort({ createdAt: 1 })
+  );
+  if (mgError || !miniGoals || miniGoals.length === 0) return { success: false, message: "No active goals found." };
+
+  const [, userWithPrefs] = await catchError(User.findById(userId, "preferences").lean());
+  const prefs = (userWithPrefs as any)?.preferences || {};
+
+  // Build task list from existing incomplete tasks (preserving order)
+  const tasksByGoal: SchedulableTask[][] = miniGoals.map((mg: any, goalIdx: number) =>
+    mg.tasks
+      .filter((t: any) => !t.completed && !t.deleted)
+      .map((t: any) => ({
+        miniGoalIndex: goalIdx,
+        taskIndex: mg.tasks.indexOf(t),
+        title: t.title,
+      }))
+  );
+
+  const totalTasks = tasksByGoal.reduce((sum, g) => sum + g.length, 0);
+  if (totalTasks === 0) return { success: true, message: "No tasks to schedule — all done!" };
+
+  const startDate = new Date();
+  const deadline = shard.timeline?.endDate ? new Date(shard.timeline.endDate) : undefined;
+
+  const scheduled = smartSchedule(
+    tasksByGoal,
+    startDate,
+    {
+      workingDays: prefs.workingDays || [1, 2, 3, 4, 5],
+      maxTasksPerDay: prefs.maxTasksPerDay || 4,
+      preferredTaskDuration: prefs.preferredTaskDuration || 'medium',
+    },
+    deadline,
+  );
+
+  // Apply dates to DB
+  for (let goalIdx = 0; goalIdx < miniGoals.length; goalIdx++) {
+    const mg = miniGoals[goalIdx];
+    const goalSchedule = scheduled.filter(s => s.miniGoalIndex === goalIdx);
+    let changed = false;
+
+    for (const s of goalSchedule) {
+      if (mg.tasks[s.taskIndex]) {
+        mg.tasks[s.taskIndex].dueDate = s.dueDate;
+        mg.tasks[s.taskIndex].rescheduled = true;
+        changed = true;
+      }
+    }
+
+    if (goalSchedule.length > 0) {
+      mg.dueDate = goalSchedule[goalSchedule.length - 1].dueDate;
+    }
+
+    if (changed) await mg.save();
+  }
+
+  await cacheInvalidate.shard(shardId);
+  await cacheInvalidate.shardList(userId);
+
+  return {
+    success: true,
+    message: `${totalTasks} tasks rescheduled!`,
+    tasks: scheduled.map(s => ({
+      title: tasksByGoal[s.miniGoalIndex]?.find(t => t.taskIndex === s.taskIndex)?.title || '',
+      dueDate: s.dueDate.toISOString(),
+      completed: false,
+    })),
+  };
+}
 
 export default {
   Mutation: {
@@ -174,40 +257,58 @@ export default {
 
         console.log("📅 [createShard] Timeline:", { start: shardStartDate, end: shardEndDate });
 
-        // Create mini-goals with their steps and calculated due dates
-        console.log("🎯 [createShard] Creating mini-goals");
-        
-        // Distribute mini-goal due dates evenly across the shard timeline
-        const miniGoalDueDates = distributeDatesEvenly(
-          shardStartDate,
-          shardEndDate,
-          questBreakdown.miniQuests.length
+        // Fetch user preferences for smart scheduling
+        const [prefError, userWithPrefs] = await catchError(
+          User.findById(context.id, "preferences").lean()
         );
-        
+        const prefs = (userWithPrefs as any)?.preferences || {};
+
+        // Build flat task list grouped by mini-goal for smart scheduling
+        const tasksByGoal: SchedulableTask[][] = questBreakdown.miniQuests.map(
+          (mq: any, goalIdx: number) =>
+            mq.steps.map((step: any, taskIdx: number) => ({
+              miniGoalIndex: goalIdx,
+              taskIndex: taskIdx,
+              title: step.text,
+            }))
+        );
+
+        // Smart schedule: packs tasks tightly on working days
+        const scheduled = smartSchedule(
+          tasksByGoal,
+          shardStartDate,
+          {
+            workingDays: prefs.workingDays || [1, 2, 3, 4, 5],
+            maxTasksPerDay: prefs.maxTasksPerDay || 4,
+            preferredTaskDuration: prefs.preferredTaskDuration || 'medium',
+          },
+          shardEndDate,
+        );
+
+        // Create mini-goals with smart-scheduled task dates
+        console.log("🎯 [createShard] Creating mini-goals with smart scheduling");
+
         const miniGoalsPromises = questBreakdown.miniQuests.map(
           async (mq: any, index: number) => {
-            console.log(`  📌 [createShard] Mini-goal ${index + 1}/${questBreakdown.miniQuests.length}: ${mq.title}`);
-            
-            const miniGoalDueDate = miniGoalDueDates[index];
-            const miniGoalStartDate = index === 0 ? shardStartDate : miniGoalDueDates[index - 1];
-
-            // Calculate task due dates - distribute evenly within mini-goal timeframe
-            const taskDueDates = mq.steps.length > 0
-              ? distributeDatesEvenly(miniGoalStartDate, miniGoalDueDate, mq.steps.length)
-              : [];
+            const goalSchedule = scheduled.filter(s => s.miniGoalIndex === index);
+            // Mini-goal due date = last task date in that goal
+            const miniGoalDueDate = goalSchedule.length > 0
+              ? goalSchedule[goalSchedule.length - 1].dueDate
+              : shardEndDate;
 
             const tasks = mq.steps.map((step: any, stepIndex: number) => {
+              const s = goalSchedule.find(g => g.taskIndex === stepIndex);
               return {
                 title: step.text,
-                dueDate: taskDueDates[stepIndex],
+                dueDate: s?.dueDate || shardEndDate,
                 completed: false,
                 xpReward: step.xpReward || 20,
               };
             });
 
-            console.log(`    ✓ Created ${tasks.length} tasks for mini-goal ${index + 1}`);
+            console.log(`  📌 [createShard] Mini-goal ${index + 1}: ${mq.title} (${tasks.length} tasks)`);
 
-            const miniGoalData = {
+            return await MiniGoal.create({
               shardId: newShard._id,
               title: mq.title,
               description: mq.description,
@@ -215,9 +316,7 @@ export default {
               progress: 0,
               completed: false,
               tasks,
-            };
-
-            return await MiniGoal.create(miniGoalData);
+            });
           }
         );
 
@@ -254,6 +353,9 @@ export default {
           title: newShard.title,
           aiCallsRemaining: usageCheck.remaining - 1,
         });
+
+        // Check achievements fire-and-forget
+        checkAchievements(context.id).catch(() => {});
 
         return {
           success: true,
@@ -338,30 +440,51 @@ export default {
           };
         }
 
-        // Create mini-goals if provided
+        // Create mini-goals if provided — use smart scheduling
         if (input.miniGoals && input.miniGoals.length > 0) {
           const shardStartDate = input.timeline?.startDate ? new Date(input.timeline.startDate) : new Date();
           const shardEndDate = input.timeline?.endDate ? new Date(input.timeline.endDate) : undefined;
 
+          // Fetch user preferences
+          const [prefErr, userPrefs] = await catchError(
+            User.findById(context.id, "preferences").lean()
+          );
+          const prefs = (userPrefs as any)?.preferences || {};
+
+          // Build task list for smart scheduling
+          const tasksByGoal: SchedulableTask[][] = input.miniGoals.map(
+            (mg: any, goalIdx: number) =>
+              (mg.tasks || []).map((task: any, taskIdx: number) => ({
+                miniGoalIndex: goalIdx,
+                taskIndex: taskIdx,
+                title: task.title,
+              }))
+          );
+
+          const scheduled = smartSchedule(
+            tasksByGoal,
+            shardStartDate,
+            {
+              workingDays: prefs.workingDays || [1, 2, 3, 4, 5],
+              maxTasksPerDay: prefs.maxTasksPerDay || 4,
+              preferredTaskDuration: prefs.preferredTaskDuration || 'medium',
+            },
+            shardEndDate,
+          );
+
           const miniGoalsPromises = input.miniGoals.map(async (mg: any, index: number) => {
             const enrichedMG = enrichment?.miniGoals?.[index];
+            const goalSchedule = scheduled.filter(s => s.miniGoalIndex === index);
+            const miniGoalDueDate = goalSchedule.length > 0
+              ? goalSchedule[goalSchedule.length - 1].dueDate
+              : shardEndDate;
 
-            // Calculate mini-goal due date
-            const miniGoalDueDate = enrichedMG?.estimatedDuration && shardEndDate
-              ? calculateDueDate(shardStartDate, enrichedMG.estimatedDuration)
-              : shardEndDate
-                ? distributeDatesEvenly(shardStartDate, shardEndDate, input.miniGoals.length)[index]
-                : undefined;
-
-            // Create tasks with due dates
-            const tasks = mg.tasks.map((task: any, taskIndex: number) => {
+            const tasks = (mg.tasks || []).map((task: any, taskIndex: number) => {
               const enrichedTask = enrichedMG?.tasks?.[taskIndex];
-
+              const s = goalSchedule.find(g => g.taskIndex === taskIndex);
               return {
                 title: task.title,
-                dueDate: enrichedTask?.estimatedDuration && miniGoalDueDate
-                  ? calculateDueDate(shardStartDate, enrichedTask.estimatedDuration)
-                  : undefined,
+                dueDate: s?.dueDate || miniGoalDueDate,
                 completed: false,
                 xpReward: enrichedTask?.xpReward || 20,
               };
@@ -949,9 +1072,12 @@ export default {
         details: `Completed mini-goal: ${minigoal.title}${earlyBonus.isEarly ? ` (early completion bonus: +${earlyBonus.bonusXP} XP)` : ''}`,
       });
 
+      // Check achievements (fire-and-forget — never blocks response)
+      checkAchievements(context.id).catch(() => {});
+
       return {
         success: true,
-        message: earlyBonus.isEarly 
+        message: earlyBonus.isEarly
           ? `Mini-goal completed ${earlyBonus.daysEarly} days early! Bonus: +${earlyBonus.bonusXP} XP`
           : "Mini-goal completed!",
         xpEarned: totalXP,
@@ -964,148 +1090,19 @@ export default {
       };
     },
 
-    // Generate weekly tasks for a mini-goal using AI
-    async generateWeeklyTasks(_, { miniGoalId, weekNumber, action = 'append' }, context) {
+    async scheduleTasks(_, { shardId }, context) {
+      return _scheduleShardTasks(shardId, context.id);
+    },
+
+    async generateWeeklyTasks(_, { miniGoalId }, context) {
       if (!context.id) ThrowError("Please login to continue.");
-
-      // 1. Check AI usage limits
-      const [userError, user] = await catchError(
-        User.findById(context.id, "role").lean()
+      const [mgErr, miniGoal] = await catchError(
+        MiniGoal.findById(miniGoalId).lean()
       );
-
-      if (userError || !user) ThrowError("User not found.");
-
-      const aiCheck = await checkAIUsage(context.id, user.role as "free" | "pro");
-
-      if (!aiCheck.canProceed) {
-        return {
-          success: false,
-          message: user.role === "pro" 
-            ? "Daily AI limit reached." 
-            : "Daily AI limit reached. Upgrade to Premium for more.",
-          aiCallsRemaining: 0,
-          needsUpgrade: user.role !== "pro",
-        };
+      if (mgErr || !miniGoal) {
+        return { success: false, message: "Mini-goal not found." };
       }
-
-      // 2. Fetch MiniGoal and Shard
-      const [mgError, miniGoal] = await catchError(
-        MiniGoal.findById(miniGoalId).populate("shardId").lean()
-      );
-
-      if (mgError || !miniGoal) {
-        return {
-          success: false,
-          message: "Mini-goal not found.",
-          aiCallsRemaining: aiCheck.remaining,
-        };
-      }
-
-      const shard: any = miniGoal.shardId;
-
-      // Verify ownership/participation
-      const isOwner = shard.owner.toString() === context.id;
-      const isParticipant = shard.participants.some(
-        (p: any) => p.user.toString() === context.id
-      );
-
-      if (!isOwner && !isParticipant) {
-        return {
-          success: false,
-          message: "You don't have access to this shard.",
-          aiCallsRemaining: aiCheck.remaining,
-        };
-      }
-
-      // 3. Calculate week dates
-      const shardStartDate = new Date(shard.timeline.startDate);
-      const weekStartDate = new Date(shardStartDate);
-      weekStartDate.setDate(shardStartDate.getDate() + (weekNumber - 1) * 7);
-      
-      const weekEndDate = new Date(weekStartDate);
-      weekEndDate.setDate(weekStartDate.getDate() + 6);
-
-      console.log("📅 [generateWeeklyTasks] Debug:", {
-        weekNumber,
-        action,
-        shardStart: shardStartDate.toISOString(),
-        weekStart: weekStartDate.toISOString(),
-        weekEnd: weekEndDate.toISOString(),
-      });
-
-      // Check if tasks already exist for this week
-      const existingTasksInWeek = miniGoal.tasks.filter((t: any) => {
-        if (!t.dueDate) return false;
-        const d = new Date(t.dueDate);
-        return d >= weekStartDate && d <= weekEndDate;
-      });
-
-      console.log("🔍 [generateWeeklyTasks] Existing tasks found:", existingTasksInWeek.length);
-      
-      // Safety check if action not provided but tasks exist
-      if (existingTasksInWeek.length > 0 && !action) {
-        return {
-          success: false,
-          message: "Tasks already exist for this week.",
-          aiCallsRemaining: aiCheck.remaining,
-        };
-      }
-
-      // 4. Generate tasks with AI
-      // Track usage first
-      await trackAIUsage(context.id);
-
-      const generatedTasks = await generateWeeklyTasks(
-        miniGoal.title,
-        miniGoal.description || "",
-        weekNumber
-      );
-
-      // 5. Assign dates (distribute evenly across the week)
-      const taskDates = distributeDatesEvenly(
-        weekStartDate,
-        weekEndDate,
-        generatedTasks.length
-      );
-
-      const newTasks = generatedTasks.map((t, index) => ({
-        title: t.title,
-        dueDate: taskDates[index],
-        completed: false,
-        xpReward: 20, // Standard reward
-      }));
-
-      // 6. Save to database based on action
-      if (action === 'replace' && existingTasksInWeek.length > 0) {
-        // Remove existing week tasks first
-        const tasksToKeep = miniGoal.tasks.filter((t: any) => {
-          if (!t.dueDate) return true;
-          const d = new Date(t.dueDate);
-          return d < weekStartDate || d > weekEndDate;
-        });
-
-        await MiniGoal.findByIdAndUpdate(miniGoalId, {
-          tasks: [...tasksToKeep, ...newTasks]
-        });
-      } else {
-        // Append new tasks
-        await MiniGoal.findByIdAndUpdate(miniGoalId, {
-          $push: { tasks: { $each: newTasks } }
-        });
-      }
-
-      // 7. Invalidate cache
-      await cacheInvalidate.shard(shard._id.toString());
-
-      return {
-        success: true,
-        message: action === 'replace' 
-          ? "Weekly tasks replaced successfully!" 
-          : "Weekly tasks generated successfully!",
-        tasks: newTasks,
-        aiCallsRemaining: aiCheck.remaining - 1,
-        needsUpgrade: false,
-      };
+      return _scheduleShardTasks(miniGoal.shardId.toString(), context.id);
     },
 
     // Soft delete a task
@@ -1280,7 +1277,7 @@ export default {
       // Fetch shard data directly from database
       const [error, shardData] = await catchError(
         Shard.findById(id)
-          .select("title description image status progress timeline participants rewards owner chatId createdAt updatedAt")
+          .select("title description image status progress timeline participants rewards owner chatId isPrivate isAnonymous version createdAt updatedAt")
           .populate("owner", "username")
           .lean()
       );
@@ -1298,6 +1295,13 @@ export default {
 
       const minigoals = minigoalsList || [];
 
+      // Populate participant user details (username, profilePic)
+      const participantUserIds = (shardData.participants || []).map((p: any) => p.user);
+      const [usersError, participantUsers] = await catchError(
+        User.find({ _id: { $in: participantUserIds } }).select("username profilePic").lean()
+      );
+      const userMap = new Map((participantUsers || []).map((u: any) => [u._id.toString(), u]));
+
       return {
         success: true,
         shard: {
@@ -1309,12 +1313,23 @@ export default {
           chatId: shardData.chatId?.toString(),
           progress: shardData.progress,
           timeline: shardData.timeline,
-          participants: shardData.participants,
+          participants: (shardData.participants || []).map((p: any) => {
+            const u = userMap.get(p.user.toString());
+            return {
+              user: p.user.toString(),
+              role: p.role,
+              username: u?.username || null,
+              profilePic: u?.profilePic || null,
+            };
+          }),
           rewards: shardData.rewards,
           owner: {
             id: (shardData.owner as any)._id.toString(),
             username: (shardData.owner as any).username,
           },
+          isPrivate: shardData.isPrivate ?? false,
+          isAnonymous: shardData.isAnonymous ?? false,
+          version: shardData.version ?? 1,
           minigoals: minigoals.map((mg: any) => ({
             id: mg._id.toString(),
             title: mg.title,

@@ -5,11 +5,13 @@ import {
   ThrowError,
 } from "../../Helpers/Helpers.js";
 import { User } from "../../models/User.js";
-import Achievement from "../../models/Achievement.js";
 import Streak from "../../models/Streak.js";
 import MiniGoal from "../../models/MiniGoal.js";
 import Shard from "../../models/Shard.js";
+import Friendship from "../../models/Friendship.js";
 import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
+import { ACHIEVEMENTS, ACHIEVEMENT_MAP, type UserStats } from "../../data/achievements.js";
+import { createNotification } from "./Notifications.js";
 
 /**
  * Calculate XP needed for next level
@@ -79,50 +81,143 @@ export async function awardXP(userId: string, amount: number, reason: string) {
 }
 
 /**
- * Check and unlock achievements
+ * Build live UserStats for a given userId — used by checkAchievements.
+ * Runs all DB counts in parallel for speed.
  */
-export async function checkAchievements(userId: string) {
-  // Get user's current stats
-  const user = await User.findById(userId).lean();
+async function buildUserStats(userId: string): Promise<UserStats | null> {
+  const user = await User.findById(userId)
+    .select("xp level currentStreak longestStreak")
+    .lean();
+  if (!user) return null;
+
+  const [friendCount, shardsCreated, shardsCompleted, tasksCompleted, miniGoalsCompleted, collaborationsJoined] =
+    await Promise.all([
+      Friendship.countDocuments({
+        $or: [{ requester: userId }, { recipient: userId }],
+        status: "accepted",
+      }),
+      Shard.countDocuments({ owner: userId }),
+      Shard.countDocuments({ owner: userId, status: "completed" }),
+      // tasksCompleted: sum completed tasks across all mini-goals the user owns
+      MiniGoal.aggregate([
+        { $match: { "tasks.completed": true } },
+        { $lookup: { from: "shards", localField: "shardId", foreignField: "_id", as: "shard" } },
+        { $unwind: "$shard" },
+        {
+          $match: {
+            $or: [
+              { "shard.owner": { $eq: userId } },
+              { "shard.participants.user": { $eq: userId } },
+            ],
+          },
+        },
+        {
+          $project: {
+            completedCount: {
+              $size: { $filter: { input: "$tasks", as: "t", cond: "$$t.completed" } },
+            },
+          },
+        },
+        { $group: { _id: null, total: { $sum: "$completedCount" } } },
+      ]).then((r) => r[0]?.total ?? 0),
+      MiniGoal.countDocuments({
+        completed: true,
+        $or: [
+          { "shard.owner": userId }, // handled via lookup below — use aggregate shortcut
+        ],
+      }).catch(() => 0) as unknown as Promise<number>, // fallback — recalculate below
+      Shard.countDocuments({
+        "participants.user": userId,
+        "participants.role": { $in: ["collaborator", "viewer"] },
+      }),
+    ]);
+
+  // More accurate miniGoalsCompleted via aggregate
+  const miniGoalsAgg = await MiniGoal.aggregate([
+    { $match: { completed: true } },
+    { $lookup: { from: "shards", localField: "shardId", foreignField: "_id", as: "shard" } },
+    { $unwind: "$shard" },
+    {
+      $match: {
+        $or: [
+          { "shard.owner": { $eq: userId } },
+          { "shard.participants.user": { $eq: userId } },
+        ],
+      },
+    },
+    { $count: "total" },
+  ]);
+  const miniGoalsCompletedActual = miniGoalsAgg[0]?.total ?? 0;
+
+  return {
+    xp: user.xp,
+    level: user.level,
+    currentStreak: user.currentStreak,
+    longestStreak: user.longestStreak,
+    friendCount,
+    shardsCreated,
+    shardsCompleted,
+    tasksCompleted: typeof tasksCompleted === "number" ? tasksCompleted : 0,
+    miniGoalsCompleted: miniGoalsCompletedActual,
+    collaborationsJoined,
+  };
+}
+
+/**
+ * Check and unlock any newly-eligible achievements.
+ * Returns the ids of newly unlocked achievements.
+ * Sends an in-app notification for each unlock.
+ */
+export async function checkAchievements(userId: string): Promise<string[]> {
+  const user = await User.findById(userId).select("achievements").lean();
   if (!user) return [];
 
-  const unlocked: string[] = [];
+  const earned = new Set(user.achievements ?? []);
+  // Only check achievements the user hasn't earned yet
+  const toCheck = ACHIEVEMENTS.filter((a) => !earned.has(a.id));
+  if (toCheck.length === 0) return [];
 
-  // Example achievement checks (extend as needed)
-  const achievementsToCheck = await Achievement.find({
-    _id: { $nin: user.achievements },
-  }).lean();
+  const stats = await buildUserStats(userId);
+  if (!stats) return [];
 
-  for (const achievement of achievementsToCheck) {
-    let shouldUnlock = false;
+  const newlyUnlocked: string[] = [];
 
-    switch (achievement.category) {
-      case "consistency":
-        if (user.streaks >= (achievement.requiredValue || 7)) {
-          shouldUnlock = true;
-        }
-        break;
-      case "milestone":
-        if (user.level >= (achievement.requiredValue || 10)) {
-          shouldUnlock = true;
-        }
-        break;
-      // Add more achievement checks
-    }
-
-    if (shouldUnlock) {
-      await User.findByIdAndUpdate(userId, {
-        $push: { achievements: achievement._id.toString(), pendingAchievements: achievement._id.toString() },
-      });
-      unlocked.push(achievement.title);
+  for (const achievement of toCheck) {
+    const { stat, threshold } = achievement.condition;
+    if ((stats[stat] ?? 0) >= threshold) {
+      newlyUnlocked.push(achievement.id);
     }
   }
 
-  if (unlocked.length > 0) {
-    await cacheInvalidate.user(userId);
+  if (newlyUnlocked.length === 0) return [];
+
+  // Persist all unlocks in one write
+  await User.findByIdAndUpdate(userId, {
+    $push: {
+      achievements:        { $each: newlyUnlocked },
+      pendingAchievements: { $each: newlyUnlocked },
+    },
+  });
+
+  await cacheInvalidate.user(userId);
+
+  // Fire one notification per unlock (fire-and-forget)
+  for (const id of newlyUnlocked) {
+    const a = ACHIEVEMENT_MAP.get(id)!;
+    createNotification(
+      userId,
+      `${a.icon} Achievement unlocked: ${a.name} — ${a.description}`,
+      "achievement"
+    ).catch(() => {});
   }
 
-  return unlocked;
+  SaveAuditTrail({
+    userId,
+    task: "Achievements Unlocked",
+    details: newlyUnlocked.join(", "),
+  });
+
+  return newlyUnlocked;
 }
 
 /**
@@ -321,11 +416,44 @@ export default {
     // Complete task and award XP
     async completeTask(_, { shardId, miniGoalId, taskIndex }, context) {
       if (!context.id) ThrowError("Please login to continue.");
-
       return await completeTask(context.id, shardId, miniGoalId, taskIndex);
+    },
+
+    // Clear the pending achievements queue after the client has shown them
+    async clearPendingAchievements(_, __, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+      await User.findByIdAndUpdate(context.id, { $set: { pendingAchievements: [] } });
+      await cacheInvalidate.user(context.id);
+      return { success: true };
     },
   },
   Query: {
+    // Returns full metadata for all achievements, with earned/pending flags
+    async getAchievements(_, __, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+
+      const user = await User.findById(context.id)
+        .select("achievements pendingAchievements")
+        .lean();
+
+      const earned = new Set(user?.achievements ?? []);
+      const pending = new Set(user?.pendingAchievements ?? []);
+
+      return {
+        success: true,
+        achievements: ACHIEVEMENTS.map((a) => ({
+          id: a.id,
+          name: a.name,
+          description: a.description,
+          icon: a.icon,
+          category: a.category,
+          rarity: a.rarity,
+          earned: earned.has(a.id),
+          pending: pending.has(a.id),
+        })),
+      };
+    },
+
     async getXP(_, __, context) {
       if (!context.id) ThrowError("Please login to continue.");
 

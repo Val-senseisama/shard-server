@@ -10,6 +10,7 @@ import NotificationResolvers from "./resolvers/Notifications.js";
 import PushNotificationResolvers from "./resolvers/PushNotifications.js";
 import ReportResolvers from "./resolvers/Report.js";
 import SupportResolvers from "./resolvers/Support.js";
+import AdminResolvers from "./resolvers/Admin.js";
 import { GraphQLScalarType, Kind } from "graphql";
 import { withErrorLogging } from "../Helpers/Helpers.js";
 
@@ -56,6 +57,7 @@ const allQueries: Record<string, Function> = {
     ...NotificationResolvers.Query,
     ...ReportResolvers.Query,
     ...SupportResolvers.Query,
+    ...AdminResolvers.Query,
 };
 
 const allMutations: Record<string, Function> = {
@@ -71,6 +73,7 @@ const allMutations: Record<string, Function> = {
     ...PushNotificationResolvers.Mutation,
     ...ReportResolvers.Mutation,
     ...SupportResolvers.Mutation,
+    ...AdminResolvers.Mutation,
 };
 
 export default {

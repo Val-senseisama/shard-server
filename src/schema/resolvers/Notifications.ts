@@ -8,9 +8,31 @@ import NotificationPreference from "../../models/NotificationPreferences.js";
 import Shard from "../../models/Shard.js";
 import { User } from "../../models/User.js";
 import { cache, cacheInvalidate } from "../../Helpers/Cache.js";
+import { sendEmailToUser } from "../../Helpers/ResendEmail.js";
 
 /**
- * Create a notification
+ * Calculate next time quiet hours end (so we can schedule the push for then).
+ */
+function nextQuietHoursEnd(preferences: any): Date {
+  const [endHour, endMin] = (preferences.quietHoursEnd || "08:00")
+    .split(":")
+    .map(Number);
+  const result = new Date();
+  result.setHours(endHour, endMin, 0, 0);
+  if (result <= new Date()) {
+    // The end time already passed today — push to tomorrow
+    result.setDate(result.getDate() + 1);
+  }
+  return result;
+}
+
+/**
+ * Create a notification.
+ * Always stores the in-app notification immediately.
+ * If currently in quiet hours the push/email is deferred to when quiet hours end
+ * (tracked via triggerAt + dispatched=false, picked up by the dispatcher cron).
+ * If not in quiet hours the record is marked dispatched=true — the resolver
+ * is responsible for firing the FCM push via sendNotificationToUser().
  */
 export async function createNotification(
   userId: string,
@@ -21,28 +43,44 @@ export async function createNotification(
   // Check user preferences
   const preferences = await NotificationPreference.findOne({ userId }).lean();
 
-  // Check if this notification type is enabled
+  // If the user has explicitly disabled this notification type, skip entirely
   if (preferences && !shouldNotify(preferences, type)) {
     return;
   }
 
-  // Check quiet hours
-  if (preferences?.quietHoursEnabled && isQuietHours(preferences)) {
-    return;
-  }
+  const inQuietHours =
+    preferences?.quietHoursEnabled && isQuietHours(preferences);
+
+  // When in quiet hours: defer push/email until quiet hours end.
+  // When not in quiet hours: mark dispatched immediately — resolver sends push.
+  const triggerAt = options?.triggerAt
+    ? options.triggerAt
+    : inQuietHours
+      ? nextQuietHoursEnd(preferences)
+      : new Date();
+
+  const dispatched = !inQuietHours;
 
   try {
     const notification = await Notification.create({
       userId,
       message,
+      type,
       shardId: options?.shardId,
       miniGoalId: options?.miniGoalId,
-      triggerAt: options?.triggerAt || new Date(),
+      triggerAt,
+      dispatched,
       read: false,
     });
 
     // Invalidate notifications cache
     await cacheInvalidate.user(userId);
+
+    // Fire email immediately only when not in quiet hours
+    // (quiet-hours email is sent by the dispatcher cron)
+    if (!inQuietHours) {
+      sendEmailToUser(userId, type, { message }).catch(() => {});
+    }
 
     return notification;
   } catch (error) {

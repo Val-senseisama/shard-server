@@ -5,8 +5,10 @@ export interface NotificationDocument extends Document {
   shardId?: Types.ObjectId;     // optional link to shard
   miniGoalId?: Types.ObjectId;  // optional link to mini-goal/task
   message: string;              // notification text
-  triggerAt: Date;              // when it should fire
-  read: boolean;                // has the user seen it?
+  type: string;                 // notification type (friend_request, shard_invite, etc.)
+  triggerAt: Date;              // when the push should fire (may be in future during quiet hours)
+  dispatched: boolean;          // has the FCM/email push been sent?
+  read: boolean;                // has the user seen it in-app?
 }
 
 const NotificationSchema = new Schema<NotificationDocument>(
@@ -15,7 +17,9 @@ const NotificationSchema = new Schema<NotificationDocument>(
     shardId: { type: Schema.Types.ObjectId, ref: "Shard" },
     miniGoalId: { type: Schema.Types.ObjectId, ref: "MiniGoal" },
     message: { type: String, required: true },
+    type: { type: String, default: "" },
     triggerAt: { type: Date, required: true },
+    dispatched: { type: Boolean, default: false },
     read: { type: Boolean, default: false },
   },
   { timestamps: true }

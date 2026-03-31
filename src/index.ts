@@ -12,7 +12,7 @@ import typeDefs from "./schema/Typedefinitions.js";
 import resolvers from "./schema/Resolvers.js";
 import cors from "cors";
 import { setupWebSocketServer } from "./server/WebSocketServer.js";
-import { startOverdueTaskReschedule, startDeletedTaskPurge, startDeadlineReminders, startOverdueAlerts } from './Helpers/CronJobs.js';
+import { startOverdueTaskReschedule, startDeletedTaskPurge, startDeadlineReminders, startOverdueAlerts, startDailyTaskReminders, startScheduledNotificationDispatcher } from './Helpers/CronJobs.js';
 
 const PORT = process.env.PORT || 4000;
 
@@ -63,4 +63,6 @@ httpServer.listen(PORT, () => {
     startDeletedTaskPurge();
     startDeadlineReminders();
     startOverdueAlerts();
+    startDailyTaskReminders();
+    startScheduledNotificationDispatcher();
 });

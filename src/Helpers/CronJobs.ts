@@ -1,8 +1,13 @@
 import cron from 'node-cron';
 import MiniGoal from '../models/MiniGoal.js';
 import Shard from '../models/Shard.js';
+import { User } from '../models/User.js';
 import { logError } from './Helpers.js';
 import { createNotification } from '../schema/resolvers/Notifications.js';
+import { sendNotificationToUser, sendNotificationToTokens } from './FirebaseMessaging.js';
+import Notification from '../models/Notifications.js';
+import NotificationPreference from '../models/NotificationPreferences.js';
+import { sendEmailToUser } from './ResendEmail.js';
 
 /**
  * Daily cron job to send deadline reminders for mini-goals due tomorrow
@@ -244,3 +249,181 @@ export function startDeletedTaskPurge() {
   
   console.log('✅ [Cron] Deleted task purge job started (runs at 4 AM daily)');
 }
+
+/**
+ * Daily task reminder — sends push notification to each user
+ * with tasks scheduled for today.
+ * Runs at 7:30 AM every day.
+ */
+export function startDailyTaskReminders() {
+  cron.schedule('30 7 * * *', async () => {
+    console.log('📋 [Cron] Running daily task reminder job...');
+
+    try {
+      const todayStart = new Date();
+      todayStart.setHours(0, 0, 0, 0);
+      const todayEnd = new Date(todayStart);
+      todayEnd.setDate(todayEnd.getDate() + 1);
+
+      // Find all mini-goals with tasks due today that are incomplete
+      const miniGoals = await MiniGoal.find({
+        completed: false,
+        'tasks.completed': false,
+        'tasks.deleted': { $ne: true },
+        'tasks.dueDate': { $gte: todayStart, $lt: todayEnd },
+      }).lean();
+
+      if (miniGoals.length === 0) {
+        console.log('📋 [Cron] No tasks due today');
+        return;
+      }
+
+      // Group tasks by shard to find users
+      const shardIds = [...new Set(miniGoals.map(mg => mg.shardId.toString()))];
+
+      const shards = await Shard.find({
+        _id: { $in: shardIds },
+        status: { $in: ['active', 'paused'] },
+      }).select('owner participants title').lean();
+
+      // Build per-user task counts
+      const userTaskCounts = new Map<string, { count: number; shardTitles: Set<string> }>();
+
+      for (const shard of shards) {
+        const shardMiniGoals = miniGoals.filter(mg => mg.shardId.toString() === shard._id.toString());
+        let taskCount = 0;
+
+        for (const mg of shardMiniGoals) {
+          taskCount += mg.tasks.filter((t: any) => {
+            if (t.completed || t.deleted || !t.dueDate) return false;
+            const d = new Date(t.dueDate);
+            return d >= todayStart && d < todayEnd;
+          }).length;
+        }
+
+        if (taskCount === 0) continue;
+
+        // Collect all users on this shard
+        const userIds = new Set<string>([shard.owner.toString()]);
+        shard.participants?.forEach((p: any) => userIds.add(p.user.toString()));
+
+        for (const userId of userIds) {
+          if (!userTaskCounts.has(userId)) {
+            userTaskCounts.set(userId, { count: 0, shardTitles: new Set() });
+          }
+          const entry = userTaskCounts.get(userId)!;
+          entry.count += taskCount;
+          entry.shardTitles.add(shard.title);
+        }
+      }
+
+      console.log(`📋 [Cron] Sending daily reminders to ${userTaskCounts.size} users`);
+
+      // Send push notification to each user
+      for (const [userId, { count, shardTitles }] of userTaskCounts) {
+        const titles = [...shardTitles];
+        const shardHint = titles.length === 1
+          ? `in ${titles[0]}`
+          : `across ${titles.length} quests`;
+
+        await sendNotificationToUser(
+          userId,
+          {
+            title: `${count} task${count > 1 ? 's' : ''} today`,
+            body: `You have ${count} task${count > 1 ? 's' : ''} scheduled ${shardHint}. Let's go!`,
+            data: { screen: '/schedule' },
+          },
+          'questDeadlines'
+        );
+
+        // Also create in-app notification
+        await createNotification(
+          userId,
+          `You have ${count} task${count > 1 ? 's' : ''} scheduled today ${shardHint}.`,
+          'task_reminder',
+          {}
+        );
+      }
+
+      console.log('✅ [Cron] Daily task reminders sent');
+    } catch (error) {
+      console.error('❌ [Cron] Daily task reminder error:', error);
+      logError('cron:dailyTaskReminders', error);
+    }
+  });
+
+  console.log('✅ [Cron] Daily task reminder job started (runs at 7:30 AM daily)');
+}
+
+/**
+ * Dispatches notifications that were deferred due to quiet hours.
+ * Runs every 5 minutes. Finds notifications where:
+ *   - dispatched = false
+ *   - triggerAt <= now
+ * For each it sends a FCM push + email, then marks dispatched = true.
+ */
+export function startScheduledNotificationDispatcher() {
+  cron.schedule('*/5 * * * *', async () => {
+    try {
+      const now = new Date();
+
+      const pending = await Notification.find({
+        dispatched: false,
+        triggerAt: { $lte: now },
+      })
+        .limit(200)
+        .lean();
+
+      if (pending.length === 0) return;
+
+      console.log(`🔔 [Cron] Dispatching ${pending.length} deferred notification(s)`);
+
+      for (const notif of pending) {
+        const userId = notif.userId.toString();
+
+        try {
+          // Check pushEnabled + type pref — but NOT quiet hours (we already waited)
+          const prefs = await NotificationPreference.findOne({ userId }).lean();
+          if (prefs && !prefs.pushEnabled) {
+            // Push disabled — mark dispatched so we don't retry, but skip push
+            await Notification.findByIdAndUpdate(notif._id, { dispatched: true });
+            continue;
+          }
+
+          // Type-level preference check
+          const typeKey = notif.type as keyof typeof prefs;
+          if (prefs && typeKey && prefs[typeKey] === false) {
+            await Notification.findByIdAndUpdate(notif._id, { dispatched: true });
+            continue;
+          }
+
+          // Fetch push tokens and send FCM
+          const user = await User.findById(userId).select('pushTokens').lean();
+          const tokens = (user?.pushTokens ?? []).map((t: any) => t.token).filter(Boolean);
+
+          if (tokens.length > 0) {
+            await sendNotificationToTokens(tokens, {
+              title: 'Shard',
+              body: notif.message,
+              data: {
+                ...(notif.shardId ? { shardId: notif.shardId.toString() } : {}),
+              },
+            });
+          }
+
+          // Send email (sendEmailToUser does its own emailEnabled + type + quiet-hours check)
+          sendEmailToUser(userId, notif.type || 'general', { message: notif.message }).catch(() => {});
+
+          await Notification.findByIdAndUpdate(notif._id, { dispatched: true });
+        } catch (err) {
+          logError('cron:dispatchNotification', err);
+        }
+      }
+    } catch (error) {
+      logError('cron:scheduledNotificationDispatcher', error);
+    }
+  });
+
+  console.log('✅ [Cron] Scheduled notification dispatcher started (runs every 5 minutes)');
+}
+
