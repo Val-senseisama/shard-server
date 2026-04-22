@@ -112,6 +112,10 @@ export default `#graphql
     createOrGetDirectChat(friendId: ID!): ChatResponse!
     createOrGetShardChat(shardId: ID!): ChatResponse!
     sendMessage(chatId: ID!, content: String!, type: String, replyTo: ID, attachments: [AttachmentInput!]): SendMessageResponse!
+    createPoll(chatId: ID!, question: String!, options: [String!]!): SendMessageResponse!
+    votePoll(messageId: ID!, optionIndex: Int!): MessageResponse!
+    assignTaskFromChat(chatId: ID!, taskId: ID, assigneeId: ID!): SendMessageResponse!
+    summonSummary(chatId: ID!): SendMessageResponse!
     markMessagesRead(chatId: ID!, messageIds: [ID!]!): MessageResponse!
     editMessage(messageId: ID!, content: String!): MessageResponse!
     deleteMessage(messageId: ID!): MessageResponse!
@@ -595,7 +599,27 @@ export default `#graphql
     deleted: Boolean!
     attachments: [Attachment!]!
     reactions: [ReactionData!]!
+    mentions: [ChatParticipant!]
+    poll: PollData
+    minitaskRef: MiniTaskRefData
     createdAt: String!
+  }
+
+  type PollOptionData {
+    text: String!
+    votes: [ChatParticipant!]!
+  }
+
+  type PollData {
+    question: String!
+    options: [PollOptionData!]!
+    multipleAnswers: Boolean!
+  }
+
+  type MiniTaskRefData {
+    miniGoalId: ID!
+    taskId: String!
+    assignedTo: ChatParticipant!
   }
 
   type ReadReceipt {

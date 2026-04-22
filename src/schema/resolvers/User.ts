@@ -748,7 +748,7 @@ console.log("newUser", newUser);
         async () => {
           const [error, userData] = await catchError(
             User.findById(context.id)
-              .select("email username bio profilePic role emailVerified xp level achievements pendingAchievements strength intelligence charisma endurance creativity authProvider")
+              .select("email username bio profilePic role emailVerified xp level achievements pendingAchievements strength intelligence charisma endurance creativity authProvider subscriptionTier preferences currentStreak longestStreak birthdate timezone aiCredits")
               .lean()
           );
 
@@ -782,6 +782,13 @@ console.log("newUser", newUser);
           creativity: user.creativity,
           authProvider: user.authProvider,
           pendingAchievements: user.pendingAchievements || [],
+          subscriptionTier: user.subscriptionTier,
+          preferences: user.preferences,
+          currentStreak: user.currentStreak || 0,
+          longestStreak: user.longestStreak || 0,
+          birthdate: user.birthdate ? user.birthdate.toISOString() : null,
+          timezone: user.timezone || 'UTC',
+          aiCredits: user.aiCredits || 0,
         },
       };
     },

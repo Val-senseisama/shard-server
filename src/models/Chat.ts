@@ -29,7 +29,7 @@ export interface MessageDocument extends Document {
   chatId: Types.ObjectId;
   sender: Types.ObjectId;
   content: string;
-  type: "text" | "system" | "nudge" | "image" | "audio" | "video" | "file";
+  type: "text" | "system" | "nudge" | "image" | "audio" | "video" | "file" | "poll" | "minitask_assignment" | "summary_ping";
   replyTo?: Types.ObjectId; // ID of the message this is a reply to
   readBy: Types.ObjectId[]; // Users who have read this message
   readAt?: { userId: Types.ObjectId; readAt: Date }[]; // Detailed read receipts with timestamps
@@ -38,6 +38,17 @@ export interface MessageDocument extends Document {
   deleted: boolean; // Whether message was deleted
   attachments?: { url: string; type: string; name?: string }[]; // File attachments
   reactions?: { userId: Types.ObjectId; emoji: string }[]; // Message reactions
+  mentions?: Types.ObjectId[]; // Mentioned users
+  poll?: {
+    question: string;
+    options: { text: string; votes: Types.ObjectId[] }[];
+    multipleAnswers: boolean;
+  };
+  minitaskRef?: {
+    miniGoalId: Types.ObjectId;
+    taskId: string;
+    assignedTo: Types.ObjectId;
+  };
   createdAt: Date;
 }
 
@@ -48,7 +59,7 @@ const MessageSchema = new Schema<MessageDocument>(
     content: { type: String, required: true },
     type: {
       type: String,
-      enum: ["text", "system", "nudge", "image", "audio", "video", "file"],
+      enum: ["text", "system", "nudge", "image", "audio", "video", "file", "poll", "minitask_assignment", "summary_ping"],
       default: "text",
     },
     replyTo: { type: Schema.Types.ObjectId, ref: "Message" },
@@ -69,6 +80,20 @@ const MessageSchema = new Schema<MessageDocument>(
       userId: { type: Schema.Types.ObjectId, ref: "User" },
       emoji: { type: String },
     }],
+    mentions: [{ type: Schema.Types.ObjectId, ref: "User" }],
+    poll: {
+      question: { type: String },
+      options: [{
+        text: { type: String },
+        votes: [{ type: Schema.Types.ObjectId, ref: "User" }],
+      }],
+      multipleAnswers: { type: Boolean, default: false },
+    },
+    minitaskRef: {
+      miniGoalId: { type: Schema.Types.ObjectId, ref: "MiniGoal" },
+      taskId: { type: String },
+      assignedTo: { type: Schema.Types.ObjectId, ref: "User" },
+    },
   },
   { timestamps: { createdAt: true, updatedAt: false } }
 );

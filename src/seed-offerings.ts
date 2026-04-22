@@ -22,8 +22,8 @@ async function seedOfferings() {
     packages: [
       {
         identifier: "monthly",
-        priceString: "$9.99",
-        price: 9.99,
+        priceString: "$5.00",
+        price: 5.00,
         currencyCode: "USD",
       },
       {

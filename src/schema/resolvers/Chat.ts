@@ -12,7 +12,7 @@ import Shard from "../../models/Shard.js";
 import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
 import { createNotification } from "./Notifications.js";
 import { User } from "../../models/User.js";
-import { sendNotificationToUsers } from "../../Helpers/FirebaseMessaging.js";
+import { enqueuePushNotification } from "../../Helpers/Queue.js";
 import { moderate } from "../../Helpers/ContentModerator.js";
 
 const cacheInvalidateChat = cacheInvalidate.chat;
@@ -22,6 +22,58 @@ const cacheInvalidateUserChats = cacheInvalidate.userChats;
 let io: any = null;
 export function setSocketIO(ioInstance: any) {
   io = ioInstance;
+}
+
+/**
+ * Helper to parse @mentions and notify users.
+ * Returns array of mentioned User IDs.
+ */
+async function processMentions(
+  content: string, 
+  participants: string[], 
+  senderId: string, 
+  chatId: string, 
+  senderUsername: string
+): Promise<string[]> {
+  const atMatches = content.match(/@(\w+)/g);
+  if (!atMatches) return [];
+
+  const foundUsernames = atMatches.map(m => m.substring(1).toLowerCase());
+  let mentionedIds: string[] = [];
+
+  if (foundUsernames.includes('everyone')) {
+    // Mention all participants except sender
+    mentionedIds = participants.filter(p => p !== senderId);
+  } else {
+    // Find specific users by username
+    const [error, users] = await catchError(
+      User.find({ 
+        username: { $in: foundUsernames.map(u => new RegExp(`^${u}$`, 'i')) } 
+      }).select('_id').lean()
+    );
+    
+    if (!error && users) {
+      mentionedIds = users
+        .map((u: any) => u._id.toString())
+        .filter(id => id !== senderId && participants.includes(id));
+    }
+  }
+
+  const uniqueMentions = [...new Set(mentionedIds)];
+  
+  if (uniqueMentions.length > 0) {
+    enqueuePushNotification(
+      uniqueMentions,
+      {
+        title: `@${senderUsername} mentioned you`,
+        body: content.length > 60 ? content.substring(0, 60) + "..." : content,
+        data: { chatId, screen: "/(screens)/shard/[id]/chat", isMention: "true" }
+      },
+      'messages'
+    ).catch(e => logError("MentionNotificationError", e));
+  }
+
+  return uniqueMentions;
 }
 
 export default {
@@ -199,6 +251,9 @@ export default {
         notfound = true;
       }
 
+      // Fetch sender information for mentions
+      const [senderError, sender] = await catchError(User.findById(context.id).select("username profilePic").lean());
+
       if (!chat) {
         const [shardError, shard] = await catchError(
           Shard.findById(chatId).select("title, participants, owner").lean()
@@ -296,6 +351,18 @@ export default {
         }
       }
 
+      // Process mentions if it's a text message
+      let mentionedIds: string[] = [];
+      if (type === 'text' || !type) {
+        mentionedIds = await processMentions(
+          content,
+          chat.participants.map((p: any) => p.toString()),
+          context.id,
+          chatId.toString(),
+          sender?.username || "Someone"
+        );
+      }
+
       // Create message
       const messageData: any = {
         chatId,
@@ -304,6 +371,7 @@ export default {
         type: type || "text",
         readBy: [context.id], // Mark as read by sender
         readAt: [{ userId: context.id, readAt: new Date() }],
+        mentions: mentionedIds,
       };
 
       if (replyTo) {
@@ -338,10 +406,6 @@ export default {
       const otherParticipants = chat.participants
         .filter((p: any) => p.toString() !== context.id);
 
-      const [senderError, sender] = await catchError(
-        User.findById(context.id).select("username").lean()
-      );
-
       for (const participant of otherParticipants) {
         await createNotification(
           participant.toString(),
@@ -350,20 +414,26 @@ export default {
         );
       }
 
-      // Send Push Notification
-      const recipientIds = otherParticipants.map((p: any) => p.toString());
-      await sendNotificationToUsers(
-        recipientIds,
-        {
-          title: `New message from ${sender?.username || "Someone"}`,
-          body: content.length > 50 ? content.substring(0, 50) + "..." : content,
-          data: { 
-            chatId: chatId.toString(), 
-            screen: "/(screens)/shard/[id]/chat" 
-          }
-        },
-        'messages' // Check message notification preferences
-      );
+      // Send Push Notification asynchronously via Queue
+      // Filter out mentioned users to avoid double notifications
+      const recipientIds = otherParticipants
+        .map((p: any) => p.toString())
+        .filter(id => !mentionedIds.includes(id));
+
+      if (recipientIds.length > 0) {
+        enqueuePushNotification(
+          recipientIds,
+          {
+            title: `New message from ${sender?.username || "Someone"}`,
+            body: content.length > 50 ? content.substring(0, 50) + "..." : content,
+            data: { 
+              chatId: chatId.toString(), 
+              screen: "/(screens)/shard/[id]/chat" 
+            }
+          },
+          'messages'
+        ).catch(e => logError("QueueDispatchError", e));
+      }
 
       // Emit WebSocket event for real-time messaging
       if (io) {
@@ -611,6 +681,187 @@ export default {
       return {
         success: true,
         message: "Reaction removed.",
+      };
+    },
+    // Create Poll
+    async createPoll(_, { chatId, question, options }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+      
+      const chat = await Chat.findById(chatId).lean();
+      if (!chat) return { success: false, message: "Chat not found" };
+      
+      const [senderError, sender] = await catchError(User.findById(context.id).select("username profilePic").lean());
+
+      const pollOptions = options.map((text: string) => ({ text, votes: [] }));
+      const newMessage = await Message.create({
+        chatId,
+        sender: context.id,
+        content: `📊 Poll: ${question}`,
+        type: "poll",
+        poll: { question, options: pollOptions, multipleAnswers: false },
+        readBy: [context.id],
+        readAt: [{ userId: context.id, readAt: new Date() }],
+      });
+
+      if (io) {
+        io.to(`chat:${chatId}`).emit("message:new", {
+          id: newMessage._id.toString(),
+          chatId,
+          sender: context.id,
+          senderUsername: sender?.username || "Unknown",
+          content: newMessage.content,
+          type: newMessage.type,
+          createdAt: newMessage.createdAt,
+        });
+      }
+
+      return {
+        success: true,
+        message: "Poll created successfully",
+        messageData: {
+          id: newMessage._id.toString(),
+          content: newMessage.content,
+          type: newMessage.type,
+          sender: {
+            id: context.id,
+            username: sender?.username || "Unknown",
+            profilePic: sender?.profilePic || "",
+          },
+          createdAt: newMessage.createdAt,
+        },
+      };
+    },
+
+    // Vote on Poll
+    async votePoll(_, { messageId, optionIndex }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+      
+      const message = await Message.findById(messageId);
+      if (!message || message.type !== "poll" || !message.poll) {
+        return { success: false, message: "Poll not found." };
+      }
+
+      // Remove existing vote for this user (single answer logic)
+      message.poll.options.forEach((opt: any) => {
+        opt.votes = opt.votes.filter((v: any) => v.toString() !== context.id);
+      });
+
+      // Add new vote
+      if (message.poll.options[optionIndex]) {
+        message.poll.options[optionIndex].votes.push(context.id as any);
+      }
+
+      await message.save();
+
+      if (io) {
+        io.to(`chat:${message.chatId.toString()}`).emit("message:poll:voted", {
+          messageId,
+          optionIndex,
+          userId: context.id,
+        });
+      }
+
+      return { success: true, message: "Voted successfully." };
+    },
+
+    // Assign Minitask
+    async assignTaskFromChat(_, { chatId, taskId, assigneeId }, context) {
+       if (!context.id) ThrowError("Please login to continue.");
+       
+       const [senderError, sender] = await catchError(User.findById(context.id).select("username profilePic").lean());
+       const [chatError, chat] = await catchError(Chat.findById(chatId).lean());
+       if (!chat) ThrowError("Chat not found");
+
+       let finalTaskId = taskId;
+       
+       // If no taskId, find the first available miniGoal for this shard and add a task
+       if (!finalTaskId && chat.shardId) {
+         const MiniGoal = (await import("../../models/MiniGoal")).default;
+         const [goalError, goal] = await catchError(MiniGoal.findOne({ shardId: chat.shardId, completed: false }).sort({ createdAt: 1 }));
+         if (goal) {
+           goal.tasks.push({
+             title: "Chat Assigned Task",
+             completed: false,
+             assignedTo: assigneeId,
+             deleted: false,
+           } as any);
+           await goal.save();
+           finalTaskId = "dynamic-" + Date.now();
+         }
+       }
+       
+       const newMessage = await Message.create({
+         chatId,
+         sender: context.id,
+         content: `📋 Task Assigned.`,
+         type: "minitask_assignment",
+         minitaskRef: { taskId: finalTaskId || "general", assignedTo: assigneeId },
+         readBy: [context.id],
+         readAt: [{ userId: context.id, readAt: new Date() }],
+       });
+       
+       if (io) {
+        io.to(`chat:${chatId}`).emit("message:new", {
+          id: newMessage._id.toString(),
+          chatId,
+          sender: context.id,
+          senderUsername: sender?.username || "Unknown",
+          content: newMessage.content,
+          type: newMessage.type,
+          createdAt: newMessage.createdAt,
+        });
+       }
+
+       return {
+         success: true,
+         message: "Task assigned and announced in chat.",
+         messageData: {
+          id: newMessage._id.toString(),
+          content: newMessage.content,
+          type: newMessage.type,
+          sender: { id: context.id, username: sender?.username || "Unknown", profilePic: sender?.profilePic || "" },
+          createdAt: newMessage.createdAt,
+         }
+       };
+    },
+
+    // Summon Summary
+    async summonSummary(_, { chatId }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+      
+      const content = `📈 Progress Summary\nShard Progress is on track. System calculated current milestone status.`;
+
+      const newMessage = await Message.create({
+         chatId,
+         sender: context.id,
+         content,
+         type: "summary_ping",
+         readBy: [context.id],
+         readAt: [{ userId: context.id, readAt: new Date() }],
+      });
+
+      if (io) {
+        io.to(`chat:${chatId}`).emit("message:new", {
+          id: newMessage._id.toString(),
+          chatId,
+          sender: context.id,
+          senderUsername: "System Analyst",
+          content: newMessage.content,
+          type: newMessage.type,
+          createdAt: newMessage.createdAt,
+        });
+      }
+
+      return {
+        success: true,
+        message: "Summary summoned",
+        messageData: {
+          id: newMessage._id.toString(),
+          content: newMessage.content,
+          type: newMessage.type,
+          sender: { id: context.id, username: "System Analyst", profilePic: "" },
+          createdAt: newMessage.createdAt,
+        }
       };
     },
   },

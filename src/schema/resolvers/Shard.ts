@@ -16,7 +16,7 @@ import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
 import { awardXP, checkAchievements } from "./XP.js";
 import { getCloudinarySignedUpload } from "../../Helpers/Cloudinary.js";
 import { calculateDueDate, distributeDatesEvenly, smartSchedule, SchedulableTask } from "../../Helpers/DateHelper.js";
-import { sendNotificationToUsers, sendNotificationToUser } from "../../Helpers/FirebaseMessaging.js";
+import { enqueuePushNotification } from "../../Helpers/Queue.js";
 
 // ─── Standalone schedule helper (called by both scheduleTasks + generateWeeklyTasks) ───
 
@@ -381,7 +381,7 @@ export default {
         // Notify participants
         if (participants && participants.length > 0) {
           const participantIds = participants.map((p: any) => p.user);
-          await sendNotificationToUsers(
+          await enqueuePushNotification(
             participantIds,
             {
               title: "New Quest Invite",
@@ -389,7 +389,7 @@ export default {
               data: { shardId: newShard._id.toString(), screen: "/shard-info" }
             },
             'shardInvites' // Check shard invite preferences
-          );
+          ).catch(e => logError("PushNotificationError", e));
         }
 
         console.log("🎉 [createShard] Shard creation complete!");
@@ -739,17 +739,17 @@ export default {
         await Promise.all(newlyAddedIds.map((uid: string) => {
           cacheInvalidate.shardList(uid);
           createNotification(uid, `${ownerName} added you to the quest: ${updatedShard.title}`, "shard_invite", { shardId: id });
-          return sendNotificationToUser(uid, {
+          return enqueuePushNotification([uid], {
             title: "You've been added to a Quest!",
             body: `${ownerName} added you to "${updatedShard.title}"`,
             data: { shardId: id, screen: "/shard-info" }
-          }, 'shardInvites');
+          }, 'shardInvites').catch(e => logError("PushNotificationError", e));
         }));
       }
 
       // Send "quest updated" only to existing participants
       if (existingIds.length > 0) {
-        await sendNotificationToUsers(
+        await enqueuePushNotification(
           existingIds,
           {
             title: "Quest Updated",
@@ -757,7 +757,7 @@ export default {
             data: { shardId: updatedShard._id.toString(), screen: "/shard-info" }
           },
           'shardUpdates'
-        );
+        ).catch(e => logError("PushNotificationError", e));
       }
 
       // Trigger reflection mission when shard is marked complete
@@ -940,15 +940,15 @@ export default {
         { shardId }
       );
 
-      await sendNotificationToUser(
-        userId,
+      enqueuePushNotification(
+        [userId],
         {
           title: "You've been added to a Quest!",
           body: `${ownerName} added you to "${shard.title}"`,
           data: { shardId: shardId, screen: "/shard-info" }
         },
         'shardInvites'
-      );
+      ).catch(e => logError("QueueDispatchError", e));
 
       return {
         success: true,
@@ -1099,15 +1099,15 @@ export default {
       });
 
       // Push notification to assignee
-      await sendNotificationToUser(
-        userId,
+      await enqueuePushNotification(
+        [userId],
         {
           title: "New Assignment",
           body: `${assignerName} assigned "${targetLabel}" to you in ${shard.title}`,
           data: { shardId: shard._id.toString(), screen: "/shard-info" }
         },
         'questDeadlines'
-      );
+      ).catch(e => logError("PushNotificationError", e));
 
       return { success: true, message: "Assigned successfully." };
     },
@@ -1794,7 +1794,11 @@ export default {
       );
 
       if (error || !shardData) {
-        throw new Error("Quest not found");
+        return {
+          success: false,
+          message: "Quest not found",
+          shard: null,
+        };
       }
 
       // Fetch mini-goals directly from database
