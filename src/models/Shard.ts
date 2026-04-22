@@ -24,6 +24,11 @@ export interface ShardDocument extends Document {
   status: "active" | "paused" | "completed" | "expired";
   // Removed miniGoals array - using separate MiniGoal collection instead
   rewards: { type: "xp" | "badge"; value: number | string }[];
+  questType: "standard" | "habit";
+  cadence?: "daily" | "weekly" | "custom";
+  habitStreak: number;
+  lastActivityAt?: Date;
+  lastNudgedAt?: Date;
   isPrivate: boolean;
   isAnonymous: boolean;
   version: number;
@@ -67,6 +72,18 @@ const ShardSchema = new Schema<ShardDocument>(
         value: { type: Schema.Types.Mixed, required: true },
       },
     ],
+    questType: {
+      type: String,
+      enum: ["standard", "habit"],
+      default: "standard"
+    },
+    cadence: {
+      type: String,
+      enum: ["daily", "weekly", "custom"]
+    },
+    habitStreak: { type: Number, default: 0 },
+    lastActivityAt: { type: Date },
+    lastNudgedAt: { type: Date },
     isPrivate: { type: Boolean, default: false },
     isAnonymous: { type: Boolean, default: false },
     version: { type: Number, default: 1 },

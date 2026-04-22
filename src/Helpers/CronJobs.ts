@@ -427,3 +427,144 @@ export function startScheduledNotificationDispatcher() {
   console.log('✅ [Cron] Scheduled notification dispatcher started (runs every 5 minutes)');
 }
 
+/**
+ * AI Coach: Inactivity Nudger
+ * Runs at 10 AM daily - nudges owners of shards idle for 3+ days.
+ * Rate-limited to 1 nudge/shard/7 days. AI only for Pro users within daily cap.
+ */
+export function startInactivityNudger() {
+  cron.schedule('0 10 * * *', async () => {
+    console.log('🤖 [Cron] Running AI inactivity nudger...');
+    try {
+      const {
+        canMakeCoachAICall, incrementCoachAICounter,
+        generateInactivityNudge, COACH_TEMPLATES
+      } = await import('./AIHelper.js');
+
+      const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+
+      const staleShards = await Shard.find({
+        status: 'active',
+        $and: [
+          { $or: [{ lastActivityAt: { $lt: threeDaysAgo } }, { lastActivityAt: { $exists: false } }] },
+          { $or: [{ lastNudgedAt: { $lt: sevenDaysAgo } }, { lastNudgedAt: { $exists: false } }] },
+        ],
+      }).select('owner title lastActivityAt').lean();
+
+      console.log(`🤖 [Cron] Found ${staleShards.length} stale shards`);
+
+      for (const shard of staleShards) {
+        const ownerId = shard.owner.toString();
+        const staleDays = shard.lastActivityAt
+          ? Math.floor((Date.now() - new Date(shard.lastActivityAt).getTime()) / 86400000)
+          : 3;
+
+        const owner = await User.findById(ownerId).select('subscriptionTier').lean();
+        const isPro = (owner as any)?.subscriptionTier === 'pro';
+
+        const nudge = (isPro && canMakeCoachAICall())
+          ? (incrementCoachAICounter(), await generateInactivityNudge(shard.title, staleDays))
+          : COACH_TEMPLATES.inactivity(shard.title);
+
+        await sendNotificationToUser(
+          ownerId,
+          { title: '🤖 Quest Coach', body: nudge, data: { shardId: shard._id.toString() } },
+          'questDeadlines'
+        );
+        await createNotification(ownerId, nudge, 'quest_deadline', { shardId: shard._id.toString() });
+        await Shard.findByIdAndUpdate(shard._id, { lastNudgedAt: new Date() });
+      }
+      console.log('✅ [Cron] Inactivity nudger done');
+    } catch (error) {
+      logError('cron:inactivityNudger', error);
+    }
+  });
+  console.log('✅ [Cron] Inactivity nudger started (runs 10 AM daily)');
+}
+
+/**
+ * AI Coach: Streak Event Detector
+ * Runs at 11 AM daily.
+ * - Streak BREAK (previousStreak > 2, currentStreak === 0): simplify tasks
+ * - Streak MILESTONE (currentStreak % 7 === 0): suggest stretch goal
+ */
+export function startStreakEventDetector() {
+  cron.schedule('0 11 * * *', async () => {
+    console.log('🤖 [Cron] Running streak event detector...');
+    try {
+      const {
+        canMakeCoachAICall, incrementCoachAICounter,
+        generateSimplifiedTasks, generateStretchGoal, COACH_TEMPLATES
+      } = await import('./AIHelper.js');
+      const MiniGoal = (await import('../models/MiniGoal.js')).default;
+
+      // ── Streak break ───
+      const brokenUsers = await User.find({ currentStreak: 0, previousStreak: { $gt: 2 } })
+        .select('_id subscriptionTier').lean();
+
+      for (const u of brokenUsers) {
+        const userId = u._id.toString();
+        const isPro = (u as any).subscriptionTier === 'pro';
+        const shard = await Shard.findOne({ owner: u._id, status: 'active' })
+          .sort({ lastActivityAt: -1 }).select('_id title').lean();
+        if (!shard) continue;
+
+        const mg = await MiniGoal.findOne({ shardId: shard._id, completed: false }).lean();
+        const incompleteTasks = mg
+          ? (mg.tasks as any[]).filter(t => !t.completed && !t.deleted).map(t => t.title)
+          : [];
+
+        let message: string;
+        if (isPro && incompleteTasks.length > 0 && canMakeCoachAICall()) {
+          const simplified = await generateSimplifiedTasks(shard.title, incompleteTasks);
+          incrementCoachAICounter();
+          if (simplified.length > 0 && mg) {
+            let si = 0;
+            const updatedTasks = (mg.tasks as any[]).map(t =>
+              !t.completed && !t.deleted && si < simplified.length
+                ? { ...t, title: simplified[si++] }
+                : t
+            );
+            await MiniGoal.findByIdAndUpdate(mg._id, { tasks: updatedTasks });
+          }
+          message = `🔄 Your coach simplified tasks in "${shard.title}" to help you restart!`;
+        } else {
+          message = COACH_TEMPLATES.streakBreak(shard.title);
+        }
+
+        await sendNotificationToUser(userId, { title: '🤖 Quest Coach', body: message, data: { shardId: shard._id.toString() } }, 'questDeadlines');
+        await createNotification(userId, message, 'quest_deadline', { shardId: shard._id.toString() });
+      }
+
+      // ── Streak milestone ───
+      const milestoneUsers = await User.find({
+        currentStreak: { $gt: 0 },
+        $expr: { $eq: [{ $mod: ['$currentStreak', 7] }, 0] },
+      }).select('_id subscriptionTier currentStreak').lean();
+
+      for (const u of milestoneUsers) {
+        const userId = u._id.toString();
+        const streak = (u as any).currentStreak as number;
+        const isPro = (u as any).subscriptionTier === 'pro';
+        const shard = await Shard.findOne({ owner: u._id, status: 'active' })
+          .sort({ lastActivityAt: -1 }).select('_id title').lean();
+        if (!shard) continue;
+
+        const suggestion = (isPro && canMakeCoachAICall())
+          ? (incrementCoachAICounter(), await generateStretchGoal(shard.title, streak))
+          : COACH_TEMPLATES.milestone(streak);
+
+        const body = `${suggestion} Add it to "${shard.title}" now! 🚀`;
+        await sendNotificationToUser(userId, { title: `🔥 ${streak}-Day Streak!`, body, data: { shardId: shard._id.toString() } }, 'questDeadlines');
+        await createNotification(userId, body, 'quest_deadline', { shardId: shard._id.toString() });
+      }
+
+      console.log('✅ [Cron] Streak event detector done');
+    } catch (error) {
+      logError('cron:streakEventDetector', error);
+    }
+  });
+  console.log('✅ [Cron] Streak event detector started (runs 11 AM daily)');
+}
+

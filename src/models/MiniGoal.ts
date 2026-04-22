@@ -12,6 +12,8 @@ interface Task {
   // Reschedule tracking
   rescheduled: boolean;
   originalDueDate?: Date;
+  // Assignment
+  assignedTo?: string; // userId string
 }
 
 export interface MiniGoalDocument extends Document {
@@ -42,6 +44,8 @@ const TaskSchema = new Schema<Task>(
     // Reschedule tracking
     rescheduled: { type: Boolean, default: false },
     originalDueDate: Date,
+    // Assignment
+    assignedTo: { type: String, default: null },
   },
   { _id: false }
 );

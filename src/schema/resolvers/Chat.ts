@@ -13,6 +13,7 @@ import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
 import { createNotification } from "./Notifications.js";
 import { User } from "../../models/User.js";
 import { sendNotificationToUsers } from "../../Helpers/FirebaseMessaging.js";
+import { moderate } from "../../Helpers/ContentModerator.js";
 
 const cacheInvalidateChat = cacheInvalidate.chat;
 const cacheInvalidateUserChats = cacheInvalidate.userChats;
@@ -253,6 +254,17 @@ export default {
           success: false,
           message: "You are not a participant in this chat.",
         };
+      }
+
+      // Moderate message content
+      if (content && type === 'text') {
+        const msgMod = moderate(content, 'chat');
+        if (!msgMod.allowed) {
+          return {
+            success: false,
+            message: msgMod.crisisMessage || msgMod.reason || 'Message could not be sent.',
+          };
+        }
       }
 
       // Scan URLs in message content for safety

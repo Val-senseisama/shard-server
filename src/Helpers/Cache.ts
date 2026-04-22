@@ -167,6 +167,8 @@ export const cacheInvalidate = {
     await cache.del(cacheKeys.friendship(friendId, userId));
     await cache.delPattern(cacheKeys.userFriendships(userId, "*"));
     await cache.delPattern(cacheKeys.userFriendships(friendId, "*"));
+    await cache.del(`friends:suggestions:${userId}`);
+    await cache.del(`friends:suggestions:${friendId}`);
   },
 
   chat: async (chatId: string) => {

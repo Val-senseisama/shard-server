@@ -53,7 +53,7 @@ export default {
         };
       }
 
-      // Check if friend exists
+      // Check if both the target user and the sender exist
       const [friendError, friend] = await catchError(
         User.findById(friendId).select("username").lean()
       );
@@ -65,6 +65,10 @@ export default {
         };
       }
 
+      const [senderError, sender] = await catchError(
+        User.findById(context.id).select("username").lean()
+      );
+
       // Create friend request (bidirectional)
       const [createError] = await catchError(
         Promise.all([
@@ -74,7 +78,6 @@ export default {
             status: "pending",
             requestedBy: context.id,
           }),
-          // Create reverse friendship
           Friendship.create({
             user: friendId,
             friend: context.id,
@@ -92,12 +95,14 @@ export default {
         };
       }
 
+      const senderName = (!senderError && sender) ? (sender as any).username : "Someone";
+
       // Fire-and-forget: cache, notifications, audit trail
       cacheInvalidate.friendship(context.id, friendId).catch((e) => logError("sendFriendRequest:cacheInvalidate", e));
 
       createNotification(
         friendId,
-        `${friend.username} wants to be friends with you`,
+        `${senderName} wants to be friends with you`,
         "friend_request"
       ).catch((e) => logError("sendFriendRequest:createNotification", e));
 
@@ -105,7 +110,7 @@ export default {
         friendId,
         {
           title: "New Friend Request",
-          body: `${friend.username} wants to be friends with you!`,
+          body: `${senderName} wants to be friends with you!`,
           data: { screen: "/(screens)/friends" }
         },
         'friendRequests'

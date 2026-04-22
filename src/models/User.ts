@@ -46,8 +46,14 @@ export interface IUser extends Document {
   currentStreak: number;
   longestStreak: number;
   lastCompletionDate?: Date;
+  streakFreezeTokens: number;
+  comebackBonusUntil?: Date;
+  previousStreak: number;
 
   subscriptionTier: 'free' | 'pro';
+
+  birthdate?: Date;
+  timezone?: string;
 
   // Workload Preferences
   preferences: {
@@ -148,6 +154,9 @@ const UserSchema: Schema<IUser> = new Schema(
     lastLoginAt: Date,
     lastActive: Date,
 
+    birthdate: { type: Date },
+    timezone: { type: String, default: 'UTC' },
+
     // Search hashes (SHA-256 of lowercased email / phone)
     emailHash: { type: String, sparse: true, index: true },
     phoneHash: { type: String, sparse: true, index: true },
@@ -202,6 +211,9 @@ const UserSchema: Schema<IUser> = new Schema(
       default: 0
     },
     lastCompletionDate: Date,
+    streakFreezeTokens: { type: Number, default: 1 },
+    comebackBonusUntil: Date,
+    previousStreak: { type: Number, default: 0 },
 
     achievements: {
          type: [String],

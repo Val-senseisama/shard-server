@@ -12,7 +12,8 @@ import typeDefs from "./schema/Typedefinitions.js";
 import resolvers from "./schema/Resolvers.js";
 import cors from "cors";
 import { setupWebSocketServer } from "./server/WebSocketServer.js";
-import { startOverdueTaskReschedule, startDeletedTaskPurge, startDeadlineReminders, startOverdueAlerts, startDailyTaskReminders, startScheduledNotificationDispatcher } from './Helpers/CronJobs.js';
+import { startOverdueTaskReschedule, startDeletedTaskPurge, startDeadlineReminders, startOverdueAlerts, startDailyTaskReminders, startScheduledNotificationDispatcher, startInactivityNudger, startStreakEventDetector } from './Helpers/CronJobs.js';
+import { handleRevenueCatWebhook } from "./controllers/WebhookController.js";
 
 const PORT = process.env.PORT || 4000;
 
@@ -31,6 +32,8 @@ export { io }; // Export for use in other files
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+app.post("/webhooks/revenuecat", handleRevenueCatWebhook);
 
 
 const server = new ApolloServer({
@@ -65,4 +68,6 @@ httpServer.listen(PORT, () => {
     startOverdueAlerts();
     startDailyTaskReminders();
     startScheduledNotificationDispatcher();
+    startInactivityNudger();
+    startStreakEventDetector();
 });

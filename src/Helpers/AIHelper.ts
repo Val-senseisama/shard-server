@@ -37,10 +37,17 @@ export async function checkAIUsage(userId: string, tier: "free" | "pro"): Promis
 }
 
 /**
- * Track AI usage (deduct credit)
+ * Track AI usage (deduct credit for free users)
  * @param userId - User ID
+ * @param tier - User subscription tier
  */
-export async function trackAIUsage(userId: string): Promise<void> {
+export async function trackAIUsage(userId: string, tier: "free" | "pro" = "free"): Promise<void> {
+  // Pro users have unlimited credits, so skip decrement
+  if (tier === "pro") {
+    console.log(`[AIUsage] Skipping credit decrement for Pro user: ${userId}`);
+    return;
+  }
+
   // Decrement credits by 1
   await User.findByIdAndUpdate(userId, {
     $inc: { aiCredits: -1 }
@@ -74,6 +81,27 @@ If user mentions self-harm or crisis:
 - Do not generate tasks - suggest professional support only
 `;
 
+export interface UserContext {
+  username: string;
+  bio?: string;
+  age?: number;
+  timezone?: string;
+  level: number;
+  currentStreak: number;
+  stats: {
+    strength: number;
+    intelligence: number;
+    charisma: number;
+    endurance: number;
+    creativity: number;
+  };
+  preferences: {
+    workloadLevel: string;
+    maxTasksPerDay: number;
+    preferredTaskDuration: string;
+  };
+}
+
 /**
  * Quest breakdown prompt for AI
  */
@@ -98,11 +126,24 @@ Rules:
 - Support any type of goal (personal, career, fitness, money, etc.)
 - Output structured JSON that our app can store and render.
 
-If information is missing, make reasonable assumptions.
+PERSONALIZATION (apply when a user profile is provided):
+- Tailor task types to RPG stats: high Strength → physical/action tasks; high Intelligence → research/learning; high Charisma → social/networking; high Endurance → consistency habits; high Creativity → creative/innovative approaches. Stats range 1–100.
+- Respect workload preference: "light" = 2–3 simple tasks per mini-quest; "medium" = 4–5 balanced tasks; "aggressive" = push harder with stretch tasks.
+- Match difficulty to app level: 1–5 = beginner (simple, guided steps); 6–15 = intermediate (assumes some experience); 16+ = advanced (concise, self-directed steps).
+- Mention the user by name in motivationTips to make it feel personal.
+- If the user has a bio, use it to make the plan more relevant to their life.
+
+UNREALISTIC GOAL/DEADLINE DETECTION:
+- Evaluate whether the goal is genuinely achievable within the deadline.
+- If clearly impossible (e.g., "get a PhD in 2 weeks", "lose 30kg in 3 days", "build a profitable startup in 1 day"), set "warning" to a short, friendly explanation and include a realistic suggested timeline. Still generate the full plan.
+- If the deadline is very tight but not impossible, set "warning" to acknowledge it and note the intensity required.
+- If the goal is vague, silently make it concrete — do not warn for this.
+- If there are no issues, set "warning" to null.
 
 FORMAT STRICTLY AS JSON:
 
 {
+  "warning": null,
   "mainQuest": {
     "title": "",
     "description": "",
@@ -145,13 +186,19 @@ Example Goal Input:
  * Call Groq API to break down goals into quests
  * @param goal - User's goal description
  * @param deadline - Optional deadline
+ * @param userContext - Optional user profile for personalisation
  * @returns Parsed quest breakdown
  */
-export async function breakDownGoalWithAI(goal: string, deadline?: string): Promise<any> {
-  // Prepare the prompt with goal and deadline
-  const userPrompt = deadline
-    ? `Goal: ${goal}\n\nDeadline: ${deadline}\n\nPlease break this down into a structured quest.`
-    : `Goal: ${goal}\n\nPlease break this down into a structured quest.`;
+export async function breakDownGoalWithAI(goal: string, deadline?: string, userContext?: UserContext): Promise<any> {
+  const userProfile = userContext
+    ? `\nUser Profile:
+- Name: ${userContext.username}${userContext.age ? `\n- Age: ${userContext.age}` : ''}${userContext.bio ? `\n- Bio: ${userContext.bio}` : ''}${userContext.timezone ? `\n- Timezone: ${userContext.timezone}` : ''}
+- App Level: ${userContext.level} | Current streak: ${userContext.currentStreak} days
+- RPG Stats — Strength: ${userContext.stats.strength}, Intelligence: ${userContext.stats.intelligence}, Charisma: ${userContext.stats.charisma}, Endurance: ${userContext.stats.endurance}, Creativity: ${userContext.stats.creativity}
+- Workload preference: ${userContext.preferences.workloadLevel} (max ${userContext.preferences.maxTasksPerDay} tasks/day, preferred task length: ${userContext.preferences.preferredTaskDuration})`
+    : '';
+
+  const userPrompt = `Goal: ${goal}${deadline ? `\nDeadline: ${deadline}` : ''}${userProfile}\n\nPlease break this down into a structured quest.`;
 
   try {
     const completion = await groq.chat.completions.create({
@@ -527,5 +574,113 @@ No additional text, just the JSON array.`;
       { title: `Practice ${miniGoalTitle} exercises`, estimatedTime: "45 min" },
       { title: `Review ${miniGoalTitle} concepts`, estimatedTime: "30 min" },
     ];
+  }
+}
+
+// ─── AI Quest Coach ────────────────────────────────────────────────────────────
+
+/** Global daily AI call counter — resets at midnight. */
+let _aiCoachCallsToday = 0;
+let _aiCoachResetDate = new Date().toDateString();
+
+export function canMakeCoachAICall(): boolean {
+  const today = new Date().toDateString();
+  if (today !== _aiCoachResetDate) {
+    _aiCoachCallsToday = 0;
+    _aiCoachResetDate = today;
+  }
+  const cap = parseInt(process.env.AI_COACH_DAILY_CAP || "50", 10);
+  return _aiCoachCallsToday < cap;
+}
+
+export function incrementCoachAICounter(): void {
+  _aiCoachCallsToday++;
+}
+
+/** Pre-written fallback templates — zero AI cost. Used for free users or when cap is hit. */
+export const COACH_TEMPLATES = {
+  inactivity: (shardTitle: string) =>
+    `Your quest "${shardTitle}" is waiting for you! Even one small task today keeps the momentum going. 💪`,
+  streakBreak: (shardTitle: string) =>
+    `Streak reset on "${shardTitle}" — but every champion bounces back. Let's restart! 🔄`,
+  milestone: (streak: number) =>
+    `🔥 ${streak}-day streak! You're on fire — ready to add a new challenge?`,
+};
+
+/**
+ * Generate a short inactivity nudge. Max 256 tokens.
+ */
+export async function generateInactivityNudge(
+  shardTitle: string,
+  staleDays: number
+): Promise<string> {
+  try {
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: [{
+        role: "user",
+        content: `A user hasn't worked on their quest "${shardTitle}" in ${staleDays} days. Write ONE motivational nudge (max 2 sentences, friendly, gamified tone, one emoji). No greetings.`,
+      }],
+      temperature: 0.8,
+      max_completion_tokens: 256,
+      top_p: 1,
+    });
+    return completion.choices[0]?.message?.content?.trim() || COACH_TEMPLATES.inactivity(shardTitle);
+  } catch {
+    return COACH_TEMPLATES.inactivity(shardTitle);
+  }
+}
+
+/**
+ * Rewrite incomplete tasks into simpler micro-steps after a streak break.
+ * Returns max 5 task title strings.
+ */
+export async function generateSimplifiedTasks(
+  shardTitle: string,
+  incompleteTasks: string[]
+): Promise<string[]> {
+  try {
+    const taskList = incompleteTasks.slice(0, 5).join(", ");
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: [{
+        role: "user",
+        content: `The user lost their streak on "${shardTitle}". Incomplete tasks: ${taskList}. Rewrite as 3–5 simpler micro-tasks (max 10 words each) to help them restart. Return ONLY a JSON array of strings.`,
+      }],
+      temperature: 0.7,
+      max_completion_tokens: 256,
+      top_p: 1,
+    });
+    const content = completion.choices[0]?.message?.content || "";
+    const match = content.match(/\[[\s\S]*\]/);
+    if (!match) return [];
+    const parsed = JSON.parse(match[0]);
+    return Array.isArray(parsed) ? parsed.slice(0, 5) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Suggest a bonus stretch goal for a streak milestone.
+ */
+export async function generateStretchGoal(
+  shardTitle: string,
+  streak: number
+): Promise<string> {
+  try {
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: [{
+        role: "user",
+        content: `User hit a ${streak}-day streak on "${shardTitle}". Suggest ONE exciting bonus challenge they could add (max 15 words, action-oriented). No preamble.`,
+      }],
+      temperature: 0.8,
+      max_completion_tokens: 128,
+      top_p: 1,
+    });
+    return completion.choices[0]?.message?.content?.trim() || COACH_TEMPLATES.milestone(streak);
+  } catch {
+    return COACH_TEMPLATES.milestone(streak);
   }
 }

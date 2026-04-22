@@ -6,9 +6,10 @@ import {
 } from "../../Helpers/Helpers.js";
 import Shard from "../../models/Shard.js";
 import MiniGoal from "../../models/MiniGoal.js";
-import Chat from "../../models/Chat.js";
+import Chat, { Message } from "../../models/Chat.js";
 import { User } from "../../models/User.js";
-import { breakDownGoalWithAI, checkAIUsage, trackAIUsage, enrichManualShard, generateReflectionMission } from "../../Helpers/AIHelper.js";
+import { breakDownGoalWithAI, checkAIUsage, trackAIUsage, enrichManualShard, generateReflectionMission, UserContext } from "../../Helpers/AIHelper.js";
+import { moderate } from "../../Helpers/ContentModerator.js";
 import SideQuest from "../../models/SideQuest.js";
 import { createNotification } from "./Notifications.js";
 import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
@@ -103,17 +104,17 @@ async function _scheduleShardTasks(shardId: string, userId: string) {
 export default {
   Mutation: {
     // Create a new quest (Shard) with AI breakdown
-    async createShard(_, { goal, deadline, image, participants, isPrivate, isAnonymous }, context) {
+    async createShard(_, { goal, deadline, image, participants, isPrivate, isAnonymous, questType, cadence }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
       console.log("🚀 [createShard] Starting shard creation with AI");
       console.log("📝 [createShard] Input:", { goal, deadline, image, participantsCount: participants?.length });
 
       try {
-        // Get user tier to check AI limits
+        // Get user data for limit check, personalization, and scheduling
         console.log("👤 [createShard] Fetching user data for:", context.id);
         const [userError, user] = await catchError(
-          User.findById(context.id, "role subscriptionTier").lean()
+          User.findById(context.id, "role subscriptionTier username bio birthdate timezone level xp currentStreak strength intelligence charisma endurance creativity preferences").lean()
         );
 
         if (userError) {
@@ -127,31 +128,77 @@ export default {
 
         console.log("✅ [createShard] User found:", { userId: context.id, role: user?.role });
 
-        // Check AI usage limit based on user's subscription tier
-        console.log("🔍 [createShard] Checking AI usage limits");
-        const tier = user?.subscriptionTier || 'free';
-        const usageCheck = await checkAIUsage(context.id, tier);
-        console.log("📊 [createShard] AI usage:", usageCheck);
+        // Admins have unlimited AI calls — skip limit check and credit deduction
+        let usageCheck = { canProceed: true, limit: -1, used: 0, remaining: -1 };
+        if (user?.role !== 'admin') {
+          console.log("🔍 [createShard] Checking AI usage limits");
+          const tier = user?.subscriptionTier || 'free';
+          usageCheck = await checkAIUsage(context.id, tier);
+          console.log("📊 [createShard] AI usage:", usageCheck);
 
-        if (!usageCheck.canProceed) {
-          console.warn("⚠️ [createShard] AI limit reached for user:", context.id);
+          if (!usageCheck.canProceed) {
+            console.warn("⚠️ [createShard] AI limit reached for user:", context.id);
+            return {
+              success: false,
+              message: `You've reached your daily AI limit (${usageCheck.limit} calls). Upgrade to Pro for unlimited AI quests!`,
+              needsUpgrade: true,
+            };
+          }
+
+          console.log("📈 [createShard] Tracking AI usage");
+          await trackAIUsage(context.id, tier);
+        }
+
+        // Validate deadline before spending an AI call
+        if (deadline) {
+          const deadlineDate = new Date(deadline);
+          if (isNaN(deadlineDate.getTime())) {
+            return { success: false, message: "Invalid deadline date." };
+          }
+          if (deadlineDate <= new Date()) {
+            return { success: false, message: "Deadline must be in the future." };
+          }
+        }
+
+        // Moderate goal text before sending to AI
+        const goalMod = moderate(goal, 'goal');
+        if (!goalMod.allowed) {
           return {
             success: false,
-            message: `You've reached your daily AI limit (${usageCheck.limit} calls). Upgrade to Pro for unlimited AI quests!`,
-            needsUpgrade: true,
+            message: goalMod.crisisMessage || goalMod.reason || 'This goal could not be processed.',
+            isCrisis: goalMod.severity === 'crisis',
           };
         }
 
-        // Track AI usage
-        console.log("📈 [createShard] Tracking AI usage");
-        await trackAIUsage(context.id);
+        // Build user context for AI personalisation
+        const u = user as any;
+        const userContext: UserContext = {
+          username: u?.username || "Adventurer",
+          bio: u?.bio,
+          age: u?.birthdate ? Math.floor((Date.now() - new Date(u.birthdate).getTime()) / (365.25 * 24 * 60 * 60 * 1000)) : undefined,
+          timezone: u?.timezone,
+          level: u?.level || 1,
+          currentStreak: u?.currentStreak || 0,
+          stats: {
+            strength: u?.strength || 5,
+            intelligence: u?.intelligence || 5,
+            charisma: u?.charisma || 5,
+            endurance: u?.endurance || 5,
+            creativity: u?.creativity || 5,
+          },
+          preferences: {
+            workloadLevel: u?.preferences?.workloadLevel || 'medium',
+            maxTasksPerDay: u?.preferences?.maxTasksPerDay || 4,
+            preferredTaskDuration: u?.preferences?.preferredTaskDuration || 'medium',
+          },
+        };
 
         // Call AI to break down the goal
         console.log("🤖 [createShard] Calling Groq AI to break down goal");
         console.log("🎯 [createShard] Goal:", goal);
         console.log("📅 [createShard] Deadline:", deadline);
-        
-        const questBreakdown = await breakDownGoalWithAI(goal, deadline);
+
+        const questBreakdown = await breakDownGoalWithAI(goal, deadline, userContext);
         
         console.log("✨ [createShard] AI breakdown complete!");
         console.log("📋 [createShard] Main Quest:", questBreakdown.mainQuest?.title);
@@ -214,6 +261,8 @@ export default {
           status: "active",
           isPrivate: isPrivate || false,
           isAnonymous: isAnonymous || false,
+          questType: questType || "standard",
+          cadence: cadence,
           rewards: [
             {
               type: "xp",
@@ -257,11 +306,7 @@ export default {
 
         console.log("📅 [createShard] Timeline:", { start: shardStartDate, end: shardEndDate });
 
-        // Fetch user preferences for smart scheduling
-        const [prefError, userWithPrefs] = await catchError(
-          User.findById(context.id, "preferences").lean()
-        );
-        const prefs = (userWithPrefs as any)?.preferences || {};
+        const prefs = (user as any)?.preferences || {};
 
         // Build flat task list grouped by mini-goal for smart scheduling
         const tasksByGoal: SchedulableTask[][] = questBreakdown.miniQuests.map(
@@ -354,12 +399,17 @@ export default {
           aiCallsRemaining: usageCheck.remaining - 1,
         });
 
-        // Check achievements fire-and-forget
         checkAchievements(context.id).catch(() => {});
+
+        // Fetch the created mini-goals to return as preview
+        const [mgFetchError, createdMiniGoals] = await catchError(
+          MiniGoal.find({ shardId: newShard._id }, "title tasks dueDate").lean()
+        );
 
         return {
           success: true,
           message: "Quest created successfully!",
+          warning: questBreakdown.warning || null,
           shard: {
             id: newShard._id.toString(),
             title: newShard.title,
@@ -368,6 +418,14 @@ export default {
             progress: newShard.progress,
             aiUsed: true,
             aiCallsRemaining: usageCheck.remaining === -1 ? -1 : usageCheck.remaining - 1,
+            miniGoals: (!mgFetchError && createdMiniGoals)
+              ? createdMiniGoals.map((mg: any) => ({
+                  id: mg._id.toString(),
+                  title: mg.title,
+                  taskCount: (mg.tasks || []).length,
+                  dueDate: mg.dueDate ? new Date(mg.dueDate).toISOString() : null,
+                }))
+              : [],
           },
         };
       } catch (error) {
@@ -426,6 +484,8 @@ export default {
             status: "active",
             isPrivate: input.isPrivate || false,
             isAnonymous: input.isAnonymous || false,
+            questType: input.questType || "standard",
+            cadence: input.cadence,
             rewards: enrichment
               ? [{ type: "xp", value: enrichment.mainQuestXP }]
               : input.rewards || [],
@@ -536,6 +596,11 @@ export default {
           details: `Created quest: ${newShard.title}`,
         });
 
+        // Fetch created mini-goals to return as preview
+        const [mgFetchErr, createdMGs] = await catchError(
+          MiniGoal.find({ shardId: newShard._id }, "title tasks dueDate").lean()
+        );
+
         return {
           success: true,
           message: "Quest created successfully!",
@@ -544,6 +609,15 @@ export default {
             title: newShard.title,
             description: newShard.description,
             status: newShard.status,
+            progress: { completion: 0, xpEarned: 0, level: 1 },
+            miniGoals: (!mgFetchErr && createdMGs)
+              ? createdMGs.map((mg: any) => ({
+                  id: mg._id.toString(),
+                  title: mg.title,
+                  taskCount: (mg.tasks || []).length,
+                  dueDate: mg.dueDate ? new Date(mg.dueDate).toISOString() : null,
+                }))
+              : [],
           },
         };
       } catch (error) {
@@ -641,8 +715,10 @@ export default {
         }
       }
 
-      // Invalidate cache
+      // Invalidate cache for owner and all participants (including newly added)
       await cacheInvalidate.shard(id);
+      const allParticipantIds = updatedShard.participants.map((p: any) => p.user.toString());
+      await Promise.all(allParticipantIds.map((uid: string) => cacheInvalidate.shardList(uid)));
 
       SaveAuditTrail({
         userId: context.id,
@@ -650,14 +726,31 @@ export default {
         details: `Updated quest: ${updatedShard.title}`,
       });
 
-      // Notify participants of update
-      const participantIds = updatedShard.participants
-        .map((p: any) => p.user.toString())
-        .filter((uid: string) => uid !== context.id);
+      // Detect which participants are newly added vs already existing
+      const oldParticipantIds = new Set(shard.participants.map((p: any) => p.user.toString()));
+      const newlyAddedIds = allParticipantIds.filter((uid: string) => !oldParticipantIds.has(uid) && uid !== context.id);
+      const existingIds = allParticipantIds.filter((uid: string) => oldParticipantIds.has(uid) && uid !== context.id);
 
-      if (participantIds.length > 0) {
+      const [ownerInfoErr, ownerInfo] = await catchError(User.findById(context.id).select("username").lean());
+      const ownerName = (!ownerInfoErr && ownerInfo) ? (ownerInfo as any).username : "Someone";
+
+      // Send "added to quest" to new participants
+      if (newlyAddedIds.length > 0) {
+        await Promise.all(newlyAddedIds.map((uid: string) => {
+          cacheInvalidate.shardList(uid);
+          createNotification(uid, `${ownerName} added you to the quest: ${updatedShard.title}`, "shard_invite", { shardId: id });
+          return sendNotificationToUser(uid, {
+            title: "You've been added to a Quest!",
+            body: `${ownerName} added you to "${updatedShard.title}"`,
+            data: { shardId: id, screen: "/shard-info" }
+          }, 'shardInvites');
+        }));
+      }
+
+      // Send "quest updated" only to existing participants
+      if (existingIds.length > 0) {
         await sendNotificationToUsers(
-          participantIds,
+          existingIds,
           {
             title: "Quest Updated",
             body: `${updatedShard.title} has been updated.`,
@@ -826,24 +919,35 @@ export default {
         }
       }
 
-      // Invalidate cache
+      // Invalidate cache for both owner and the new participant
       await cacheInvalidate.shardList(context.id);
+      await cacheInvalidate.shardList(userId);
 
       SaveAuditTrail({
         userId: context.id,
         task: "Added Shard Participant",
-        details: `Added ${user.username} as ${role} to quest: ${shard.title}`,
+        details: `Added ${(user as any).username} as ${role} to quest: ${shard.title}`,
       });
 
-      // Notify added user
+      // Notify added user with a specific "added" message
+      const [ownerErr, owner] = await catchError(User.findById(context.id).select("username").lean());
+      const ownerName = (!ownerErr && owner) ? (owner as any).username : "Someone";
+
+      await createNotification(
+        userId,
+        `${ownerName} added you to the quest: ${shard.title}`,
+        "shard_invite",
+        { shardId }
+      );
+
       await sendNotificationToUser(
         userId,
         {
-          title: "Quest Invite",
-          body: `You've been added to ${shard.title}`,
+          title: "You've been added to a Quest!",
+          body: `${ownerName} added you to "${shard.title}"`,
           data: { shardId: shardId, screen: "/shard-info" }
         },
-        'shardInvites' // Check shard invite preferences
+        'shardInvites'
       );
 
       return {
@@ -922,81 +1026,221 @@ export default {
     },
 
     // Assign mini-goal to collaborator
-    async assignMiniGoal(_, { miniGoalId, userId }, context) {
+    async assignMiniGoal(_, { miniGoalId, userId, taskIndex }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
       // Get mini-goal with shard info
       const [minigoalError, minigoal] = await catchError(
-        MiniGoal.findById(miniGoalId)
-          .populate("shardId")
-          .lean()
+        MiniGoal.findById(miniGoalId).populate("shardId").lean()
       );
 
       if (minigoalError || !minigoal || !minigoal.shardId) {
-        return {
-          success: false,
-          message: "Mini-goal not found.",
-        };
+        return { success: false, message: "Mini-goal not found." };
       }
 
       const shard: any = minigoal.shardId;
 
-      // Check permissions
       // Only owner and accountability partners can assign
       const isOwner = shard.owner.toString() === context.id;
       const isAccountabilityPartner = shard.participants.some(
         (p: any) => p.user.toString() === context.id && p.role === "accountability_partner"
       );
-
       if (!isOwner && !isAccountabilityPartner) {
-        return {
-          success: false,
-          message: "Only owners and accountability partners can assign goals.",
-        };
+        return { success: false, message: "Only owners and accountability partners can assign goals." };
       }
 
-      // Verify user is a collaborator on this shard
-      const isCollaborator = shard.participants.some(
-        (p: any) => p.user.toString() === userId && p.role === "collaborator"
-      );
-
-      if (!isCollaborator && userId !== shard.owner.toString()) {
-        return {
-          success: false,
-          message: "User must be a collaborator or owner to be assigned a mini-goal.",
-        };
+      // Verify assignee is a participant or owner
+      const isValidAssignee =
+        userId === shard.owner.toString() ||
+        shard.participants.some((p: any) => p.user.toString() === userId);
+      if (!isValidAssignee) {
+        return { success: false, message: "User must be a participant or owner to be assigned." };
       }
 
-      // Update mini-goal to track assignment
-      // Add assignment tracking (can extend MiniGoal model or use a separate field)
-      await MiniGoal.findByIdAndUpdate(miniGoalId, {
-        assignedTo: userId,
-      });
+      // Fetch both users for system message
+      const [, assigner] = await catchError(User.findById(context.id, "username").lean());
+      const [, assignee] = await catchError(User.findById(userId, "username").lean());
+      const assignerName = (assigner as any)?.username || "Someone";
+      const assigneeName = (assignee as any)?.username || "a teammate";
+
+      let targetLabel = minigoal.title;
+
+      if (typeof taskIndex === "number") {
+        // Task-level assignment
+        const [mgFetchErr, mgDoc] = await catchError(MiniGoal.findById(miniGoalId));
+        if (mgFetchErr || !mgDoc) return { success: false, message: "Mini-goal not found." };
+
+        if (!mgDoc.tasks[taskIndex]) {
+          return { success: false, message: "Task not found at that index." };
+        }
+
+        targetLabel = mgDoc.tasks[taskIndex].title;
+        mgDoc.tasks[taskIndex].assignedTo = userId;
+        await mgDoc.save();
+      } else {
+        // Mini-goal level assignment
+        await MiniGoal.findByIdAndUpdate(miniGoalId, { assignedTo: userId });
+      }
+
+      // Inject system message into quest chat (fire-and-forget)
+      if (shard.chatId) {
+        Message.create({
+          chatId: shard.chatId,
+          sender: context.id,
+          content: `${assignerName} assigned "${targetLabel}" to @${assigneeName}`,
+          type: "system",
+        }).catch((e: any) => logError("assignMiniGoal:systemMessage", e));
+      }
 
       SaveAuditTrail({
         userId: context.id,
         task: "Assigned Mini-Goal",
-        details: `Assigned mini-goal to ${userId}`,
+        details: `Assigned "${targetLabel}" to ${userId}`,
       });
 
-      // Notify assignee
+      // Push notification to assignee
       await sendNotificationToUser(
         userId,
         {
-          title: "New Goal Assignment",
-          body: `You've been assigned a new goal in ${shard.title}`,
+          title: "New Assignment",
+          body: `${assignerName} assigned "${targetLabel}" to you in ${shard.title}`,
           data: { shardId: shard._id.toString(), screen: "/shard-info" }
         },
-        'questDeadlines' // Check quest deadline preferences
+        'questDeadlines'
       );
+
+      return { success: true, message: "Assigned successfully." };
+    },
+
+
+    // Complete mini-goal
+    async completeHabitCycle(_, { shardId }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+
+      const [shardError, shard] = await catchError(Shard.findById(shardId).lean());
+      if (shardError || !shard) ThrowError("Shard not found");
+
+      if (shard.questType !== "habit") {
+        ThrowError("This shard is not a recurring habit quest.");
+      }
+
+      // Check if user has permission (must be owner or collaborator)
+      const isOwner = shard.owner.toString() === context.id;
+      const isCollaborator = shard.participants.some(
+        (p: any) => p.user.toString() === context.id && p.role === "collaborator"
+      );
+      if (!isOwner && !isCollaborator) {
+        ThrowError("You do not have permission to reset this habit cycle.");
+      }
+
+      // Fetch all mini-goals for this shard
+      const [mgError, miniGoals] = await catchError(MiniGoal.find({ shardId }).lean());
+      if (mgError || !miniGoals) ThrowError("Failed to fetch mini goals");
+
+      // Count total tasks to award XP, and reset completed statuses
+      let totalTasksCompleted = 0;
+
+      for (const mg of (miniGoals as any[])) {
+        let mgChanged = false;
+        
+        for (const task of mg.tasks) {
+          if (task.completed) {
+            totalTasksCompleted++;
+            task.completed = false;
+            mgChanged = true;
+          }
+        }
+        
+        if (mgChanged) {
+          await MiniGoal.findByIdAndUpdate(mg._id, {
+            tasks: mg.tasks,
+            progress: 0,
+            completed: false,
+          });
+        }
+      }
+
+      // Increment Habit streak and update progress back to 0
+      const newHabitStreak = (shard.habitStreak || 0) + 1;
+      
+      await Shard.findByIdAndUpdate(shardId, {
+        habitStreak: newHabitStreak,
+        "progress.completion": 0,
+      });
+
+      // Award XP using existing completeTask multiplier rules, if any
+      // We process the XP globally for the whole cycle reset
+      let xpEarned = totalTasksCompleted * 20;
+
+      // Add simple streak bonus: +5 XP per day in the streak
+      xpEarned += (newHabitStreak * 5);
+      
+      const { awardXP } = await import("./XP.js");
+      const xpResult = await awardXP(context.id, xpEarned, `Completed Habit Cycle for ${shard.title}`);
+
+      // Inject system message
+      const User = require("../../models/User").User;
+      const user = await User.findById(context.id).select("username").lean();
+      if (user && shard.chatId) {
+        const { Message } = await import("../../models/Chat.js");
+        Message.create({
+          chatId: shard.chatId,
+          sender: context.id,
+          content: `${user.username} achieved a ${newHabitStreak}-cycle streak on "${shard.title}" ✨`,
+          type: "system",
+        }).catch(e => console.error(e));
+      }
+
+      // Invalidate caches
+      await cacheInvalidate.shard(shardId);
+      await cacheInvalidate.shardList(context.id);
 
       return {
         success: true,
-        message: "Mini-goal assigned successfully.",
+        message: "Habit cycle completed and reset!",
+        xpEarned,
+        newStreak: newHabitStreak,
       };
     },
 
-    // Complete mini-goal
+    // Manual AI coach nudge trigger
+    async triggerCoachNudge(_, { shardId }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+
+      const [shardErr, shard] = await catchError(Shard.findById(shardId).lean());
+      if (shardErr || !shard) return { success: false, message: "Shard not found.", nudge: null };
+
+      const isOwner = shard.owner.toString() === context.id;
+      if (!isOwner) return { success: false, message: "Only the quest owner can request a nudge.", nudge: null };
+
+      // Rate limit: 1 nudge per 7 days
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      if (shard.lastNudgedAt && new Date(shard.lastNudgedAt) > sevenDaysAgo) {
+        const nextDate = new Date(new Date(shard.lastNudgedAt).getTime() + 7 * 24 * 60 * 60 * 1000);
+        return { success: false, message: `Next coach tip available on ${nextDate.toLocaleDateString()}.`, nudge: null };
+      }
+
+      const { canMakeCoachAICall, incrementCoachAICounter, generateInactivityNudge, COACH_TEMPLATES } = await import("../../Helpers/AIHelper.js");
+      const [userErr, user] = await catchError(User.findById(context.id).select("subscriptionTier").lean());
+      const isPro = !userErr && (user as any)?.subscriptionTier === "pro";
+
+      const staleDays = shard.lastActivityAt
+        ? Math.floor((Date.now() - new Date(shard.lastActivityAt).getTime()) / 86400000)
+        : 3;
+
+      let nudge: string;
+      if (isPro && canMakeCoachAICall()) {
+        nudge = await generateInactivityNudge(shard.title, staleDays);
+        incrementCoachAICounter();
+      } else {
+        nudge = COACH_TEMPLATES.inactivity(shard.title);
+      }
+
+      await Shard.findByIdAndUpdate(shardId, { lastNudgedAt: new Date() });
+
+      return { success: true, message: "Coach nudge generated!", nudge };
+    },
+
     async completeMiniGoal(_, { miniGoalId }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
@@ -1124,14 +1368,14 @@ export default {
 
       // Verify ownership/participation
       const isOwner = shard.owner.toString() === context.id;
-      const isParticipant = shard.participants.some(
-        (p: any) => p.user.toString() === context.id
+      const isCollaborator = shard.participants.some(
+        (p: any) => p.user.toString() === context.id && p.role === "collaborator"
       );
 
-      if (!isOwner && !isParticipant) {
+      if (!isOwner && !isCollaborator) {
         return {
           success: false,
-          message: "You don't have access to this shard.",
+          message: "You don't have permission to modify this shard.",
         };
       }
 
@@ -1185,14 +1429,14 @@ export default {
 
       // Verify ownership/participation
       const isOwner = shard.owner.toString() === context.id;
-      const isParticipant = shard.participants.some(
-        (p: any) => p.user.toString() === context.id
+      const isCollaborator = shard.participants.some(
+        (p: any) => p.user.toString() === context.id && p.role === "collaborator"
       );
 
-      if (!isOwner && !isParticipant) {
+      if (!isOwner && !isCollaborator) {
         return {
           success: false,
-          message: "You don't have access to this shard.",
+          message: "You don't have permission to modify this shard.",
         };
       }
 
@@ -1219,9 +1463,273 @@ export default {
         message: "Task restored successfully.",
       };
     },
+
+    async updateMiniGoal(_, { miniGoalId, input }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+
+      const [error, miniGoal] = await catchError(
+        MiniGoal.findById(miniGoalId).populate("shardId")
+      );
+      if (error || !miniGoal) return { success: false, message: "Mini-goal not found." };
+
+      const shard: any = miniGoal.shardId;
+      const isOwner = shard.owner.toString() === context.id;
+      const isCollaborator = shard.participants.some(
+        (p: any) => p.user.toString() === context.id && p.role === "collaborator"
+      );
+      if (!isOwner && !isCollaborator)
+        return { success: false, message: "You don't have permission to edit this mini-goal." };
+
+      if (input.title) miniGoal.title = input.title.trim();
+      if (input.description !== undefined) miniGoal.description = input.description;
+      if (input.dueDate !== undefined)
+        (miniGoal as any).dueDate = input.dueDate ? new Date(input.dueDate) : undefined;
+
+      await miniGoal.save();
+      await cacheInvalidate.shard(shard._id.toString());
+
+      return { success: true, message: "Mini-goal updated." };
+    },
+
+    async deleteMiniGoal(_, { miniGoalId }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+
+      const [error, miniGoal] = await catchError(
+        MiniGoal.findById(miniGoalId).populate("shardId").lean()
+      );
+      if (error || !miniGoal) return { success: false, message: "Mini-goal not found." };
+
+      const shard: any = miniGoal.shardId;
+      if (shard.owner.toString() !== context.id)
+        return { success: false, message: "Only the quest owner can delete mini-goals." };
+
+      await MiniGoal.findByIdAndDelete(miniGoalId);
+      await cacheInvalidate.shard(shard._id.toString());
+
+      SaveAuditTrail({
+        userId: context.id,
+        task: "Deleted Mini-Goal",
+        details: `Deleted mini-goal: ${miniGoal.title} from quest: ${shard.title}`,
+      });
+
+      return { success: true, message: "Mini-goal deleted." };
+    },
+
+    async addMiniGoal(_, { shardId, input }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+
+      const [shardError, shard] = await catchError(Shard.findById(shardId).lean());
+      if (shardError || !shard) return { success: false, message: "Quest not found." };
+
+      if (shard.owner.toString() !== context.id)
+        return { success: false, message: "Only the quest owner can add mini-goals." };
+
+      const mgMod = moderate(input.title, 'task');
+      if (!mgMod.allowed) return { success: false, message: mgMod.crisisMessage || mgMod.reason || 'Content not allowed.' };
+
+      const tasks = (input.tasks || []).map((t: any) => ({
+        title: t.title,
+        completed: false,
+        deleted: false,
+        xpReward: 20,
+        rescheduled: false,
+      }));
+
+      const [createError, newMiniGoal] = await catchError(
+        MiniGoal.create({ shardId, title: input.title, description: input.description, tasks, progress: 0, completed: false })
+      );
+      if (createError) return { success: false, message: "Failed to create mini-goal." };
+
+      await cacheInvalidate.shard(shardId);
+
+      return {
+        success: true,
+        message: "Mini-goal added.",
+        miniGoal: {
+          id: newMiniGoal._id.toString(),
+          title: newMiniGoal.title,
+          description: newMiniGoal.description || null,
+          dueDate: (newMiniGoal as any).dueDate?.toISOString() || null,
+          tasks: newMiniGoal.tasks
+            .filter((t: any) => !t.deleted)
+            .map((t: any) => ({ title: t.title, dueDate: t.dueDate?.toISOString() || null, completed: t.completed, assignedTo: t.assignedTo || null })),
+        },
+      };
+    },
+
+    async addTask(_, { miniGoalId, title, dueDate }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+
+      const [error, miniGoal] = await catchError(
+        MiniGoal.findById(miniGoalId).populate("shardId")
+      );
+      if (error || !miniGoal) return { success: false, message: "Mini-goal not found." };
+
+      const shard: any = miniGoal.shardId;
+      const isOwner = shard.owner.toString() === context.id;
+      const isCollaborator = shard.participants.some(
+        (p: any) => p.user.toString() === context.id && p.role === "collaborator"
+      );
+      if (!isOwner && !isCollaborator)
+        return { success: false, message: "You don't have permission to add tasks." };
+
+      const addTaskMod = moderate(title, 'task');
+      if (!addTaskMod.allowed) return { success: false, message: addTaskMod.crisisMessage || addTaskMod.reason || 'Content not allowed.' };
+
+      (miniGoal.tasks as any).push({
+        title: title.trim(),
+        dueDate: dueDate ? new Date(dueDate) : undefined,
+        completed: false,
+        deleted: false,
+        xpReward: 20,
+        rescheduled: false,
+      });
+
+      await miniGoal.save();
+      await cacheInvalidate.shard(shard._id.toString());
+
+      return { success: true, message: "Task added." };
+    },
+
+    async updateTask(_, { miniGoalId, taskIndex, title, dueDate }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+
+      const [error, miniGoal] = await catchError(
+        MiniGoal.findById(miniGoalId).populate("shardId")
+      );
+      if (error || !miniGoal) return { success: false, message: "Mini-goal not found." };
+
+      const shard: any = miniGoal.shardId;
+      const isOwner = shard.owner.toString() === context.id;
+      const isCollaborator = shard.participants.some(
+        (p: any) => p.user.toString() === context.id && p.role === "collaborator"
+      );
+      if (!isOwner && !isCollaborator)
+        return { success: false, message: "You don't have permission to edit tasks." };
+
+      const updateTaskMod = moderate(title, 'task');
+      if (!updateTaskMod.allowed) return { success: false, message: updateTaskMod.crisisMessage || updateTaskMod.reason || 'Content not allowed.' };
+
+      const activeTasks = miniGoal.tasks.filter((t: any) => !t.deleted);
+      if (taskIndex < 0 || taskIndex >= activeTasks.length)
+        return { success: false, message: "Task not found." };
+
+      const task = activeTasks[taskIndex] as any;
+      if (title) task.title = title.trim();
+      if (dueDate !== undefined) task.dueDate = dueDate ? new Date(dueDate) : undefined;
+
+      await miniGoal.save();
+      await cacheInvalidate.shard(shard._id.toString());
+
+      return { success: true, message: "Task updated." };
+    },
+
+    async regenerateShard(_, { shardId }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+
+      const [shardError, shard] = await catchError(Shard.findById(shardId).lean());
+      if (shardError || !shard) return { success: false, message: "Quest not found." };
+
+      if ((shard as any).owner.toString() !== context.id)
+        return { success: false, message: "Only the quest owner can regenerate the plan." };
+
+      const [userError, user] = await catchError(
+        User.findById(context.id, "role subscriptionTier username bio level xp currentStreak strength intelligence charisma endurance creativity preferences").lean()
+      );
+      if (userError || !user) return { success: false, message: "Failed to verify user." };
+
+      const u = user as any;
+      let usageCheck = { canProceed: true, limit: -1, used: 0, remaining: -1 };
+      if (u?.role !== 'admin') {
+        const tier = u?.subscriptionTier || 'free';
+        usageCheck = await checkAIUsage(context.id, tier);
+        if (!usageCheck.canProceed)
+          return { success: false, message: "You've reached your AI limit. Upgrade to Pro for unlimited AI!", needsUpgrade: true };
+        await trackAIUsage(context.id, tier);
+      }
+
+      const userContext: UserContext = {
+        username: u?.username || "Adventurer",
+        bio: u?.bio,
+        level: u?.level || 1,
+        currentStreak: u?.currentStreak || 0,
+        stats: {
+          strength: u?.strength || 5,
+          intelligence: u?.intelligence || 5,
+          charisma: u?.charisma || 5,
+          endurance: u?.endurance || 5,
+          creativity: u?.creativity || 5,
+        },
+        preferences: {
+          workloadLevel: u?.preferences?.workloadLevel || 'medium',
+          maxTasksPerDay: u?.preferences?.maxTasksPerDay || 4,
+          preferredTaskDuration: u?.preferences?.preferredTaskDuration || 'medium',
+        },
+      };
+
+      const s = shard as any;
+      const goal = s.description ? `${s.title}: ${s.description}` : s.title;
+      const deadline = s.timeline?.endDate?.toISOString();
+
+      const questBreakdown = await breakDownGoalWithAI(goal, deadline, userContext);
+
+      await MiniGoal.deleteMany({ shardId, completed: false });
+
+      const newMiniGoals = await Promise.all(
+        questBreakdown.miniQuests.map((mq: any) =>
+          MiniGoal.create({
+            shardId,
+            title: mq.title,
+            description: mq.description,
+            tasks: mq.steps.map((step: any) => ({
+              title: step.text,
+              completed: false,
+              deleted: false,
+              xpReward: step.xpReward || 20,
+              rescheduled: false,
+            })),
+            progress: 0,
+            completed: false,
+          })
+        )
+      );
+
+      await cacheInvalidate.shard(shardId);
+      SaveAuditTrail({ userId: context.id, task: "Regenerated Shard", details: `Regenerated plan for: ${s.title}` });
+
+      return {
+        success: true,
+        message: "Quest plan regenerated!",
+        warning: questBreakdown.warning || null,
+        miniGoals: newMiniGoals.map((mg: any) => ({
+          id: mg._id.toString(),
+          title: mg.title,
+          taskCount: mg.tasks.length,
+          dueDate: mg.dueDate?.toISOString() || null,
+        })),
+        aiCallsRemaining: usageCheck.remaining === -1 ? -1 : usageCheck.remaining - 1,
+      };
+    },
   },
 
   Query: {
+    // Get AI usage for the current user
+    async getAIUsage(_, __, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+      const [userError, user] = await catchError(
+        User.findById(context.id, "subscriptionTier").lean()
+      );
+      if (userError || !user) return { success: false, remaining: 0, limit: 0, canProceed: false };
+      const tier = (user as any)?.subscriptionTier || 'free';
+      const usage = await checkAIUsage(context.id, tier);
+      return {
+        success: true,
+        remaining: usage.remaining,
+        limit: usage.limit,
+        canProceed: usage.canProceed,
+      };
+    },
+
     getSignedUploadUrl: async (_, __, context) => {
       // No auth required for signed upload parameters
       const params = getCloudinarySignedUpload();
@@ -1240,7 +1748,10 @@ export default {
 
       const [error, shardList] = await catchError(
         Shard.find({
-          owner: context.id,
+          $or: [
+            { owner: context.id },
+            { "participants.user": context.id },
+          ],
         })
           .select("title description image status progress timeline participants createdAt updatedAt")
           .sort({ createdAt: -1 })
@@ -1277,8 +1788,8 @@ export default {
       // Fetch shard data directly from database
       const [error, shardData] = await catchError(
         Shard.findById(id)
-          .select("title description image status progress timeline participants rewards owner chatId isPrivate isAnonymous version createdAt updatedAt")
-          .populate("owner", "username")
+          .select("title description image status progress timeline participants rewards owner chatId isPrivate isAnonymous version questType cadence habitStreak createdAt updatedAt")
+          .populate("owner", "username profilePic")
           .lean()
       );
 
@@ -1326,10 +1837,14 @@ export default {
           owner: {
             id: (shardData.owner as any)._id.toString(),
             username: (shardData.owner as any).username,
+            profilePic: (shardData.owner as any).profilePic || null,
           },
           isPrivate: shardData.isPrivate ?? false,
           isAnonymous: shardData.isAnonymous ?? false,
           version: shardData.version ?? 1,
+          questType: (shardData as any).questType ?? 'standard',
+          cadence: (shardData as any).cadence ?? null,
+          habitStreak: (shardData as any).habitStreak ?? 0,
           minigoals: minigoals.map((mg: any) => ({
             id: mg._id.toString(),
             title: mg.title,

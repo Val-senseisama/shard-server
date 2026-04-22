@@ -16,6 +16,7 @@ export default `#graphql
     getShardSchedule(shardId: ID!, startDate: String, endDate: String): ScheduleResponse!
     getMySchedule(startDate: String, endDate: String): MyScheduleResponse!
     getShardAnalytics(shardId: ID!): ShardAnalyticsResponse!
+    getAIUsage: AIUsageResponse!
     
     # Friendship queries
     getFriends: FriendsResponse!
@@ -58,6 +59,9 @@ export default `#graphql
     # Support queries
     mySupportFlags: SupportFlagsResponse!
     getAllSupportFlags: AllSupportFlagsResponse!
+
+    # Public — Subscription offerings
+    listOfferings: [Offering!]!
   }
 
   type Mutation {
@@ -74,19 +78,27 @@ export default `#graphql
     updatePreferences(input: PreferencesInput!): MessageResponse!
     
     # Shard mutations
-    createShard(goal: String!, deadline: String, image: String, participants: [ParticipantInput!], isPrivate: Boolean, isAnonymous: Boolean): CreateShardResponse!
+    createShard(goal: String!, deadline: String, image: String, participants: [ParticipantInput!], isPrivate: Boolean, isAnonymous: Boolean, questType: String, cadence: String): CreateShardResponse!
     createShardManual(input: CreateShardInput!): CreateShardResponse!
     updateShard(id: ID!, input: UpdateShardInput!): ShardResponse!
     deleteShard(id: ID!): MessageResponse!
     addShardParticipant(shardId: ID!, userId: ID!, role: String!): AddParticipantResponse!
     removeShardParticipant(shardId: ID!, userId: ID!): MessageResponse!
-    assignMiniGoal(miniGoalId: ID!, userId: ID!): MessageResponse!
+    assignMiniGoal(miniGoalId: ID!, userId: ID!, taskIndex: Int): MessageResponse!
     completeMiniGoal(miniGoalId: ID!): CompleteMiniGoalResponse!
+    completeHabitCycle(shardId: ID!): CompleteHabitResponse!
+    triggerCoachNudge(shardId: ID!): CoachNudgeResult!
     scheduleTasks(shardId: ID!): GenerateTasksResponse!
     generateWeeklyTasks(miniGoalId: ID!, weekNumber: Int, action: String): GenerateTasksResponse!
     deleteTask(miniGoalId: ID!, taskTitle: String!): MessageResponse!
     restoreTask(miniGoalId: ID!, taskTitle: String!): MessageResponse!
-    
+    updateMiniGoal(miniGoalId: ID!, input: UpdateMiniGoalInput!): MessageResponse!
+    deleteMiniGoal(miniGoalId: ID!): MessageResponse!
+    addMiniGoal(shardId: ID!, input: AddMiniGoalInput!): AddMiniGoalResponse!
+    addTask(miniGoalId: ID!, title: String!, dueDate: String): MessageResponse!
+    updateTask(miniGoalId: ID!, taskIndex: Int!, title: String!, dueDate: String): MessageResponse!
+    regenerateShard(shardId: ID!): RegenerateShardResponse!
+
     # Friendship mutations
     sendFriendRequest(friendId: ID!): MessageResponse!
     acceptFriendRequest(friendId: ID!): MessageResponse!
@@ -151,6 +163,8 @@ export default `#graphql
     username: String
     bio: String
     profilePic: String
+    birthdate: String
+    timezone: String
   }
 
   input PreferencesInput {
@@ -178,6 +192,11 @@ export default `#graphql
     emailVerified: Boolean
     xp: Int
     level: Int
+    currentStreak: Int
+    longestStreak: Int
+    lastCompletionDate: String
+    streakFreezeTokens: Int
+    comebackBonusUntil: String
     achievements: [String]
     strength: Int
     intelligence: Int
@@ -186,10 +205,11 @@ export default `#graphql
     creativity: Int
     authProvider: String
     isNewUser: Boolean
-    currentStreak: Int
-    longestStreak: Int
     preferences: UserPreferences
     subscriptionTier: String
+    pendingAchievements: [String]
+    birthdate: String
+    timezone: String
   }
 
   type UserResponse {
@@ -274,6 +294,9 @@ export default `#graphql
     isPrivate: Boolean
     isAnonymous: Boolean
     version: Int
+    questType: String
+    cadence: String
+    habitStreak: Int
   }
 
   type ShardProgress {
@@ -302,6 +325,7 @@ export default `#graphql
   type ShardOwner {
     id: ID!
     username: String!
+    profilePic: String
   }
 
   type MiniGoal {
@@ -319,6 +343,52 @@ export default `#graphql
     title: String!
     dueDate: String
     completed: Boolean!
+    assignedTo: String
+  }
+
+  input TaskInput {
+    title: String!
+  }
+
+  input MiniGoalInput {
+    title: String!
+    description: String
+    tasks: [TaskInput!]
+  }
+
+  input UpdateMiniGoalInput {
+    title: String
+    description: String
+    dueDate: String
+  }
+
+  input AddMiniGoalInput {
+    title: String!
+    description: String
+    tasks: [TaskInput!]
+  }
+
+  type MiniGoalDetail {
+    id: ID!
+    title: String!
+    description: String
+    dueDate: String
+    tasks: [Task!]!
+  }
+
+  type AddMiniGoalResponse {
+    success: Boolean!
+    message: String!
+    miniGoal: MiniGoalDetail
+  }
+
+  type RegenerateShardResponse {
+    success: Boolean!
+    message: String!
+    warning: String
+    needsUpgrade: Boolean
+    miniGoals: [MiniGoalPreview!]
+    aiCallsRemaining: Int
   }
 
   input CreateShardInput {
@@ -330,6 +400,9 @@ export default `#graphql
     rewards: [RewardInput!]
     isPrivate: Boolean
     isAnonymous: Boolean
+    questType: String
+    cadence: String
+    miniGoals: [MiniGoalInput!]
   }
 
   input ParticipantInput {
@@ -365,6 +438,21 @@ export default `#graphql
     shard: ShardSummary
     needsUpgrade: Boolean
     aiCallsRemaining: Int
+    warning: String
+  }
+
+  type MiniGoalPreview {
+    id: ID!
+    title: String!
+    taskCount: Int!
+    dueDate: String
+  }
+
+  type AIUsageResponse {
+    success: Boolean!
+    remaining: Int!
+    limit: Int!
+    canProceed: Boolean!
   }
 
   type ShardSummary {
@@ -376,6 +464,8 @@ export default `#graphql
     progress: ShardProgress!
     aiUsed: Boolean
     aiCallsRemaining: Int
+    miniGoals: [MiniGoalPreview!]
+    participantsCount: Int
   }
 
   type ShardResponse {
@@ -573,6 +663,7 @@ export default `#graphql
     newXP: Int!
     newLevel: Int!
     leveledUp: Boolean!
+    bonusMultiplier: Float
   }
 
   type XPResponse {
@@ -716,6 +807,19 @@ export default `#graphql
     xpEarned: Int!
     xpResult: XPResult
     shardProgress: Int!
+  }
+
+  type CompleteHabitResponse {
+    success: Boolean!
+    message: String!
+    xpEarned: Int
+    newStreak: Int
+  }
+
+  type CoachNudgeResult {
+    success: Boolean!
+    message: String!
+    nudge: String
   }
 
   type GenerateTasksResponse {
@@ -945,6 +1049,14 @@ export default `#graphql
 
     # Admin — Shards
     adminGetShardOverview(status: String, page: Int, limit: Int): AdminShardsResponse!
+
+    # Admin — Achievements
+    adminListAchievementDefinitions: [AchievementDefinition!]!
+
+    # Admin — Subscription & Revenue
+    adminGetRevenueStats: RevenueStats!
+    adminListSubscriptions(page: Int, limit: Int): SubscriptionHistoryResponse!
+    adminListOfferings: [Offering!]!
   }
 
   extend type Mutation {
@@ -954,6 +1066,21 @@ export default `#graphql
 
     # Admin — User Management
     adminUpdateUser(userId: ID!, input: AdminUpdateUserInput!): AdminUpdateUserResponse!
+    adminUpdateSubscription(userId: ID!, tier: String!, endDate: String): AdminUpdateUserResponse!
+
+    # Admin — Achievement Management
+    adminGrantAchievement(userId: ID!, achievementId: String!): MessageResponse!
+    adminRevokeAchievement(userId: ID!, achievementId: String!): MessageResponse!
+
+    # Admin — Offering Management
+    adminUpdateOffering(identifier: String!, description: String!): MessageResponse!
+    adminUpdatePackage(offeringIdentifier: String!, packageIdentifier: String!, input: AdminUpdatePackageInput!): MessageResponse!
+  }
+
+  input AdminUpdatePackageInput {
+    price: Float
+    priceString: String
+    currencyCode: String
   }
 
   input AdminUpdateUserInput {
@@ -1124,5 +1251,58 @@ export default `#graphql
     page: Int!
     limit: Int!
     shards: [AdminShardSummary!]!
+  }
+
+  type SubscriptionHistory {
+    id: ID!
+    user: UserInfo
+    tier: String!
+    action: String!
+    amount: Float
+    currency: String
+    details: String
+    timestamp: String!
+  }
+
+  type RevenueStats {
+    mrr: Float!
+    totalRevenue: Float!
+    activeSubscriptions: Int!
+    churnRate: Float!
+    recentTransactions: [SubscriptionHistory!]!
+  }
+
+  type SubscriptionHistoryResponse {
+    success: Boolean!
+    subscriptions: [SubscriptionHistory!]!
+    total: Int!
+    page: Int!
+    limit: Int!
+  }
+
+  extend type AdminUserDetail {
+    subscriptionHistory: [SubscriptionHistory!]
+  }
+
+  type Offering {
+    identifier: String!
+    description: String!
+    packages: [Package!]!
+  }
+
+  type Package {
+    identifier: String!
+    priceString: String!
+    price: Float!
+    currencyCode: String!
+  }
+
+  type AchievementDefinition {
+    id: String!
+    name: String!
+    description: String!
+    icon: String!
+    category: String!
+    rarity: String!
   }
 `;

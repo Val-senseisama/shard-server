@@ -15,6 +15,7 @@ import EmailQueue from "../../models/EmailQueue.js";
 import Friendship from "../../models/Friendship.js";
 import { getCloudinarySignedUpload } from "../../Helpers/Cloudinary.js";
 import { verifyGoogleToken, generateUsernameFromGoogle } from "../../Helpers/GoogleAuth.js";
+import { moderate } from "../../Helpers/ContentModerator.js";
 import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
 
 export default {
@@ -22,6 +23,11 @@ export default {
     // Sign up with password
     async signup(_, { input }) {
       const { email, password, username } = input;
+
+      // Moderate username at signup
+      const signupMod = moderate(username, 'public_profile');
+      if (!signupMod.allowed)
+        return { success: false, message: signupMod.reason || 'This username is not allowed.' };
 
       // Validate email format
       const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -372,10 +378,26 @@ export default {
     async updateProfile(_, { input }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
+      // Moderate public-facing profile fields
+      if (input.username) {
+        const usernameMod = moderate(input.username, 'public_profile');
+        if (!usernameMod.allowed)
+          return { success: false, message: usernameMod.reason || 'Username is not allowed.' };
+      }
+      if (input.bio) {
+        const bioMod = moderate(input.bio, 'public_profile');
+        if (!bioMod.allowed)
+          return { success: false, message: bioMod.crisisMessage || bioMod.reason || 'Bio content is not allowed.' };
+      }
+
       const updateData: any = {};
       if (input.username) updateData.username = input.username;
-      if (input.bio) updateData.bio = input.bio;
+      if (input.bio !== undefined) updateData.bio = input.bio;
       if (input.profilePic) updateData.profilePic = input.profilePic;
+      if (input.timezone) updateData.timezone = input.timezone;
+      if (input.birthdate !== undefined) {
+        updateData.birthdate = input.birthdate ? new Date(input.birthdate) : null;
+      }
 
       const [updateError, updatedUser] = await catchError(
         User.findByIdAndUpdate(context.id, updateData, { new: true }).lean()
@@ -407,6 +429,8 @@ export default {
           username: updatedUser.username,
           bio: updatedUser.bio,
           profilePic: updatedUser.profilePic,
+          birthdate: updatedUser.birthdate ? (updatedUser.birthdate as Date).toISOString() : null,
+          timezone: updatedUser.timezone || 'UTC',
         },
       };
     },
@@ -682,7 +706,8 @@ console.log("newUser", newUser);
           role: user.role,
           emailVerified: user.emailVerified,
           authProvider: user.authProvider || 'google',
-          isNewUser
+          isNewUser,
+          pendingAchievements: user.pendingAchievements || [],
         };
 
         console.log("userResponse", userResponse);
@@ -722,7 +747,7 @@ console.log("newUser", newUser);
         async () => {
           const [error, userData] = await catchError(
             User.findById(context.id)
-              .select("email username bio profilePic role emailVerified xp level achievements strength intelligence charisma endurance creativity authProvider")
+              .select("email username bio profilePic role emailVerified xp level achievements pendingAchievements strength intelligence charisma endurance creativity authProvider")
               .lean()
           );
 
@@ -755,6 +780,7 @@ console.log("newUser", newUser);
           endurance: user.endurance,
           creativity: user.creativity,
           authProvider: user.authProvider,
+          pendingAchievements: user.pendingAchievements || [],
         },
       };
     },
@@ -869,6 +895,16 @@ console.log("newUser", newUser);
           message: "Failed to generate upload URL.",
         };
       }
+    },
+
+    /**
+     * Public: returns the current offerings from the DB for the mobile paywall.
+     * No auth required so any logged-in user can see prices.
+     */
+    async listOfferings() {
+      const { default: Offering } = await import("../../models/Offering.js");
+      const offerings = await Offering.find({}).lean();
+      return offerings;
     },
   },
 };

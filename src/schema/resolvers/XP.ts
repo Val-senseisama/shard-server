@@ -50,11 +50,17 @@ export async function awardXP(userId: string, amount: number, reason: string) {
     return;
   }
 
-  const newXP = user.xp + amount;
+  let multiplier = 1.0;
+  if (user.comebackBonusUntil && new Date(user.comebackBonusUntil) > new Date()) {
+    multiplier = 1.2;
+  }
+
+  const finalAmount = Math.floor(amount * multiplier);
+  const newXP = user.xp + finalAmount;
   const newLevel = calculateLevel(newXP);
 
   await User.findByIdAndUpdate(userId, {
-    $inc: { xp: amount },
+    $inc: { xp: finalAmount },
     $set: { level: newLevel },
   });
 
@@ -77,7 +83,7 @@ export async function awardXP(userId: string, amount: number, reason: string) {
     });
   }
 
-  return { newXP, newLevel, leveledUp: newLevel > user.level };
+  return { newXP, newLevel, leveledUp: newLevel > user.level, bonusMultiplier: multiplier };
 }
 
 /**
@@ -382,21 +388,90 @@ export async function completeTask(userId: string, shardId: string, miniGoalId: 
   );
 
   if (!allMgError && allMiniGoals && allMiniGoals.length > 0) {
-    // Calculate average progress across all mini-goals
     const totalProgress = allMiniGoals.reduce((sum: number, mg: any) => sum + mg.progress, 0);
     const shardProgress = Math.floor(totalProgress / allMiniGoals.length);
-    
     console.log(`📊 [completeTask] Updating shard progress to ${shardProgress}%`);
-    
     await Shard.findByIdAndUpdate(shardId, {
       "progress.completion": shardProgress,
+      lastActivityAt: new Date(),
     });
+  } else {
+    // Still update lastActivityAt even if no mini-goal aggregation needed
+    await Shard.findByIdAndUpdate(shardId, { lastActivityAt: new Date() });
   }
 
-  // Award XP (20 XP per task)
+  // === User Schema Streak Hardening & Comeback Bonus ===
+  const [userError, rawUser] = await catchError(User.findById(userId).select("currentStreak longestStreak lastCompletionDate streakFreezeTokens comebackBonusUntil").lean());
+  const user = rawUser as any;
+  
+  if (!userError && user) {
+    const now = new Date();
+    const lastCompletion = user.lastCompletionDate ? new Date(user.lastCompletionDate) : null;
+    
+    let newStreak = user.currentStreak || 0;
+    let newLongest = user.longestStreak || 0;
+    let newStreakFreezeTokens = user.streakFreezeTokens ?? 1;
+    let newComebackBonusUntil = user.comebackBonusUntil;
+
+    if (lastCompletion) {
+      const todayMidnight = new Date(now);
+      todayMidnight.setHours(0, 0, 0, 0);
+      const lastMidnight = new Date(lastCompletion);
+      lastMidnight.setHours(0, 0, 0, 0);
+      
+      const daysDifference = Math.floor((todayMidnight.getTime() - lastMidnight.getTime()) / (1000 * 60 * 60 * 24));
+      
+      if (daysDifference > 7) {
+        // More than a week gone -> +20% comeback bonus for next 3 days
+        newComebackBonusUntil = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
+      }
+
+      if (daysDifference === 1) {
+        newStreak += 1;
+      } else if (daysDifference > 1) {
+        if (newStreakFreezeTokens > 0) {
+          // Freeze token breaks the fall
+          newStreakFreezeTokens -= 1;
+          newStreak += 1;
+          console.log(`❄️ [completeTask] Consumed freeze token for user ${userId}. Tokens left: ${newStreakFreezeTokens}`);
+        } else {
+          // Streak broken completely
+          newStreak = 1;
+          console.log(`💔 [completeTask] Streak broken for user ${userId}. Reset to 1.`);
+        }
+      }
+      // If 0, same day, no change to streak length
+    } else {
+      // First ever task completion
+      newStreak = 1;
+    }
+
+    if (newStreak > newLongest) {
+      newLongest = newStreak;
+    }
+
+    const updatePayload: any = {
+      $set: {
+        currentStreak: newStreak,
+        longestStreak: newLongest,
+        lastCompletionDate: now,
+        streakFreezeTokens: newStreakFreezeTokens,
+        previousStreak: user.currentStreak || 0, // snapshot before update
+      }
+    };
+    if (newComebackBonusUntil) {
+      updatePayload.$set.comebackBonusUntil = newComebackBonusUntil;
+    } else {
+      updatePayload.$unset = { comebackBonusUntil: "" };
+    }
+
+    await User.findByIdAndUpdate(userId, updatePayload);
+  }
+
+  // Award XP (20 XP per task - will be multiplied by awardXP if comeback bonus active)
   const xpResult = await awardXP(userId, 20, `Task in ${minigoal.title}`);
   
-  // Update streak
+  // Historical streak tracking widget update
   await updateStreak(userId, "task_completion");
 
   // Check for achievements
@@ -424,7 +499,7 @@ export default {
       if (!context.id) ThrowError("Please login to continue.");
       await User.findByIdAndUpdate(context.id, { $set: { pendingAchievements: [] } });
       await cacheInvalidate.user(context.id);
-      return { success: true };
+      return { success: true, message: 'Achievements cleared.' };
     },
   },
   Query: {

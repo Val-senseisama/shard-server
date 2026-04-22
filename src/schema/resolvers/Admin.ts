@@ -12,8 +12,12 @@ import Report from "../../models/Report.js";
 import SupportFlag from "../../models/SupportFlag.js";
 import AuditTrail from "../../models/AuditTrail.js";
 import EmailQueue from "../../models/EmailQueue.js";
+import Subscription from "../../models/Subscription.js";
+import SubscriptionHistory from "../../models/SubscriptionHistory.js";
 import setJWT from "../../Helpers/setJWT.js";
 import { cache, cacheInvalidate } from "../../Helpers/Cache.js";
+import { ACHIEVEMENTS, ACHIEVEMENT_MAP } from "../../data/achievements.js";
+import Offering from "../../models/Offering.js";
 
 // ─── Guard ────────────────────────────────────────────────────────────────────
 function requireAdmin(context: any) {
@@ -230,6 +234,215 @@ export default {
         },
       };
     },
+
+    /**
+     * Grant or revoke a user's subscription.
+     */
+    async adminUpdateSubscription(_, { userId, tier, endDate }, context) {
+      requireAdmin(context);
+
+      const validTiers = ["free", "pro"];
+      if (!validTiers.includes(tier)) {
+        return { success: false, message: "Invalid subscription tier." };
+      }
+
+      const [userErr, user] = await catchError(User.findById(userId));
+      if (userErr || !user) {
+        return { success: false, message: "User not found." };
+      }
+
+      const action = tier === "free" ? "CANCELLATION" : "UPGRADE";
+
+      // 1. Update User model
+      const [updateErr] = await catchError(
+        User.findByIdAndUpdate(userId, { subscriptionTier: tier as any })
+      );
+
+      if (updateErr) {
+        logError("adminUpdateSubscription:userUpdate", updateErr);
+        return { success: false, message: "Failed to update user tier." };
+      }
+
+      // 2. Upsert Subscription record
+      const subscriptionData: any = {
+        userId,
+        tier: tier === "free" ? "free" : "premium", // Current Subscription model uses 'premium'
+        status: tier === "free" ? "expired" : "active",
+        startDate: new Date(),
+      };
+
+      if (endDate) {
+        subscriptionData.endDate = new Date(endDate);
+      }
+
+      await catchError(
+        Subscription.findOneAndUpdate({ userId }, subscriptionData, {
+          upsert: true,
+          new: true,
+        })
+      );
+
+      // 3. Log to History
+      await catchError(
+        SubscriptionHistory.create({
+          userId,
+          tier,
+          action,
+          details: `Admin ${context.username || "admin"} ${tier === "free" ? "revoked" : "granted"} ${tier} access.`,
+          timestamp: new Date(),
+        })
+      );
+
+      // 4. Invalidate cache
+      await cacheInvalidate.user(userId);
+
+      SaveAuditTrail({
+        userId: context.id,
+        task: "Admin Updated Subscription",
+        details: `Admin changed user ${user.username} tier to ${tier}${endDate ? ` (Expires: ${endDate})` : ""}`,
+      });
+
+      return {
+        success: true,
+        message: `Subscription for ${user.username} updated to ${tier}.`,
+      };
+    },
+
+    /**
+     * Manually grant an achievement to a user.
+     */
+    async adminGrantAchievement(_, { userId, achievementId }, context) {
+      requireAdmin(context);
+
+      const achievement = ACHIEVEMENT_MAP.get(achievementId);
+      if (!achievement) {
+        return { success: false, message: "Achievement not found." };
+      }
+
+      const [userErr, user] = await catchError(User.findById(userId));
+      if (userErr || !user) {
+        return { success: false, message: "User not found." };
+      }
+
+      if (user.achievements?.includes(achievementId)) {
+        return { success: false, message: "User already has this achievement." };
+      }
+
+      await User.findByIdAndUpdate(userId, {
+        $push: {
+          achievements: achievementId,
+          pendingAchievements: achievementId,
+        },
+      });
+
+      await cacheInvalidate.user(userId);
+
+      SaveAuditTrail({
+        userId: context.id,
+        task: "Admin Granted Achievement",
+        details: `Admin granted achievement "${achievement.name}" (${achievementId}) to ${user.username}`,
+      });
+
+      return {
+        success: true,
+        message: `Achievement "${achievement.name}" granted to ${user.username}.`,
+      };
+    },
+
+    /**
+     * Manually revoke an achievement from a user.
+     */
+    async adminRevokeAchievement(_, { userId, achievementId }, context) {
+      requireAdmin(context);
+
+      const [userErr, user] = await catchError(User.findById(userId));
+      if (userErr || !user) {
+        return { success: false, message: "User not found." };
+      }
+
+      if (!user.achievements?.includes(achievementId)) {
+        return { success: false, message: "User does not have this achievement." };
+      }
+
+      await User.findByIdAndUpdate(userId, {
+        $pull: {
+          achievements: achievementId,
+          pendingAchievements: achievementId, // Also remove from pending if it was there
+        },
+      });
+
+      await cacheInvalidate.user(userId);
+
+      SaveAuditTrail({
+        userId: context.id,
+        task: "Admin Revoked Achievement",
+        details: `Admin revoked achievement "${achievementId}" from ${user.username}`,
+      });
+
+      return {
+        success: true,
+        message: `Achievement revoked from ${user.username}.`,
+      };
+    },
+
+    /**
+     * Update an offering's metadata.
+     */
+    async adminUpdateOffering(_, { identifier, description }, context) {
+      requireAdmin(context);
+
+      const [error, offering] = await catchError(
+        Offering.findOneAndUpdate(
+          { identifier },
+          { description },
+          { new: true }
+        )
+      );
+
+      if (error || !offering) {
+        return { success: false, message: "Offering not found." };
+      }
+
+      SaveAuditTrail({
+        userId: context.id,
+        task: "Admin Updated Offering",
+        details: `Admin updated offering ${identifier}: ${description}`,
+      });
+
+      return { success: true, message: `Offering ${identifier} updated.` };
+    },
+
+    /**
+     * Update a specific package within an offering.
+     */
+    async adminUpdatePackage(_, { offeringIdentifier, packageIdentifier, input }, context) {
+      requireAdmin(context);
+
+      const offering = await Offering.findOne({ identifier: offeringIdentifier });
+      if (!offering) {
+        return { success: false, message: "Offering not found." };
+      }
+
+      const pkg = offering.packages.find(p => p.identifier === packageIdentifier);
+      if (!pkg) {
+        return { success: false, message: "Package not found." };
+      }
+
+      // Update fields
+      if (input.price !== undefined) pkg.price = input.price;
+      if (input.priceString !== undefined) pkg.priceString = input.priceString;
+      if (input.currencyCode !== undefined) pkg.currencyCode = input.currencyCode;
+
+      await offering.save();
+
+      SaveAuditTrail({
+        userId: context.id,
+        task: "Admin Updated Package",
+        details: `Admin updated package ${packageIdentifier} in ${offeringIdentifier}: ${JSON.stringify(input)}`,
+      });
+
+      return { success: true, message: `Package ${packageIdentifier} updated.` };
+    },
   },
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -342,10 +555,10 @@ export default {
           id: u._id.toString(),
           username: u.username,
           email: u.email,
-          role: u.role,
-          isActive: u.isActive,
-          xp: u.xp,
-          level: u.level,
+          role: u.role ?? "user",
+          isActive: u.isActive ?? true,
+          xp: u.xp ?? 0,
+          level: u.level ?? 1,
           currentStreak: u.currentStreak ?? 0,
           subscriptionTier: u.subscriptionTier,
           lastLoginAt: u.lastLoginAt,
@@ -381,18 +594,18 @@ export default {
           email: (user as any).email,
           profilePic: (user as any).profilePic,
           bio: (user as any).bio,
-          role: (user as any).role,
-          isActive: (user as any).isActive,
-          emailVerified: (user as any).emailVerified,
-          authProvider: (user as any).authProvider,
-          xp: (user as any).xp,
-          level: (user as any).level,
-          aiCredits: (user as any).aiCredits,
-          strength: (user as any).strength,
-          intelligence: (user as any).intelligence,
-          charisma: (user as any).charisma,
-          endurance: (user as any).endurance,
-          creativity: (user as any).creativity,
+          role: (user as any).role ?? "user",
+          isActive: (user as any).isActive ?? true,
+          emailVerified: (user as any).emailVerified ?? false,
+          authProvider: (user as any).authProvider ?? "email",
+          xp: (user as any).xp ?? 0,
+          level: (user as any).level ?? 1,
+          aiCredits: (user as any).aiCredits ?? 0,
+          strength: (user as any).strength ?? 5,
+          intelligence: (user as any).intelligence ?? 5,
+          charisma: (user as any).charisma ?? 5,
+          endurance: (user as any).endurance ?? 5,
+          creativity: (user as any).creativity ?? 5,
           currentStreak: (user as any).currentStreak ?? 0,
           longestStreak: (user as any).longestStreak ?? 0,
           subscriptionTier: (user as any).subscriptionTier,
@@ -605,10 +818,10 @@ export default {
         shards: (shards ?? []).map((s: any) => ({
           id: s._id.toString(),
           title: s.title,
-          status: s.status,
+          status: s.status ?? "active",
           completion: s.progress?.completion ?? 0,
-          isPrivate: s.isPrivate,
-          isAnonymous: s.isAnonymous,
+          isPrivate: s.isPrivate ?? false,
+          isAnonymous: s.isAnonymous ?? false,
           owner: s.owner
             ? { id: s.owner._id.toString(), username: s.owner.username }
             : null,
@@ -616,6 +829,151 @@ export default {
           endDate: s.timeline?.endDate,
         })),
       };
+    },
+
+    adminListAchievementDefinitions(_, __, context) {
+      requireAdmin(context);
+      return ACHIEVEMENTS;
+    },
+
+    /**
+     * Get revenue stats for the admin dashboard.
+     */
+    async adminGetRevenueStats(_, __, context) {
+      requireAdmin(context);
+
+      const [statsErr, stats] = await catchError(
+        SubscriptionHistory.aggregate([
+          {
+            $group: {
+              _id: null,
+              totalRevenue: { $sum: "$amount" },
+              activeSubscriptions: {
+                $sum: { $cond: [{ $eq: ["$action", "PURCHASE"] }, 1, 0] },
+              },
+            },
+          },
+        ])
+      );
+
+      const totalRevenue = stats?.[0]?.totalRevenue ?? 0;
+      const activeSubscriptions = stats?.[0]?.activeSubscriptions ?? 0;
+
+      // MRR calculation: Sum of prices of all active subscriptions.
+      // In a real-world high-volume app, we might cache this or store it in a Stat model.
+      // For now, we fetch current prices from the Offering model.
+      const offerings = await Offering.find({});
+      const priceMap: Record<string, number> = {};
+      offerings.forEach(off => {
+        off.packages.forEach(pkg => {
+          priceMap[pkg.identifier] = pkg.price;
+        });
+      });
+
+      // Fetch active subscriptions from Subscription model (not history)
+      const activeSubs = await Subscription.find({ status: "active" });
+      let mrr = 0;
+      activeSubs.forEach(sub => {
+        // Map sub.tier (e.g. 'premium') to a package if possible, or use a default.
+        // Actually, our current Subscription model uses 'free' or 'premium'.
+        // Let's assume 'premium' maps to 'monthly' price for MRR estimation.
+        if (sub.tier === "premium") {
+          mrr += priceMap["monthly"] || 9.99;
+        }
+      });
+
+      const [recentErr, recent] = await catchError(
+        SubscriptionHistory.find({})
+          .populate("userId", "username email")
+          .sort({ timestamp: -1 })
+          .limit(10)
+          .lean()
+      );
+
+      return {
+        mrr,
+        totalRevenue,
+        activeSubscriptions,
+        churnRate: 5.0, 
+        recentTransactions: (recent || []).map((h: any) => ({
+          id: h._id.toString(),
+          user: h.userId ? { id: h.userId._id.toString(), username: h.userId.username } : null,
+          tier: h.tier,
+          action: h.action,
+          amount: h.amount,
+          currency: h.currency,
+          timestamp: h.timestamp.toISOString(),
+        })),
+      };
+    },
+
+    /**
+     * List all subscription history records.
+     */
+    async adminListSubscriptions(_, { page = 1, limit = 20 }, context) {
+      requireAdmin(context);
+      const { skip, limit: safeLimit } = paginate(page, limit);
+
+      const [countErr, total] = await catchError(SubscriptionHistory.countDocuments({}));
+      const [listErr, list] = await catchError(
+        SubscriptionHistory.find({})
+          .populate("userId", "username email")
+          .sort({ timestamp: -1 })
+          .skip(skip)
+          .limit(safeLimit)
+          .lean()
+      );
+
+      return {
+        success: true,
+        total: total ?? 0,
+        page,
+        limit: safeLimit,
+        subscriptions: (list || []).map((h: any) => ({
+          id: h._id.toString(),
+          user: h.userId ? { id: h.userId._id.toString(), username: h.userId.username } : null,
+          tier: h.tier,
+          action: h.action,
+          amount: h.amount,
+          currency: h.currency,
+          timestamp: h.timestamp.toISOString(),
+        })),
+      };
+    },
+
+    /**
+     * List project offerings (plans).
+     */
+    async adminListOfferings(_, __, context) {
+      requireAdmin(context);
+      
+      const offerings = await Offering.find({}).lean();
+      return offerings;
+    },
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // FIELD RESOLVERS
+  // ═══════════════════════════════════════════════════════════════════════════
+  AdminUserDetail: {
+    async subscriptionHistory(parent: any) {
+      const [error, history] = await catchError(
+        SubscriptionHistory.find({ userId: parent.id })
+          .sort({ timestamp: -1 })
+          .lean()
+      );
+
+      if (error) return [];
+
+      return (history || []).map((h: any) => ({
+        id: h._id.toString(),
+        tier: h.tier,
+        action: h.action,
+        amount: h.amount,
+        currency: h.currency,
+        details: h.details,
+        timestamp: h.timestamp.toISOString(),
+      }));
     },
   },
 };
