@@ -62,6 +62,7 @@ export default `#graphql
 
     # Public — Subscription offerings
     listOfferings: [Offering!]!
+    mySubscriptionHistory: [SubscriptionHistory!]!
   }
 
   type Mutation {

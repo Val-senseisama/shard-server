@@ -13,6 +13,7 @@ import { hashPassword, comparePassword, validatePassword } from "../../Helpers/P
 import { User } from "../../models/User.js";
 import EmailQueue from "../../models/EmailQueue.js";
 import Friendship from "../../models/Friendship.js";
+import SubscriptionHistory from "../../models/SubscriptionHistory.js";
 import { getCloudinarySignedUpload } from "../../Helpers/Cloudinary.js";
 import { verifyGoogleToken, generateUsernameFromGoogle } from "../../Helpers/GoogleAuth.js";
 import { moderate } from "../../Helpers/ContentModerator.js";
@@ -905,6 +906,25 @@ console.log("newUser", newUser);
       const { default: Offering } = await import("../../models/Offering.js");
       const offerings = await Offering.find({}).lean();
       return offerings;
+    },
+
+    // Get user's own subscription history
+    async mySubscriptionHistory(_, __, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+
+      const history = await SubscriptionHistory.find({ userId: context.id })
+        .sort({ timestamp: -1 })
+        .lean();
+
+      return history.map((item: any) => ({
+        id: item._id.toString(),
+        tier: item.tier,
+        action: item.action,
+        amount: item.amount,
+        currency: item.currency,
+        details: item.details,
+        timestamp: item.timestamp.toISOString(),
+      }));
     },
   },
 };
