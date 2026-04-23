@@ -1,16 +1,18 @@
 import { Queue, Worker, Job } from 'bullmq';
+import Redis from 'ioredis';
 import { sendNotificationToUsers } from './FirebaseMessaging.js';
 import { logError } from './Helpers.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-const connection: any = process.env.REDIS_URL 
-  ? process.env.REDIS_URL 
-  : {
+const connection = process.env.REDIS_URL 
+  ? new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null })
+  : new Redis({
       host: process.env.REDIS_HOST || 'localhost',
       port: parseInt(process.env.REDIS_PORT || '6379'),
-    };
+      maxRetriesPerRequest: null,
+    });
 
 export const chatQueue = new Queue('chat-jobs', {
   connection,
@@ -19,6 +21,7 @@ export const chatQueue = new Queue('chat-jobs', {
     backoff: { type: 'exponential', delay: 1000 },
   },
 });
+
 
 // Track Redis connection state for graceful degradation
 let isRedisConnected = process.env.ENABLE_REDIS_QUEUE === 'true';
