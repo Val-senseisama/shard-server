@@ -5,7 +5,7 @@ export interface Package {
   priceString: string;
   price: number;
   currencyCode: string;
-}
+} 
 
 export interface OfferingDocument extends Document {
   identifier: string;
