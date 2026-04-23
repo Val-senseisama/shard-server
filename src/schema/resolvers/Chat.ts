@@ -937,10 +937,9 @@ export default {
         };
       }
 
-      // Get messages (don't cache per-request, cache keys vary)
       const [error, messages] = await catchError(
         Message.find({ chatId })
-          .select("sender content type readBy attachments poll minitaskRef mentions createdAt edited deleted editedAt")
+          .select("sender content type readBy readAt attachments poll minitaskRef mentions createdAt edited deleted editedAt reactions")
           .populate("sender", "username profilePic")
           .populate("poll.options.votes", "username profilePic")
           .populate("mentions", "username profilePic")
@@ -972,6 +971,11 @@ export default {
             profilePic: m.sender.profilePic,
           } : { id: 'unknown', username: 'Unknown User', profilePic: '' },
           readBy: m.readBy || [],
+          readAt: m.readAt || [],
+          edited: !!m.edited,
+          editedAt: m.editedAt ? new Date(m.editedAt).toISOString() : null,
+          deleted: !!m.deleted,
+          reactions: m.reactions || [],
           mediaUrl: m.attachments && m.attachments.length > 0 ? m.attachments[0].url : undefined,
           poll: m.poll,
           minitaskRef: m.minitaskRef ? {
@@ -980,8 +984,8 @@ export default {
               id: m.minitaskRef.assignedTo._id?.toString(),
               username: m.minitaskRef.assignedTo.username,
               profilePic: m.minitaskRef.assignedTo.profilePic,
-            } : null
-          } : undefined,
+            } : { id: "unknown", username: "Unknown", profilePic: "" }
+          } : null,
           mentions: m.mentions?.map((u: any) => ({
             id: u._id?.toString(),
             username: u.username,
