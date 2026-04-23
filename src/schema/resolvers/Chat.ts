@@ -940,8 +940,11 @@ export default {
       // Get messages (don't cache per-request, cache keys vary)
       const [error, messages] = await catchError(
         Message.find({ chatId })
-          .select("sender content type readBy attachments createdAt")
+          .select("sender content type readBy attachments poll minitaskRef mentions createdAt edited deleted editedAt")
           .populate("sender", "username profilePic")
+          .populate("poll.options.votes", "username profilePic")
+          .populate("mentions", "username profilePic")
+          .populate("minitaskRef.assignedTo", "username profilePic")
           .sort({ createdAt: -1 })
           .limit(limit)
           .skip(skip)
@@ -963,14 +966,29 @@ export default {
           id: m._id.toString(),
           content: m.content,
           type: m.type,
-          sender: {
-            id: m.sender._id.toString(),
+          sender: m.sender ? {
+            id: m.sender._id?.toString(),
             username: m.sender.username,
             profilePic: m.sender.profilePic,
-          },
+          } : { id: 'unknown', username: 'Unknown User', profilePic: '' },
           readBy: m.readBy || [],
           mediaUrl: m.attachments && m.attachments.length > 0 ? m.attachments[0].url : undefined,
-          createdAt: m.createdAt,
+          poll: m.poll,
+          minitaskRef: m.minitaskRef ? {
+            ...m.minitaskRef,
+            assignedTo: m.minitaskRef.assignedTo ? {
+              id: m.minitaskRef.assignedTo._id?.toString(),
+              username: m.minitaskRef.assignedTo.username,
+              profilePic: m.minitaskRef.assignedTo.profilePic,
+            } : null
+          } : undefined,
+          mentions: m.mentions?.map((u: any) => ({
+            id: u._id?.toString(),
+            username: u.username,
+            profilePic: u.profilePic
+          })),
+          attachments: m.attachments || [],
+          createdAt: m.createdAt instanceof Date ? m.createdAt.toISOString() : new Date(m.createdAt).toISOString(),
         })),
       };
     },
