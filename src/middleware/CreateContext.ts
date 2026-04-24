@@ -1,6 +1,6 @@
 import jwt from "jsonwebtoken";
 import "dotenv/config";
-import setJWT from "../Helpers/setJWT.js";
+import setJWT, { hashRefreshToken } from "../Helpers/setJWT.js";
 import { catchError, logError, ThrowError } from "../Helpers/Helpers.js";
 import { User } from "../models/User.js";
 
@@ -74,8 +74,11 @@ export default async (req: any, res: any) => {
         ThrowError("Your account has been deactivated. Please contact support.");
       }
       
-      // Check if the refresh token exists in user's refreshTokens array
-      if (!decodedRefreshToken.token || !thisUser.refreshTokens?.includes(decodedRefreshToken.token)) {
+      // Hash the raw token from the JWT and compare against stored hashes
+      const rawToken = decodedRefreshToken.token;
+      if (!rawToken) ThrowError("Session expired. Please login again.");
+      const hashedIncoming = hashRefreshToken(rawToken);
+      if (!thisUser.refreshTokens?.includes(hashedIncoming)) {
         ThrowError("Session expired. Please login again.");
       }
 

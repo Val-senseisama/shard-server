@@ -1,7 +1,9 @@
 import { Server as HTTPServer } from "http";
 import { Server as SocketIOServer } from "socket.io";
 import jwt from "jsonwebtoken";
+import mongoose from "mongoose";
 import { User } from "../models/User.js";
+import Chat from "../models/Chat.js";
 
 interface SocketUser {
   userId: string;
@@ -100,28 +102,54 @@ export function setupWebSocketServer(httpServer: HTTPServer) {
       });
     });
 
-    // Join a chat room
-    socket.on("chat:join", (chatId: string) => {
-      socket.join(`chat:${chatId}`);
-      if (!userActiveChats.has(userId)) userActiveChats.set(userId, new Set());
-      userActiveChats.get(userId)!.add(chatId);
-      console.log(`📨 ${username} joined chat ${chatId}`);
+    // Join a chat room — validate membership before admitting
+    socket.on("chat:join", async (chatId: string) => {
+      if (!chatId || !mongoose.isValidObjectId(chatId)) return;
+      try {
+        const chat = await Chat.findById(chatId).select("participants").lean();
+        if (!chat) return;
+        const isMember = chat.participants.some(
+          (p: any) => p.toString() === userId
+        );
+        if (!isMember) return; // silently reject — don't reveal room existence
+        socket.join(`chat:${chatId}`);
+        if (!userActiveChats.has(userId)) userActiveChats.set(userId, new Set());
+        userActiveChats.get(userId)!.add(chatId);
+      } catch {
+        // ignore
+      }
     });
 
     // Leave a chat room
     socket.on("chat:leave", (chatId: string) => {
+      if (!chatId || !mongoose.isValidObjectId(chatId)) return;
       socket.leave(`chat:${chatId}`);
       userActiveChats.get(userId)?.delete(chatId);
-      console.log(`👋 ${username} left chat ${chatId}`);
     });
 
-    // Join multiple chats at once (e.g. on app start)
-    socket.on("chats:join", (chatIds: string[]) => {
-      if (!userActiveChats.has(userId)) userActiveChats.set(userId, new Set());
-      chatIds.forEach((chatId) => {
-        socket.join(`chat:${chatId}`);
-        userActiveChats.get(userId)!.add(chatId);
-      });
+    // Join multiple chats at once — each validated individually
+    socket.on("chats:join", async (chatIds: string[]) => {
+      if (!Array.isArray(chatIds)) return;
+      const validIds = chatIds.filter(
+        (id) => id && mongoose.isValidObjectId(id)
+      );
+      if (validIds.length === 0) return;
+      try {
+        const chats = await Chat.find({
+          _id: { $in: validIds },
+          participants: new mongoose.Types.ObjectId(userId),
+        }).select("_id").lean();
+        const allowedIds = new Set(chats.map((c: any) => c._id.toString()));
+        if (!userActiveChats.has(userId)) userActiveChats.set(userId, new Set());
+        validIds.forEach((chatId) => {
+          if (allowedIds.has(chatId)) {
+            socket.join(`chat:${chatId}`);
+            userActiveChats.get(userId)!.add(chatId);
+          }
+        });
+      } catch {
+        // ignore
+      }
     });
 
     // Heartbeat — throttled to one DB write per minute to avoid hammering Mongo

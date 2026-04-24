@@ -38,36 +38,34 @@ export async function checkAIUsage(userId: string, tier: "free" | "pro"): Promis
   used: number;
   remaining: number;
 }> {
+  if (tier === "pro") {
+    return { canProceed: true, limit: -1, used: 0, remaining: -1 };
+  }
   const user = await User.findById(userId, "aiCredits");
   const credits = user?.aiCredits || 0;
-
-  // Pro users have unlimited credits (-1), Free users use credits
-  const hasCredits = tier === "pro" || credits > 0;
-
   return {
-    canProceed: hasCredits,
-    limit: tier === "pro" ? -1 : credits, // For free users, limit is their current balance
-    used: 0, // Not tracking daily usage anymore
-    remaining: tier === "pro" ? -1 : credits,
+    canProceed: credits > 0,
+    limit: credits,
+    used: 0,
+    remaining: credits,
   };
 }
 
 /**
- * Track AI usage (deduct credit for free users)
- * @param userId - User ID
- * @param tier - User subscription tier
+ * Atomically deduct one AI credit. Returns false if no credits remain (TOCTOU-safe).
  */
-export async function trackAIUsage(userId: string, tier: "free" | "pro" = "free"): Promise<void> {
-  // Pro users have unlimited credits, so skip decrement
-  if (tier === "pro") {
-    console.log(`[AIUsage] Skipping credit decrement for Pro user: ${userId}`);
-    return;
-  }
+export async function trackAIUsage(userId: string, tier: "free" | "pro" = "free"): Promise<boolean> {
+  if (tier === "pro") return true;
 
-  // Decrement credits by 1
-  await User.findByIdAndUpdate(userId, {
-    $inc: { aiCredits: -1 }
-  });
+  // Atomic check-and-decrement — prevents race condition where concurrent
+  // requests both see credits > 0 and both proceed
+  const updated = await User.findOneAndUpdate(
+    { _id: userId, aiCredits: { $gt: 0 } },
+    { $inc: { aiCredits: -1 } },
+    { new: true }
+  );
+
+  return !!updated;
 }
 
 /**

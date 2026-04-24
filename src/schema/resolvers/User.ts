@@ -61,9 +61,10 @@ export default {
       }
 
       if (existingUser) {
+        // Generic message — don't reveal whether email or username is taken
         return {
           success: false,
-          message: "User with this email or username already exists.",
+          message: "Could not create account with these details.",
         };
       }
 
@@ -138,7 +139,7 @@ export default {
       SaveAuditTrail({
         userId: newUser._id.toString(),
         task: "Signed up",
-        details: `New user signed up with email ${email}`,
+        details: `New user registered (emailHash: ${emailHash.slice(0, 8)}…)`,
       });
 
       return {
@@ -817,9 +818,12 @@ console.log("newUser", newUser);
     async searchUsers(_, { query, type }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      if (!query || query.trim().length < 2) {
+      if (!query || query.trim().length < 3) {
         return { success: true, users: [] };
       }
+
+      // Enforce max length to prevent oversized regex patterns
+      const trimmed = query.trim().slice(0, 50);
 
       // Get IDs of blocked users to exclude
       const [blockedErr, blocked] = await catchError(
@@ -831,7 +835,9 @@ console.log("newUser", newUser);
       let dbQuery: any = { _id: { $nin: blockedIds }, isActive: true };
 
       if (!type || type === "USERNAME") {
-        dbQuery.username = { $regex: query.trim(), $options: "i" };
+        // Escape all regex metacharacters before passing to MongoDB $regex
+        const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        dbQuery.username = { $regex: escaped, $options: "i" };
       } else if (type === "EMAIL_HASH") {
         dbQuery.emailHash = query.trim();
       } else if (type === "PHONE_HASH") {

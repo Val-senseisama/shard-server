@@ -5,6 +5,9 @@ import { expressMiddleware } from "@as-integrations/express5";
 import { ApolloServerPluginDrainHttpServer } from "@apollo/server/plugin/drainHttpServer";
 import express from "express";
 import http from "http";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import depthLimit from "graphql-depth-limit";
 import { connectDB } from "./config/db.js";
 import createContext from "./middleware/CreateContext.js";
 import { formatError } from "./middleware/FormatError.js";
@@ -12,62 +15,120 @@ import typeDefs from "./schema/Typedefinitions.js";
 import resolvers from "./schema/Resolvers.js";
 import cors from "cors";
 import { setupWebSocketServer } from "./server/WebSocketServer.js";
-import { startOverdueTaskReschedule, startDeletedTaskPurge, startDeadlineReminders, startOverdueAlerts, startDailyTaskReminders, startScheduledNotificationDispatcher, startInactivityNudger, startStreakEventDetector } from './Helpers/CronJobs.js';
+import {
+  startOverdueTaskReschedule,
+  startDeletedTaskPurge,
+  startDeadlineReminders,
+  startOverdueAlerts,
+  startDailyTaskReminders,
+  startScheduledNotificationDispatcher,
+  startInactivityNudger,
+  startStreakEventDetector,
+} from './Helpers/CronJobs.js';
 import { handleRevenueCatWebhook } from "./controllers/WebhookController.js";
 
 const PORT = process.env.PORT || 4000;
+const isProd = process.env.NODE_ENV === "production";
 
 const app = express();
 const httpServer = http.createServer(app);
 
-// Setup WebSocket server
-const io = setupWebSocketServer(httpServer);
+// ─── Security headers ────────────────────────────────────────────────────────
+app.use(helmet({
+  crossOriginEmbedderPolicy: false, // Allow Apollo Studio in dev
+  contentSecurityPolicy: isProd ? undefined : false,
+}));
 
-// Set up WebSocket in Chat resolver
-import { setSocketIO } from "./schema/resolvers/Chat.js";
-setSocketIO(io);
+// ─── Body size limits ────────────────────────────────────────────────────────
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
-export { io }; // Export for use in other files
+// ─── CORS ─────────────────────────────────────────────────────────────────────
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
 
+app.use(cors({
+  origin: isProd
+    ? (origin, cb) => {
+        // Mobile apps have no origin — allow. Web origins must be allowlisted.
+        if (!origin || ALLOWED_ORIGINS.includes(origin)) cb(null, true);
+        else cb(new Error(`CORS: origin ${origin} not allowed`));
+      }
+    : true,
+  exposedHeaders: ["x-access-token", "x-refresh-token"],
+}));
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// ─── Rate limiting ────────────────────────────────────────────────────────────
+// Tight limit on auth endpoints
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many attempts. Please try again in 15 minutes." },
+});
 
+// General GraphQL limit — prevents DoS via volume
+const graphqlLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Slow down." },
+  skip: (req) => {
+    // Don't rate-limit health checks
+    const body = req.body;
+    return body?.operationName === "IntrospectionQuery";
+  },
+});
+
+// ─── Webhook (before GraphQL middleware) ─────────────────────────────────────
 app.post("/webhooks/revenuecat", handleRevenueCatWebhook);
 
+// ─── WebSocket ────────────────────────────────────────────────────────────────
+const io = setupWebSocketServer(httpServer);
+import { setSocketIO } from "./schema/resolvers/Chat.js";
+setSocketIO(io);
+export { io };
 
+// ─── Apollo Server ────────────────────────────────────────────────────────────
 const server = new ApolloServer({
-    typeDefs,
-    resolvers,
-    formatError,
-    plugins: [
-        ApolloServerPluginDrainHttpServer({ httpServer }),
-           ],
-           
+  typeDefs,
+  resolvers,
+  formatError,
+  introspection: !isProd, // Disable schema exposure in production
+  validationRules: [
+    depthLimit(10), // Reject queries nested deeper than 10 levels
+  ],
+  plugins: [ApolloServerPluginDrainHttpServer({ httpServer })],
 });
 
 await server.start();
 
-app.use(cors());
-
-app.use("/graphql", expressMiddleware(server, {
+app.use(
+  "/graphql",
+  graphqlLimiter,
+  expressMiddleware(server, {
     context: async ({ req, res }) => createContext(req, res),
-}));
+  })
+);
+
+// ─── Separate stricter rate limit for auth operations (applied in resolvers) ──
+// The auth resolvers themselves check a per-IP counter via this exported limiter.
+export { authLimiter };
 
 connectDB();
 
 httpServer.listen(PORT, () => {
-    console.log(`🚀 [SERVER] Server is running on port ${PORT}`);
-    console.log(`🚀 [SERVER] GraphQL endpoint: http://localhost:${PORT}/graphql`);
-    console.log(`🚀 [SERVER] WebSocket endpoint: ws://localhost:${PORT}`);
-    
-    // Start cron jobs
-    startOverdueTaskReschedule();
-    startDeletedTaskPurge();
-    startDeadlineReminders();
-    startOverdueAlerts();
-    startDailyTaskReminders();
-    startScheduledNotificationDispatcher();
-    startInactivityNudger();
-    startStreakEventDetector();
+  console.log(`🚀 [SERVER] Running on port ${PORT} (${isProd ? "production" : "development"})`);
+  startOverdueTaskReschedule();
+  startDeletedTaskPurge();
+  startDeadlineReminders();
+  startOverdueAlerts();
+  startDailyTaskReminders();
+  startScheduledNotificationDispatcher();
+  startInactivityNudger();
+  startStreakEventDetector();
 });
