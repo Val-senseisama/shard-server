@@ -26,6 +26,19 @@ export function setSocketIO(ioInstance: any) {
 }
 
 /**
+ * Resolve a chat by either its own _id OR by the shard's chatId.
+ * The mobile client passes the shard ID in the URL, not the chat document ID.
+ */
+async function resolveChat(chatId: string) {
+  let [, chat] = await catchError(Chat.findById(chatId).lean());
+  if (!chat) {
+    const [, byShardId] = await catchError(Chat.findOne({ shardId: chatId }).lean());
+    chat = byShardId ?? null;
+  }
+  return chat;
+}
+
+/**
  * Parse @mentions in a message and notify mentioned users.
  */
 async function processMentions(
@@ -378,11 +391,15 @@ export default {
     async markMessagesRead(_, { chatId, messageIds }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
+      // Resolve shard ID → actual chat document
+      const chat = await resolveChat(chatId);
+      const actualChatId = chat?._id ?? chatId;
+
       const now = new Date();
 
       const [error] = await catchError(
         Message.updateMany(
-          { _id: { $in: messageIds }, chatId },
+          { _id: { $in: messageIds }, chatId: actualChatId },
           {
             $addToSet: {
               readBy: context.id,
@@ -398,7 +415,7 @@ export default {
       }
 
       if (io) {
-        io.to(`chat:${chatId}`).emit("message:read", {
+        io.to(`chat:${actualChatId}`).emit("message:read", {
           messageIds,
           readBy: context.id,
           readAt: now,
@@ -900,9 +917,10 @@ export default {
     async getChatMessages(_, { chatId, limit = 50, skip = 0, before }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      const [chatError, chat] = await catchError(Chat.findById(chatId).lean());
+      // chatId may be the shard ID (from the URL) — resolve to the actual chat document
+      const chat = await resolveChat(chatId);
 
-      if (chatError || !chat) {
+      if (!chat) {
         return { success: false, message: "Chat not found.", messages: [] };
       }
 
@@ -914,8 +932,11 @@ export default {
         };
       }
 
+      // Always use the actual chat _id for the message query, regardless of what was passed
+      const actualChatId = chat._id;
+
       // Cursor-based pagination when `before` is provided; fall back to skip/limit
-      const query: any = { chatId };
+      const query: any = { chatId: actualChatId };
       if (before) {
         try {
           query._id = { $lt: new Types.ObjectId(before) };
