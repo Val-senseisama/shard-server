@@ -622,7 +622,7 @@ export default `#graphql
   }
 
   type PollData {
-    question: String!
+    question: String
     options: [PollOptionData!]!
     multipleAnswers: Boolean!
   }

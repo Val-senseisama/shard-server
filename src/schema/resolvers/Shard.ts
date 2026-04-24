@@ -825,9 +825,13 @@ export default {
         }
       }
 
-      // Invalidate cache for both owner and the new participant
+      // Invalidate shard, chat, and both users' shard lists
+      await cacheInvalidate.shard(shardId);
       await cacheInvalidate.shardList(context.id);
       await cacheInvalidate.shardList(userId);
+      if (shard.chatId) {
+        await cacheInvalidate.chat(shard.chatId.toString());
+      }
 
       SaveAuditTrail({
         userId: context.id,

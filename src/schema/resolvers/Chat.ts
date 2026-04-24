@@ -317,6 +317,7 @@ export default {
           chatId,
           sender: context.id,
           senderUsername: sender?.username || "Unknown",
+          senderProfilePic: sender?.profilePic || "",
           content: newMessage.content,
           type: newMessage.type,
           mediaUrl:
@@ -545,6 +546,7 @@ export default {
           chatId,
           sender: context.id,
           senderUsername: sender?.username || "Unknown",
+          senderProfilePic: sender?.profilePic || "",
           content: newMessage.content,
           type: newMessage.type,
           createdAt: newMessage.createdAt,
@@ -652,6 +654,7 @@ export default {
           chatId,
           sender: context.id,
           senderUsername: sender?.username || "Unknown",
+          senderProfilePic: sender?.profilePic || "",
           content: newMessage.content,
           type: newMessage.type,
           createdAt: newMessage.createdAt,
@@ -727,6 +730,7 @@ export default {
           chatId,
           sender: context.id,
           senderUsername: "AI Summary",
+          senderProfilePic: "",
           content: newMessage.content,
           type: newMessage.type,
           createdAt: newMessage.createdAt,
@@ -973,7 +977,18 @@ export default {
           replyTo: m.replyTo ? m.replyTo.toString() : null,
           mediaUrl:
             m.attachments && m.attachments.length > 0 ? m.attachments[0].url : undefined,
-          poll: m.poll,
+          poll: m.poll?.question != null ? {
+              question: m.poll.question,
+              multipleAnswers: m.poll.multipleAnswers ?? false,
+              options: (m.poll.options || []).map((opt: any) => ({
+                text: opt.text ?? '',
+                votes: (opt.votes || []).map((v: any) =>
+                  typeof v === 'object' && v?._id
+                    ? { id: v._id.toString(), username: v.username, profilePic: v.profilePic }
+                    : { id: v?.toString() ?? '', username: '', profilePic: '' }
+                ),
+              })),
+            } : null,
           minitaskRef: m.minitaskRef
             ? {
                 ...m.minitaskRef,
