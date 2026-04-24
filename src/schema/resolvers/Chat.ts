@@ -14,63 +14,63 @@ import { createNotification } from "./Notifications.js";
 import { User } from "../../models/User.js";
 import { enqueuePushNotification } from "../../Helpers/Queue.js";
 import { moderate } from "../../Helpers/ContentModerator.js";
+import { generateChatSummary } from "../../Helpers/AIHelper.js";
+import { Types } from "mongoose";
 
 const cacheInvalidateChat = cacheInvalidate.chat;
 const cacheInvalidateUserChats = cacheInvalidate.userChats;
 
-// Import io for WebSocket emissions
 let io: any = null;
 export function setSocketIO(ioInstance: any) {
   io = ioInstance;
 }
 
 /**
- * Helper to parse @mentions and notify users.
- * Returns array of mentioned User IDs.
+ * Parse @mentions in a message and notify mentioned users.
  */
 async function processMentions(
-  content: string, 
-  participants: string[], 
-  senderId: string, 
-  chatId: string, 
+  content: string,
+  participants: string[],
+  senderId: string,
+  chatId: string,
   senderUsername: string
 ): Promise<string[]> {
   const atMatches = content.match(/@(\w+)/g);
   if (!atMatches) return [];
 
-  const foundUsernames = atMatches.map(m => m.substring(1).toLowerCase());
+  const foundUsernames = atMatches.map((m) => m.substring(1).toLowerCase());
   let mentionedIds: string[] = [];
 
-  if (foundUsernames.includes('everyone')) {
-    // Mention all participants except sender
-    mentionedIds = participants.filter(p => p !== senderId);
+  if (foundUsernames.includes("everyone")) {
+    mentionedIds = participants.filter((p) => p !== senderId);
   } else {
-    // Find specific users by username
     const [error, users] = await catchError(
-      User.find({ 
-        username: { $in: foundUsernames.map(u => new RegExp(`^${u}$`, 'i')) } 
-      }).select('_id').lean()
+      User.find({
+        username: { $in: foundUsernames.map((u) => new RegExp(`^${u}$`, "i")) },
+      })
+        .select("_id")
+        .lean()
     );
-    
+
     if (!error && users) {
       mentionedIds = users
         .map((u: any) => u._id.toString())
-        .filter(id => id !== senderId && participants.includes(id));
+        .filter((id) => id !== senderId && participants.includes(id));
     }
   }
 
   const uniqueMentions = [...new Set(mentionedIds)];
-  
+
   if (uniqueMentions.length > 0) {
     enqueuePushNotification(
       uniqueMentions,
       {
         title: `@${senderUsername} mentioned you`,
         body: content.length > 60 ? content.substring(0, 60) + "..." : content,
-        data: { chatId, screen: "/(screens)/shard/[id]/chat", isMention: "true" }
+        data: { chatId, screen: "/(screens)/shard/[id]/chat", isMention: "true" },
       },
-      'messages'
-    ).catch(e => logError("MentionNotificationError", e));
+      "messages"
+    ).catch((e) => logError("MentionNotificationError", e));
   }
 
   return uniqueMentions;
@@ -78,101 +78,60 @@ async function processMentions(
 
 export default {
   Mutation: {
-    // Create or get direct chat
     async createOrGetDirectChat(_, { friendId }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      // Check if users are friends
       const [friendshipError, friendship] = await catchError(
-        Friendship.findOne({
-          user: context.id,
-          friend: friendId,
-          status: "accepted",
-        }).lean()
+        Friendship.findOne({ user: context.id, friend: friendId, status: "accepted" }).lean()
       );
 
       if (friendshipError || !friendship) {
-        return {
-          success: false,
-          message: "You can only chat with friends.",
-        };
+        return { success: false, message: "You can only chat with friends." };
       }
 
-      // Check if chat already exists
       const [existingError, existingChat] = await catchError(
-        Chat.findOne({
-          type: "direct",
-          participants: { $all: [context.id, friendId] },
-        }).lean()
+        Chat.findOne({ type: "direct", participants: { $all: [context.id, friendId] } }).lean()
       );
 
       if (existingError) {
         logError("createOrGetDirectChat:findExisting", existingError);
-        return {
-          success: false,
-          message: "An error occurred.",
-        };
+        return { success: false, message: "An error occurred." };
       }
 
       if (existingChat) {
-        return {
-          success: true,
-          chatId: existingChat._id.toString(),
-        };
+        return { success: true, chatId: existingChat._id.toString() };
       }
 
-      // Create new chat
       const [createError, newChat] = await catchError(
-        Chat.create({
-          type: "direct",
-          participants: [context.id, friendId],
-        })
+        Chat.create({ type: "direct", participants: [context.id, friendId] })
       );
 
       if (createError) {
         logError("createOrGetDirectChat:create", createError);
-        return {
-          success: false,
-          message: "Failed to create chat.",
-        };
+        return { success: false, message: "Failed to create chat." };
       }
 
-      return {
-        success: true,
-        chatId: newChat._id.toString(),
-      };
+      return { success: true, chatId: newChat._id.toString() };
     },
 
-    // Create or get shard group chat
     async createOrGetShardChat(_, { shardId }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      // Verify user is a shard participant
-      const [shardError, shard] = await catchError(
-        Shard.findById(shardId).lean()
-      );
+      const [shardError, shard] = await catchError(Shard.findById(shardId).lean());
 
       if (shardError || !shard) {
-        return {
-          success: false,
-          message: "Shard not found.",
-        };
+        return { success: false, message: "Shard not found." };
       }
 
-      // Check if user is owner or participant
       const isOwner = shard.owner.toString() === context.id;
       const isParticipant = shard.participants?.some(
         (p: any) => p.user.toString() === context.id
       );
 
       if (!isOwner && !isParticipant) {
-        return {
-          success: false,
-          message: "You are not a participant in this shard.",
-        };
+        return { success: false, message: "You are not a participant in this shard." };
       }
 
-      // Check if shard has multiple participants
       const allParticipants = [
         shard.owner.toString(),
         ...(shard.participants?.map((p: any) => p.user.toString()) || []),
@@ -186,34 +145,23 @@ export default {
         };
       }
 
-      // Check if chat already exists for this shard
       const [existingError, existingChat] = await catchError(
-        Chat.findOne({
-          type: "group",
-          shardId: shardId,
-        }).lean()
+        Chat.findOne({ type: "group", shardId }).lean()
       );
 
       if (existingError) {
         logError("createOrGetShardChat:findExisting", existingError);
-        return {
-          success: false,
-          message: "An error occurred.",
-        };
+        return { success: false, message: "An error occurred." };
       }
 
       if (existingChat) {
-        return {
-          success: true,
-          chatId: existingChat._id.toString(),
-        };
+        return { success: true, chatId: existingChat._id.toString() };
       }
 
-      // Create new group chat for shard
       const [createError, newChat] = await catchError(
         Chat.create({
           type: "group",
-          shardId: shardId,
+          shardId,
           name: `${shard.title} Chat`,
           participants: uniqueParticipants,
         })
@@ -221,59 +169,34 @@ export default {
 
       if (createError) {
         logError("createOrGetShardChat:create", createError);
-        return {
-          success: false,
-          message: "Failed to create chat.",
-        };
+        return { success: false, message: "Failed to create chat." };
       }
 
-      // Update shard with chat ID
       await Shard.findByIdAndUpdate(shardId, { chatId: newChat._id });
 
-      return {
-        success: true,
-        chatId: newChat._id.toString(),
-      };
+      return { success: true, chatId: newChat._id.toString() };
     },
 
-    // Send message
     async sendMessage(_, { chatId, content, type, replyTo, attachments }, context) {
-      let notfound = false;
       if (!context.id) ThrowError("Please login to continue.");
 
-      // Verify user is participant
-      let [chatError, chat] = await catchError(
-        Chat.findById(chatId).lean()
-      );
-
-      if (chatError) {
-        console.log("chaterror", chatError, chatId);
-        notfound = true;
-      }
-
-      // Fetch sender information for mentions
-      const [senderError, sender] = await catchError(User.findById(context.id).select("username profilePic").lean());
+      // Find chat — if not found by chat ID, try to auto-create from shard
+      let [chatError, chat] = await catchError(Chat.findById(chatId).lean());
 
       if (!chat) {
         const [shardError, shard] = await catchError(
-          Shard.findById(chatId).select("title, participants, owner").lean()
+          Shard.findById(chatId).select("title participants owner").lean()
         );
-        if (shardError) {
-          logError("sendMessage:shard", shardError);
-          return {
-            success: false,
-            message: "Failed to create chat.",
-          };
-        }  
-        
-        // Extract participant user IDs from shard participants (which are objects with {user, role})
+
+        if (shardError || !shard) {
+          return { success: false, message: "Chat not found." };
+        }
+
         const participantUserIds = shard.participants?.map((p: any) => p.user.toString()) || [];
-        
-        // Ensure owner is included in participants
         const allParticipantIds = [shard.owner.toString(), ...participantUserIds];
         const uniqueParticipantIds = [...new Set(allParticipantIds)];
-        
-        const [newShardChatError, newShardChat] = await catchError(
+
+        const [newChatError, newShardChat] = await catchError(
           Chat.create({
             type: "shard",
             shardId: chatId,
@@ -282,78 +205,47 @@ export default {
           })
         );
 
-        if (newShardChatError) {
-          
-          logError("sendMessage:newShardChat", newShardChatError);
-          return {
-            success: false,
-            message: "Failed to create chat.",
-          };
+        if (newChatError) {
+          logError("sendMessage:newShardChat", newChatError);
+          return { success: false, message: "Failed to create chat." };
         }
 
         chatId = newShardChat._id;
-        chat = newShardChat
-      }
-
-      if (notfound) {
-        return {
-          success: false,
-          message: "Chat not found.",
-        };
+        chat = newShardChat;
       }
 
       if (!chat.participants.map((p: any) => p.toString()).includes(context.id)) {
-        console.log(chat.participants, context.id);
-
-        return {
-          success: false,
-          message: "You are not a participant in this chat.",
-        };
+        return { success: false, message: "You are not a participant in this chat." };
       }
 
-      // Moderate message content
-      if (content && type === 'text') {
-        const msgMod = moderate(content, 'chat');
+      // Content moderation
+      if (content && type === "text") {
+        const msgMod = moderate(content, "chat");
         if (!msgMod.allowed) {
           return {
             success: false,
-            message: msgMod.crisisMessage || msgMod.reason || 'Message could not be sent.',
+            message: msgMod.crisisMessage || msgMod.reason || "Message could not be sent.",
           };
         }
       }
 
-      // Scan URLs in message content for safety
-      if (content && type !== 'image' && type !== 'video' && type !== 'audio') {
-        const urls = extractUrls(content);
-        if (urls.length > 0) {
-          const scanResults = await Promise.all(urls.map(scanLink));
-          const flagged = scanResults.find(r => !r.safe);
-          if (flagged) {
-            return {
-              success: false,
-              message: "Message contains a flagged or unsafe link.",
-            };
-          }
-        }
-      }
-
-      // If replying to a message, verify it exists in this chat
+      // Validate reply target exists in this chat
       if (replyTo) {
         const [replyError, originalMessage] = await catchError(
           Message.findOne({ _id: replyTo, chatId }).lean()
         );
-
         if (replyError || !originalMessage) {
-          return {
-            success: false,
-            message: "Original message not found.",
-          };
+          return { success: false, message: "Original message not found." };
         }
       }
 
-      // Process mentions if it's a text message
+      const [senderError, sender] = await catchError(
+        User.findById(context.id).select("username profilePic").lean()
+      );
+
+      // Process @mentions
       let mentionedIds: string[] = [];
-      if (type === 'text' || !type) {
+      if (type === "text" || !type) {
         mentionedIds = await processMentions(
           content,
           chat.participants.map((p: any) => p.toString()),
@@ -363,48 +255,36 @@ export default {
         );
       }
 
-      // Create message
       const messageData: any = {
         chatId,
         sender: context.id,
         content,
         type: type || "text",
-        readBy: [context.id], // Mark as read by sender
+        readBy: [context.id],
         readAt: [{ userId: context.id, readAt: new Date() }],
         mentions: mentionedIds,
       };
 
-      if (replyTo) {
-        messageData.replyTo = replyTo;
-      }
+      if (replyTo) messageData.replyTo = replyTo;
+      if (attachments) messageData.attachments = attachments;
 
-      if (attachments) {
-        messageData.attachments = attachments;
-      }
-
-      const [messageError, newMessage] = await catchError(
-        Message.create(messageData)
-      );
+      const [messageError, newMessage] = await catchError(Message.create(messageData));
 
       if (messageError) {
         logError("sendMessage", messageError);
-        return {
-          success: false,
-          message: "Failed to send message.",
-        };
+        return { success: false, message: "Failed to send message." };
       }
 
-      // Invalidate chat and user chats cache
+      // Invalidate caches
       await cacheInvalidateChat(chatId);
       await Promise.all(
-        chat.participants.map((p: any) => 
-          cacheInvalidateUserChats(p.toString())
-        )
+        chat.participants.map((p: any) => cacheInvalidateUserChats(p.toString()))
       );
 
-      // Send notifications to other participants
-      const otherParticipants = chat.participants
-        .filter((p: any) => p.toString() !== context.id);
+      // Notify participants
+      const otherParticipants = chat.participants.filter(
+        (p: any) => p.toString() !== context.id
+      );
 
       for (const participant of otherParticipants) {
         await createNotification(
@@ -414,11 +294,9 @@ export default {
         );
       }
 
-      // Send Push Notification asynchronously via Queue
-      // Filter out mentioned users to avoid double notifications
       const recipientIds = otherParticipants
         .map((p: any) => p.toString())
-        .filter(id => !mentionedIds.includes(id));
+        .filter((id) => !mentionedIds.includes(id));
 
       if (recipientIds.length > 0) {
         enqueuePushNotification(
@@ -426,16 +304,13 @@ export default {
           {
             title: `New message from ${sender?.username || "Someone"}`,
             body: content.length > 50 ? content.substring(0, 50) + "..." : content,
-            data: { 
-              chatId: chatId.toString(), 
-              screen: "/(screens)/shard/[id]/chat" 
-            }
+            data: { chatId: chatId.toString(), screen: "/(screens)/shard/[id]/chat" },
           },
-          'messages'
-        ).catch(e => logError("QueueDispatchError", e));
+          "messages"
+        ).catch((e) => logError("QueueDispatchError", e));
       }
 
-      // Emit WebSocket event for real-time messaging
+      // Real-time broadcast — includes replyTo so clients can render quote previews
       if (io) {
         io.to(`chat:${chatId}`).emit("message:new", {
           id: newMessage._id.toString(),
@@ -444,11 +319,36 @@ export default {
           senderUsername: sender?.username || "Unknown",
           content: newMessage.content,
           type: newMessage.type,
-          mediaUrl: newMessage.attachments && newMessage.attachments.length > 0 
-            ? newMessage.attachments[0].url 
-            : undefined,
+          mediaUrl:
+            newMessage.attachments && newMessage.attachments.length > 0
+              ? newMessage.attachments[0].url
+              : undefined,
+          replyTo: replyTo || null,
           createdAt: newMessage.createdAt,
         });
+      }
+
+      // URL safety scan — non-blocking, runs after response is sent
+      if (content && type !== "image" && type !== "audio" && type !== "file") {
+        const urls = extractUrls(content);
+        if (urls.length > 0) {
+          Promise.all(urls.map(scanLink))
+            .then(async (results) => {
+              const flagged = results.find((r) => !r.safe);
+              if (flagged) {
+                await Message.findByIdAndUpdate(newMessage._id, {
+                  deleted: true,
+                  content: "[Message removed — contains a flagged link]",
+                });
+                if (io) {
+                  io.to(`chat:${chatId}`).emit("message:deleted", {
+                    messageId: newMessage._id.toString(),
+                  });
+                }
+              }
+            })
+            .catch(() => {}); // scan failure is non-fatal
+        }
       }
 
       SaveAuditTrail({
@@ -474,7 +374,6 @@ export default {
       };
     },
 
-    // Mark messages as read (with detailed timestamps)
     async markMessagesRead(_, { chatId, messageIds }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
@@ -483,24 +382,20 @@ export default {
       const [error] = await catchError(
         Message.updateMany(
           { _id: { $in: messageIds }, chatId },
-          { 
-            $addToSet: { 
+          {
+            $addToSet: {
               readBy: context.id,
-              readAt: { userId: context.id, readAt: now }
-            }
+              readAt: { userId: context.id, readAt: now },
+            },
           }
         )
       );
 
       if (error) {
         logError("markMessagesRead", error);
-        return {
-          success: false,
-          message: "Failed to mark messages as read.",
-        };
+        return { success: false, message: "Failed to mark messages as read." };
       }
 
-      // Emit WebSocket event for read receipts
       if (io) {
         io.to(`chat:${chatId}`).emit("message:read", {
           messageIds,
@@ -509,40 +404,24 @@ export default {
         });
       }
 
-      return {
-        success: true,
-        message: "Messages marked as read.",
-      };
+      return { success: true, message: "Messages marked as read." };
     },
 
-    // Edit message
     async editMessage(_, { messageId, content }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      // Verify message belongs to user
-      const [messageError, message] = await catchError(
-        Message.findById(messageId).lean()
-      );
+      const [messageError, message] = await catchError(Message.findById(messageId).lean());
 
       if (messageError || !message) {
-        return {
-          success: false,
-          message: "Message not found.",
-        };
+        return { success: false, message: "Message not found." };
       }
 
       if (message.sender.toString() !== context.id) {
-        return {
-          success: false,
-          message: "You can only edit your own messages.",
-        };
+        return { success: false, message: "You can only edit your own messages." };
       }
 
       if (message.deleted) {
-        return {
-          success: false,
-          message: "Cannot edit deleted message.",
-        };
+        return { success: false, message: "Cannot edit deleted message." };
       }
 
       await Message.findByIdAndUpdate(messageId, {
@@ -551,7 +430,6 @@ export default {
         editedAt: new Date(),
       });
 
-      // Emit WebSocket event
       if (io) {
         io.to(`chat:${message.chatId.toString()}`).emit("message:edited", {
           messageId,
@@ -559,33 +437,20 @@ export default {
         });
       }
 
-      return {
-        success: true,
-        message: "Message edited successfully.",
-      };
+      return { success: true, message: "Message edited successfully." };
     },
 
-    // Delete message
     async deleteMessage(_, { messageId }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      // Verify message belongs to user
-      const [messageError, message] = await catchError(
-        Message.findById(messageId).lean()
-      );
+      const [messageError, message] = await catchError(Message.findById(messageId).lean());
 
       if (messageError || !message) {
-        return {
-          success: false,
-          message: "Message not found.",
-        };
+        return { success: false, message: "Message not found." };
       }
 
       if (message.sender.toString() !== context.id) {
-        return {
-          success: false,
-          message: "You can only delete your own messages.",
-        };
+        return { success: false, message: "You can only delete your own messages." };
       }
 
       await Message.findByIdAndUpdate(messageId, {
@@ -593,47 +458,29 @@ export default {
         content: "[Message deleted]",
       });
 
-      // Emit WebSocket event
       if (io) {
-        io.to(`chat:${message.chatId.toString()}`).emit("message:deleted", {
-          messageId,
-        });
+        io.to(`chat:${message.chatId.toString()}`).emit("message:deleted", { messageId });
       }
 
-      return {
-        success: true,
-        message: "Message deleted successfully.",
-      };
+      return { success: true, message: "Message deleted successfully." };
     },
 
-    // Add reaction to message
     async addReaction(_, { messageId, emoji }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      const [error, message] = await catchError(
-        Message.findById(messageId).lean()
-      );
+      const [error, message] = await catchError(Message.findById(messageId).lean());
 
       if (error || !message) {
-        return {
-          success: false,
-          message: "Message not found.",
-        };
+        return { success: false, message: "Message not found." };
       }
 
-      // Remove existing reaction from user if exists
       let reactions = message.reactions || [];
+      // Replace existing reaction from this user
       reactions = reactions.filter((r: any) => r.userId.toString() !== context.id);
-
-      // Add new reaction
-      reactions.push({
-        userId: context.id,
-        emoji,
-      });
+      reactions.push({ userId: context.id, emoji });
 
       await Message.findByIdAndUpdate(messageId, { reactions });
 
-      // Emit WebSocket event
       if (io) {
         io.to(`chat:${message.chatId.toString()}`).emit("message:reaction", {
           messageId,
@@ -642,25 +489,16 @@ export default {
         });
       }
 
-      return {
-        success: true,
-        message: "Reaction added.",
-      };
+      return { success: true, message: "Reaction added." };
     },
 
-    // Remove reaction
     async removeReaction(_, { messageId, emoji }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      const [error, message] = await catchError(
-        Message.findById(messageId).lean()
-      );
+      const [error, message] = await catchError(Message.findById(messageId).lean());
 
       if (error || !message) {
-        return {
-          success: false,
-          message: "Message not found.",
-        };
+        return { success: false, message: "Message not found." };
       }
 
       const reactions = (message.reactions || []).filter(
@@ -669,7 +507,6 @@ export default {
 
       await Message.findByIdAndUpdate(messageId, { reactions });
 
-      // Emit WebSocket event
       if (io) {
         io.to(`chat:${message.chatId.toString()}`).emit("message:reaction:removed", {
           messageId,
@@ -678,19 +515,18 @@ export default {
         });
       }
 
-      return {
-        success: true,
-        message: "Reaction removed.",
-      };
+      return { success: true, message: "Reaction removed." };
     },
-    // Create Poll
+
     async createPoll(_, { chatId, question, options }, context) {
       if (!context.id) ThrowError("Please login to continue.");
-      
+
       const chat = await Chat.findById(chatId).lean();
       if (!chat) return { success: false, message: "Chat not found" };
-      
-      const [senderError, sender] = await catchError(User.findById(context.id).select("username profilePic").lean());
+
+      const [senderError, sender] = await catchError(
+        User.findById(context.id).select("username profilePic").lean()
+      );
 
       const pollOptions = options.map((text: string) => ({ text, votes: [] }));
       const newMessage = await Message.create({
@@ -732,75 +568,85 @@ export default {
       };
     },
 
-    // Vote on Poll
     async votePoll(_, { messageId, optionIndex }, context) {
       if (!context.id) ThrowError("Please login to continue.");
-      
+
       const message = await Message.findById(messageId);
       if (!message || message.type !== "poll" || !message.poll) {
         return { success: false, message: "Poll not found." };
       }
 
-      // Remove existing vote for this user (single answer logic)
+      // Remove existing vote from this user (single-answer)
       message.poll.options.forEach((opt: any) => {
         opt.votes = opt.votes.filter((v: any) => v.toString() !== context.id);
       });
 
-      // Add new vote
       if (message.poll.options[optionIndex]) {
         message.poll.options[optionIndex].votes.push(context.id as any);
       }
 
       await message.save();
 
+      // Emit full updated options so clients can update state in-place without refetching
       if (io) {
         io.to(`chat:${message.chatId.toString()}`).emit("message:poll:voted", {
           messageId,
-          optionIndex,
-          userId: context.id,
+          options: message.poll.options.map((opt: any) => ({
+            text: opt.text,
+            votes: opt.votes.map((v: any) => v.toString()),
+          })),
         });
       }
 
       return { success: true, message: "Voted successfully." };
     },
 
-    // Assign Minitask
     async assignTaskFromChat(_, { chatId, taskId, assigneeId }, context) {
-       if (!context.id) ThrowError("Please login to continue.");
-       
-       const [senderError, sender] = await catchError(User.findById(context.id).select("username profilePic").lean());
-       const [chatError, chat] = await catchError(Chat.findById(chatId).lean());
-       if (!chat) ThrowError("Chat not found");
+      if (!context.id) ThrowError("Please login to continue.");
 
-       let finalTaskId = taskId;
-       
-       // If no taskId, find the first available miniGoal for this shard and add a task
-       if (!finalTaskId && chat.shardId) {
-         const MiniGoal = (await import("../../models/MiniGoal")).default;
-         const [goalError, goal] = await catchError(MiniGoal.findOne({ shardId: chat.shardId, completed: false }).sort({ createdAt: 1 }));
-         if (goal) {
-           goal.tasks.push({
-             title: "Chat Assigned Task",
-             completed: false,
-             assignedTo: assigneeId,
-             deleted: false,
-           } as any);
-           await goal.save();
-           finalTaskId = "dynamic-" + Date.now();
-         }
-       }
-       
-       const newMessage = await Message.create({
-         chatId,
-         sender: context.id,
-         content: `📋 Task Assigned.`,
-         type: "minitask_assignment",
-         minitaskRef: { taskId: finalTaskId || "general", assignedTo: assigneeId },
-         readBy: [context.id],
-         readAt: [{ userId: context.id, readAt: new Date() }],
-       });
-       
-       if (io) {
+      const [senderError, sender] = await catchError(
+        User.findById(context.id).select("username profilePic").lean()
+      );
+      const [chatError, chat] = await catchError(Chat.findById(chatId).lean());
+      if (!chat) ThrowError("Chat not found");
+
+      let finalTaskId = taskId;
+
+      if (!finalTaskId && chat.shardId) {
+        const MiniGoal = (await import("../../models/MiniGoal.js")).default;
+        const [goalError, goal] = await catchError(
+          MiniGoal.findOne({ shardId: chat.shardId, completed: false }).sort({ createdAt: 1 })
+        );
+        if (goal) {
+          goal.tasks.push({
+            title: "Chat Assigned Task",
+            completed: false,
+            assignedTo: assigneeId,
+            deleted: false,
+          } as any);
+          await goal.save();
+          finalTaskId = "dynamic-" + Date.now();
+        }
+      }
+
+      const [assigneeErr, assignee] = await catchError(
+        User.findById(assigneeId).select("username").lean()
+      );
+
+      const newMessage = await Message.create({
+        chatId,
+        sender: context.id,
+        content: `📋 Task Assigned.`,
+        type: "minitask_assignment",
+        minitaskRef: {
+          taskId: finalTaskId || "general",
+          assignedTo: assigneeId,
+        },
+        readBy: [context.id],
+        readAt: [{ userId: context.id, readAt: new Date() }],
+      });
+
+      if (io) {
         io.to(`chat:${chatId}`).emit("message:new", {
           id: newMessage._id.toString(),
           chatId,
@@ -810,34 +656,69 @@ export default {
           type: newMessage.type,
           createdAt: newMessage.createdAt,
         });
-       }
+      }
 
-       return {
-         success: true,
-         message: "Task assigned and announced in chat.",
-         messageData: {
+      return {
+        success: true,
+        message: "Task assigned and announced in chat.",
+        messageData: {
           id: newMessage._id.toString(),
           content: newMessage.content,
           type: newMessage.type,
-          sender: { id: context.id, username: sender?.username || "Unknown", profilePic: sender?.profilePic || "" },
+          sender: {
+            id: context.id,
+            username: sender?.username || "Unknown",
+            profilePic: sender?.profilePic || "",
+          },
           createdAt: newMessage.createdAt,
-         }
-       };
+        },
+      };
     },
 
-    // Summon Summary
     async summonSummary(_, { chatId }, context) {
       if (!context.id) ThrowError("Please login to continue.");
-      
-      const content = `📈 Progress Summary\nShard Progress is on track. System calculated current milestone status.`;
+
+      // Fetch recent text messages for context
+      const [msgErr, recentMessages] = await catchError(
+        Message.find({ chatId, type: { $in: ["text", "system"] }, deleted: false })
+          .sort({ _id: -1 })
+          .limit(30)
+          .populate("sender", "username")
+          .lean()
+      );
+
+      // Get shard title and progress for richer summary
+      const [chatErr, chat] = await catchError(Chat.findById(chatId).lean());
+      let shardTitle = "this shard";
+      let shardProgress = 0;
+      if (chat?.shardId) {
+        const [shardErr, shard] = await catchError(
+          Shard.findById(chat.shardId).select("title progress").lean()
+        );
+        if (shard) {
+          shardTitle = shard.title;
+          shardProgress = shard.progress?.completion ?? 0;
+        }
+      }
+
+      const messages = (recentMessages || []).reverse();
+      const messageHistory = messages
+        .map((m: any) => `${m.sender?.username || "User"}: ${m.content}`)
+        .join("\n");
+
+      const summaryContent = await generateChatSummary(messageHistory, shardTitle, shardProgress);
+
+      const [senderErr, sender] = await catchError(
+        User.findById(context.id).select("username profilePic").lean()
+      );
 
       const newMessage = await Message.create({
-         chatId,
-         sender: context.id,
-         content,
-         type: "summary_ping",
-         readBy: [context.id],
-         readAt: [{ userId: context.id, readAt: new Date() }],
+        chatId,
+        sender: context.id,
+        content: summaryContent,
+        type: "summary_ping",
+        readBy: [context.id],
+        readAt: [{ userId: context.id, readAt: new Date() }],
       });
 
       if (io) {
@@ -845,7 +726,7 @@ export default {
           id: newMessage._id.toString(),
           chatId,
           sender: context.id,
-          senderUsername: "System Analyst",
+          senderUsername: "AI Summary",
           content: newMessage.content,
           type: newMessage.type,
           createdAt: newMessage.createdAt,
@@ -859,74 +740,166 @@ export default {
           id: newMessage._id.toString(),
           content: newMessage.content,
           type: newMessage.type,
-          sender: { id: context.id, username: "System Analyst", profilePic: "" },
+          sender: {
+            id: context.id,
+            username: sender?.username || "AI Summary",
+            profilePic: "",
+          },
           createdAt: newMessage.createdAt,
-        }
+        },
       };
     },
   },
 
   Query: {
-    // Get user's chats (with caching)
     async myChats(_, __, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      const chats = await cache.getOrSet(
-        `user:${context.id}:chats`,
-        async () => {
-          const [error, chatList] = await catchError(
-            Chat.find({
-              participants: context.id,
-            })
-              .select("type participants createdAt updatedAt")
-              .populate("participants", "username profilePic")
-              .sort({ updatedAt: -1 })
-              .lean()
-          );
+      const userId = new Types.ObjectId(context.id);
 
-          if (error) {
-            logError("myChats", error);
-            return [];
-          }
+      // Single aggregation: chats + last message + unread count + participants
+      // Cached per user; invalidated on every sendMessage for all participants
+      const cacheKey = cacheKeys.userChats(context.id);
+      const cached = await cache.get<any[]>(cacheKey);
+      if (cached) return { success: true, chats: cached };
 
-          return chatList;
-        },
-        1800 // 30 minutes
+      const [aggErr, chatList] = await catchError(
+        Chat.aggregate([
+          { $match: { participants: userId } },
+
+          // Last message per chat
+          {
+            $lookup: {
+              from: "messages",
+              let: { chatId: "$_id" },
+              pipeline: [
+                { $match: { $expr: { $eq: ["$chatId", "$$chatId"] } } },
+                { $sort: { _id: -1 } },
+                { $limit: 1 },
+                {
+                  $lookup: {
+                    from: "users",
+                    localField: "sender",
+                    foreignField: "_id",
+                    as: "senderData",
+                    pipeline: [{ $project: { username: 1, profilePic: 1 } }],
+                  },
+                },
+                { $addFields: { sender: { $arrayElemAt: ["$senderData", 0] } } },
+                { $project: { senderData: 0 } },
+              ],
+              as: "lastMessages",
+            },
+          },
+
+          // Unread count per chat for this user
+          {
+            $lookup: {
+              from: "messages",
+              let: { chatId: "$_id" },
+              pipeline: [
+                {
+                  $match: {
+                    $expr: {
+                      $and: [
+                        { $eq: ["$chatId", "$$chatId"] },
+                        { $not: { $in: [userId, "$readBy"] } },
+                        { $ne: ["$sender", userId] },
+                      ],
+                    },
+                  },
+                },
+                { $count: "n" },
+              ],
+              as: "unreadData",
+            },
+          },
+
+          // Populate participants
+          {
+            $lookup: {
+              from: "users",
+              localField: "participants",
+              foreignField: "_id",
+              as: "participantDetails",
+              pipeline: [{ $project: { username: 1, profilePic: 1 } }],
+            },
+          },
+
+          {
+            $addFields: {
+              lastMessage: { $arrayElemAt: ["$lastMessages", 0] },
+              unreadCount: {
+                $ifNull: [{ $arrayElemAt: ["$unreadData.n", 0] }, 0],
+              },
+              // Sort key: last message time or chat creation time
+              lastActivity: {
+                $ifNull: [{ $arrayElemAt: ["$lastMessages._id", 0] }, "$_id"],
+              },
+            },
+          },
+
+          { $sort: { lastActivity: -1 } },
+          { $project: { lastMessages: 0, unreadData: 0 } },
+        ])
       );
 
-      return {
-        success: true,
-        chats: chats.map((chat: any) => ({
-          id: chat._id.toString(),
-          type: chat.type,
-          participants: chat.participants.map((p: any) => ({
-            id: p._id.toString(),
-            username: p.username,
-            profilePic: p.profilePic,
-          })),
-          createdAt: chat.createdAt,
-          updatedAt: chat.updatedAt,
+      if (aggErr) {
+        logError("myChats:aggregate", aggErr);
+        return { success: false, chats: [] };
+      }
+
+      const chats = (chatList || []).map((chat: any) => ({
+        id: chat._id.toString(),
+        type: chat.type,
+        name: chat.name || null,
+        participants: (chat.participantDetails || []).map((p: any) => ({
+          id: p._id.toString(),
+          username: p.username,
+          profilePic: p.profilePic || "",
         })),
-      };
+        unreadCount: chat.unreadCount,
+        lastMessage: chat.lastMessage
+          ? {
+              id: chat.lastMessage._id.toString(),
+              content: chat.lastMessage.deleted
+                ? "[Message deleted]"
+                : chat.lastMessage.content,
+              type: chat.lastMessage.type,
+              sender: {
+                id: chat.lastMessage.sender?._id?.toString() || "",
+                username: chat.lastMessage.sender?.username || "",
+                profilePic: chat.lastMessage.sender?.profilePic || "",
+              },
+              createdAt:
+                chat.lastMessage.createdAt instanceof Date
+                  ? chat.lastMessage.createdAt.toISOString()
+                  : new Date(chat.lastMessage.createdAt).toISOString(),
+            }
+          : null,
+        createdAt:
+          chat.createdAt instanceof Date
+            ? chat.createdAt.toISOString()
+            : new Date(chat.createdAt).toISOString(),
+        updatedAt:
+          chat.updatedAt instanceof Date
+            ? chat.updatedAt.toISOString()
+            : new Date(chat.updatedAt || chat.createdAt).toISOString(),
+      }));
+
+      // Cache for 5 minutes; invalidated on every sendMessage
+      await cache.set(cacheKey, chats, 300);
+
+      return { success: true, chats };
     },
 
-    // Get chat messages (paginated with caching)
-    async getChatMessages(_, { chatId, limit = 50, skip = 0 }, context) {
+    async getChatMessages(_, { chatId, limit = 50, skip = 0, before }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      // Verify user is participant
-      const [chatError, chat] = await catchError(
-        Chat.findById(chatId).lean()
-      );
+      const [chatError, chat] = await catchError(Chat.findById(chatId).lean());
 
       if (chatError || !chat) {
-        console.log("cht id", chatId);
-        
-        return {
-          success: false,
-          message: "Chat not found.",
-          messages: [],
-        };
+        return { success: false, message: "Chat not found.", messages: [] };
       }
 
       if (!chat.participants.map((p: any) => p.toString()).includes(context.id)) {
@@ -937,100 +910,131 @@ export default {
         };
       }
 
+      // Cursor-based pagination when `before` is provided; fall back to skip/limit
+      const query: any = { chatId };
+      if (before) {
+        try {
+          query._id = { $lt: new Types.ObjectId(before) };
+        } catch {
+          // invalid cursor — ignore and fetch from top
+        }
+      }
+
+      const fetchLimit = limit + 1; // fetch one extra to determine hasMore
+
       const [error, messages] = await catchError(
-        Message.find({ chatId })
-          .select("sender content type readBy readAt attachments poll minitaskRef mentions createdAt edited deleted editedAt reactions")
+        Message.find(query)
+          .select(
+            "sender content type readBy readAt attachments poll minitaskRef mentions replyTo createdAt edited editedAt deleted reactions"
+          )
           .populate("sender", "username profilePic")
           .populate("poll.options.votes", "username profilePic")
           .populate("mentions", "username profilePic")
           .populate("minitaskRef.assignedTo", "username profilePic")
-          .sort({ createdAt: -1 })
-          .limit(limit)
-          .skip(skip)
+          .sort({ _id: -1 })
+          .limit(before ? fetchLimit : limit)
+          .skip(before ? 0 : skip)
           .lean()
       );
 
       if (error) {
         logError("getChatMessages", error);
-        return {
-          success: false,
-          message: "Failed to fetch messages.",
-          messages: [],
-        };
+        return { success: false, message: "Failed to fetch messages.", messages: [] };
       }
+
+      const hasMore = before ? messages.length > limit : false;
+      if (hasMore) messages.pop();
+
+      const ordered = messages.reverse();
+      const nextCursor =
+        hasMore && ordered.length > 0 ? ordered[0]._id.toString() : null;
 
       return {
         success: true,
-        messages: messages.reverse().map((m: any) => ({
+        nextCursor,
+        hasMore,
+        messages: ordered.map((m: any) => ({
           id: m._id.toString(),
           content: m.content,
           type: m.type,
-          sender: m.sender ? {
-            id: m.sender._id?.toString(),
-            username: m.sender.username,
-            profilePic: m.sender.profilePic,
-          } : { id: 'unknown', username: 'Unknown User', profilePic: '' },
+          sender: m.sender
+            ? {
+                id: m.sender._id?.toString(),
+                username: m.sender.username,
+                profilePic: m.sender.profilePic,
+              }
+            : { id: "unknown", username: "Unknown User", profilePic: "" },
           readBy: m.readBy || [],
           readAt: m.readAt || [],
           edited: !!m.edited,
           editedAt: m.editedAt ? new Date(m.editedAt).toISOString() : null,
           deleted: !!m.deleted,
           reactions: m.reactions || [],
-          mediaUrl: m.attachments && m.attachments.length > 0 ? m.attachments[0].url : undefined,
+          replyTo: m.replyTo ? m.replyTo.toString() : null,
+          mediaUrl:
+            m.attachments && m.attachments.length > 0 ? m.attachments[0].url : undefined,
           poll: m.poll,
-          minitaskRef: m.minitaskRef ? {
-            ...m.minitaskRef,
-            assignedTo: m.minitaskRef.assignedTo ? {
-              id: m.minitaskRef.assignedTo._id?.toString(),
-              username: m.minitaskRef.assignedTo.username,
-              profilePic: m.minitaskRef.assignedTo.profilePic,
-            } : { id: "unknown", username: "Unknown", profilePic: "" }
-          } : null,
+          minitaskRef: m.minitaskRef
+            ? {
+                ...m.minitaskRef,
+                assignedTo: m.minitaskRef.assignedTo
+                  ? {
+                      id: m.minitaskRef.assignedTo._id?.toString(),
+                      username: m.minitaskRef.assignedTo.username,
+                      profilePic: m.minitaskRef.assignedTo.profilePic,
+                    }
+                  : { id: "unknown", username: "Unknown", profilePic: "" },
+              }
+            : null,
           mentions: m.mentions?.map((u: any) => ({
             id: u._id?.toString(),
             username: u.username,
-            profilePic: u.profilePic
+            profilePic: u.profilePic,
           })),
           attachments: m.attachments || [],
-          createdAt: m.createdAt instanceof Date ? m.createdAt.toISOString() : new Date(m.createdAt).toISOString(),
+          createdAt:
+            m.createdAt instanceof Date
+              ? m.createdAt.toISOString()
+              : new Date(m.createdAt).toISOString(),
         })),
       };
     },
 
-    // Get unread message count
     async getUnreadCount(_, __, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      const [error, count] = await catchError(
+      // Use distinct to get chat IDs in a single query, then count unread messages
+      const [chatIdsErr, chatIds] = await catchError(
+        Chat.distinct("_id", { participants: context.id })
+      );
+
+      if (chatIdsErr) {
+        logError("getUnreadCount:distinct", chatIdsErr);
+        return { success: false, count: 0 };
+      }
+
+      const [countErr, count] = await catchError(
         Message.countDocuments({
-          chatId: { $in: await Chat.find({ participants: context.id }).select("_id").lean() },
+          chatId: { $in: chatIds },
           sender: { $ne: context.id },
           readBy: { $ne: context.id },
         })
       );
 
-      if (error) {
-        logError("getUnreadCount", error);
-        return {
-          success: false,
-          count: 0,
-        };
+      if (countErr) {
+        logError("getUnreadCount:count", countErr);
+        return { success: false, count: 0 };
       }
 
-      return {
-        success: true,
-        count,
-      };
+      return { success: true, count };
     },
 
-    // Get chat details
     async getChat(_, { chatId }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
       const chat = await cache.getOrSet(
         cacheKeys.chat(chatId),
         async () => {
-          // First try to find by chat ID
           let [error, chatData] = await catchError(
             Chat.findById(chatId)
               .select("type participants shardId name createdAt updatedAt")
@@ -1039,7 +1043,6 @@ export default {
               .lean()
           );
 
-          // If not found by chat ID, try finding by shard ID
           if (!chatData) {
             console.log("Chat not found by ID, trying as shard ID:", chatId);
             [error, chatData] = await catchError(
@@ -1051,21 +1054,14 @@ export default {
             );
           }
 
-          if (error || !chatData) {
-            throw new Error("Chat not found");
-          }
-
+          if (error || !chatData) throw new Error("Chat not found");
           return chatData;
         },
-        1800 // 30 minutes
+        1800
       );
 
-      // Verify user is participant
       if (!chat.participants.map((p: any) => p._id.toString()).includes(context.id)) {
-        return {
-          success: false,
-          message: "You are not a participant in this chat.",
-        };
+        return { success: false, message: "You are not a participant in this chat." };
       }
 
       return {
@@ -1079,14 +1075,15 @@ export default {
             username: p.username,
             profilePic: p.profilePic,
           })),
-          shard: chat.shardId ? {
-            id: chat.shardId._id.toString(),
-            title: (chat.shardId as any)?.title || "Shard Chat",
-          } : null,
+          shard: chat.shardId
+            ? {
+                id: chat.shardId._id.toString(),
+                title: (chat.shardId as any)?.title || "Shard Chat",
+              }
+            : null,
           createdAt: chat.createdAt,
         },
       };
     },
   },
 };
-

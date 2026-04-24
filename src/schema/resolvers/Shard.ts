@@ -107,46 +107,28 @@ export default {
     async createShard(_, { goal, deadline, image, participants, isPrivate, isAnonymous, questType, cadence }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      console.log("🚀 [createShard] Starting shard creation with AI");
-      console.log("📝 [createShard] Input:", { goal, deadline, image, participantsCount: participants?.length });
-
       try {
-        // Get user data for limit check, personalization, and scheduling
-        console.log("👤 [createShard] Fetching user data for:", context.id);
         const [userError, user] = await catchError(
           User.findById(context.id, "role subscriptionTier username bio birthdate timezone level xp currentStreak strength intelligence charisma endurance creativity preferences").lean()
         );
 
         if (userError) {
-          console.error("❌ [createShard] User fetch error:", userError);
           logError("createShard:getUser", userError);
-          return {
-            success: false,
-            message: "Failed to verify user.",
-          };
+          return { success: false, message: "Failed to verify user." };
         }
 
-        console.log("✅ [createShard] User found:", { userId: context.id, role: user?.role });
-
-        // Admins have unlimited AI calls — skip limit check and credit deduction
+        // Check AI credit limit before spending time on validation
+        const userTier: "free" | "pro" = (user as any)?.subscriptionTier === 'pro' ? 'pro' : 'free';
         let usageCheck = { canProceed: true, limit: -1, used: 0, remaining: -1 };
         if (user?.role !== 'admin') {
-          console.log("🔍 [createShard] Checking AI usage limits");
-          const tier = user?.subscriptionTier || 'free';
-          usageCheck = await checkAIUsage(context.id, tier);
-          console.log("📊 [createShard] AI usage:", usageCheck);
-
+          usageCheck = await checkAIUsage(context.id, userTier);
           if (!usageCheck.canProceed) {
-            console.warn("⚠️ [createShard] AI limit reached for user:", context.id);
             return {
               success: false,
-              message: `You've reached your daily AI limit (${usageCheck.limit} calls). Upgrade to Pro for unlimited AI quests!`,
+              message: `You've used all your AI credits. Upgrade to Pro for unlimited quests!`,
               needsUpgrade: true,
             };
           }
-
-          console.log("📈 [createShard] Tracking AI usage");
-          await trackAIUsage(context.id, tier);
         }
 
         // Validate deadline before spending an AI call
@@ -193,118 +175,68 @@ export default {
           },
         };
 
-        // Call AI to break down the goal
-        console.log("🤖 [createShard] Calling Groq AI to break down goal");
-        console.log("🎯 [createShard] Goal:", goal);
-        console.log("📅 [createShard] Deadline:", deadline);
-
         const questBreakdown = await breakDownGoalWithAI(goal, deadline, userContext);
-        
-        console.log("✨ [createShard] AI breakdown complete!");
-        console.log("📋 [createShard] Main Quest:", questBreakdown.mainQuest?.title);
-        console.log("🎯 [createShard] Mini Quests count:", questBreakdown.miniQuests?.length);
 
-        // Create a chat group for this shard ONLY if there are multiple participants
-        let shardChat = null;
+        // Deduct credit only after a successful AI call — prevents losing credits on failures
+        if (user?.role !== 'admin') {
+          await trackAIUsage(context.id, userTier).catch(() => {});
+        }
+
         const participantIds = participants ? participants.map((p: any) => p.user) : [];
         const totalParticipants = [context.id, ...participantIds];
-        
+
+        // Create shard FIRST — prevents orphaned chats if shard creation fails
+        const [shardError, newShard] = await catchError(
+          Shard.create({
+            title: questBreakdown.mainQuest.title,
+            description: questBreakdown.mainQuest.description,
+            owner: context.id,
+            participants: participants
+              ? participants.map((p: any) => ({ user: p.user, role: p.role }))
+              : [],
+            image,
+            timeline: {
+              startDate: new Date(),
+              endDate: deadline ? new Date(deadline) : undefined,
+            },
+            progress: { completion: 0, xpEarned: 0, level: 1 },
+            status: "active",
+            isPrivate: isPrivate || false,
+            isAnonymous: isAnonymous || false,
+            questType: questType || "standard",
+            cadence,
+            rewards: [{ type: "xp", value: questBreakdown.mainQuest.xpReward }],
+          })
+        );
+
+        if (shardError || !newShard) {
+          logError("createShard:createShard", shardError);
+          return { success: false, message: "Failed to create quest." };
+        }
+
+        // Create chat only after shard exists
         if (totalParticipants.length > 1) {
-          console.log("💬 [createShard] Creating chat group (multiple participants)");
-          console.log("👥 [createShard] Chat participants:", totalParticipants);
-          
-          const [chatError, chat] = await catchError(
+          const [chatError, shardChat] = await catchError(
             Chat.create({
               type: "shard",
-              participants: totalParticipants, // Owner + participants
-              shardId: undefined, // Will be set after shard creation
+              participants: totalParticipants,
+              shardId: newShard._id,
               name: questBreakdown.mainQuest.title,
             })
           );
-
-          if (chatError) {
-            console.error("❌ [createShard] Chat creation error:", chatError);
+          if (!chatError && shardChat) {
+            await Shard.findByIdAndUpdate(newShard._id, { chatId: shardChat._id });
+          } else if (chatError) {
             logError("createShard:createChat", chatError);
-            // Continue even if chat creation fails
-          } else {
-            shardChat = chat;
-            console.log("✅ [createShard] Chat created:", shardChat?._id);
           }
-        } else {
-          console.log("ℹ️ [createShard] Skipping chat creation (only one participant)");
         }
 
-
-        // Create the Shard (main quest)
-        console.log("🏗️ [createShard] Creating shard document");
-        const shardData = {
-          title: questBreakdown.mainQuest.title,
-          description: questBreakdown.mainQuest.description,
-          owner: context.id,
-          participants: participants
-            ? participants.map((p: any) => ({
-              user: p.user,
-              role: p.role,
-            }))
-            : [],
-          image: image,
-          chatId: shardChat?._id,
-          timeline: {
-            startDate: new Date(),
-            endDate: deadline ? new Date(deadline) : undefined,
-          },
-          progress: {
-            completion: 0,
-            xpEarned: 0,
-            level: 1,
-          },
-          status: "active",
-          isPrivate: isPrivate || false,
-          isAnonymous: isAnonymous || false,
-          questType: questType || "standard",
-          cadence: cadence,
-          rewards: [
-            {
-              type: "xp",
-              value: questBreakdown.mainQuest.xpReward,
-            },
-          ],
-        };
-        
-        console.log("📦 [createShard] Shard data:", JSON.stringify(shardData, null, 2));
-        
-        const [shardError, newShard] = await catchError(
-          Shard.create(shardData)
-        );
-
-        // Update chat with shardId
-        if (shardChat && newShard) {
-          console.log("🔗 [createShard] Linking chat to shard");
-          await Chat.findByIdAndUpdate(shardChat._id, {
-            shardId: newShard._id,
-          });
-        }
-
-        if (shardError) {
-          console.error("❌ [createShard] Shard creation error:", shardError);
-          logError("createShard:createShard", shardError);
-          return {
-            success: false,
-            message: "Failed to create quest.",
-          };
-        }
-
-        console.log("✅ [createShard] Shard created:", newShard._id);
-
-        // Calculate shard end date from AI estimate or use provided deadline
         const shardStartDate = new Date();
         const shardEndDate = deadline
           ? new Date(deadline)
           : questBreakdown.mainQuest.estimatedDuration
             ? calculateDueDate(shardStartDate, questBreakdown.mainQuest.estimatedDuration)
-            : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // Default 30 days
-
-        console.log("📅 [createShard] Timeline:", { start: shardStartDate, end: shardEndDate });
+            : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
 
         const prefs = (user as any)?.preferences || {};
 
@@ -331,7 +263,6 @@ export default {
         );
 
         // Create mini-goals with smart-scheduled task dates
-        console.log("🎯 [createShard] Creating mini-goals with smart scheduling");
 
         const miniGoalsPromises = questBreakdown.miniQuests.map(
           async (mq: any, index: number) => {
@@ -351,7 +282,6 @@ export default {
               };
             });
 
-            console.log(`  📌 [createShard] Mini-goal ${index + 1}: ${mq.title} (${tasks.length} tasks)`);
 
             return await MiniGoal.create({
               shardId: newShard._id,
@@ -366,11 +296,8 @@ export default {
         );
 
         await Promise.all(miniGoalsPromises);
-        console.log("✅ [createShard] All mini-goals created");
 
-        // Invalidate user's shard list cache
         await cacheInvalidate.shardList(context.id);
-        console.log("🗑️ [createShard] Cache invalidated");
 
         SaveAuditTrail({
           userId: context.id,
@@ -401,7 +328,6 @@ export default {
 
         checkAchievements(context.id).catch(() => {});
 
-        // Fetch the created mini-goals to return as preview
         const [mgFetchError, createdMiniGoals] = await catchError(
           MiniGoal.find({ shardId: newShard._id }, "title tasks dueDate").lean()
         );
@@ -429,13 +355,8 @@ export default {
           },
         };
       } catch (error) {
-        console.error("💥 [createShard] Fatal error:", error);
-        console.error("💥 [createShard] Error stack:", (error as Error).stack);
         logError("createShard", error);
-        return {
-          success: false,
-          message: "Failed to create quest. Please try again.",
-        };
+        return { success: false, message: "Failed to create quest. Please try again." };
       }
     },
 
@@ -444,51 +365,27 @@ export default {
       if (!context.id) ThrowError("Please login to continue.");
 
       try {
-        // Enrich manual shard with AI-generated rewards and timelines if mini-goals provided
-        let enrichment: any = null;
-        if (input.miniGoals && input.miniGoals.length > 0) {
-          try {
-            enrichment = await enrichManualShard({
-              title: input.title,
-              description: input.description,
-              miniGoals: input.miniGoals,
-              deadline: input.timeline?.endDate,
-            });
-          } catch (error) {
-            logError("enrichManualShard", error);
-            // Continue without enrichment if it fails
-          }
-        }
-
+        // Create shard immediately with default rewards — enrich with AI in background
         const [shardError, newShard] = await catchError(
           Shard.create({
             title: input.title,
             description: input.description,
             owner: context.id,
             participants: input.participants
-              ? input.participants.map((p: any) => ({
-                user: p.user,
-                role: p.role,
-              }))
+              ? input.participants.map((p: any) => ({ user: p.user, role: p.role }))
               : [],
             image: input.image,
             timeline: {
               startDate: input.timeline?.startDate ? new Date(input.timeline.startDate) : new Date(),
               endDate: input.timeline?.endDate ? new Date(input.timeline.endDate) : undefined,
             },
-            progress: {
-              completion: 0,
-              xpEarned: 0,
-              level: 1,
-            },
+            progress: { completion: 0, xpEarned: 0, level: 1 },
             status: "active",
             isPrivate: input.isPrivate || false,
             isAnonymous: input.isAnonymous || false,
             questType: input.questType || "standard",
             cadence: input.cadence,
-            rewards: enrichment
-              ? [{ type: "xp", value: enrichment.mainQuestXP }]
-              : input.rewards || [],
+            rewards: input.rewards?.length ? input.rewards : [{ type: "xp", value: 200 }],
           })
         );
 
@@ -533,20 +430,18 @@ export default {
           );
 
           const miniGoalsPromises = input.miniGoals.map(async (mg: any, index: number) => {
-            const enrichedMG = enrichment?.miniGoals?.[index];
             const goalSchedule = scheduled.filter(s => s.miniGoalIndex === index);
             const miniGoalDueDate = goalSchedule.length > 0
               ? goalSchedule[goalSchedule.length - 1].dueDate
               : shardEndDate;
 
             const tasks = (mg.tasks || []).map((task: any, taskIndex: number) => {
-              const enrichedTask = enrichedMG?.tasks?.[taskIndex];
               const s = goalSchedule.find(g => g.taskIndex === taskIndex);
               return {
                 title: task.title,
                 dueDate: s?.dueDate || miniGoalDueDate,
                 completed: false,
-                xpReward: enrichedTask?.xpReward || 20,
+                xpReward: 20,
               };
             });
 
@@ -564,30 +459,41 @@ export default {
           await Promise.all(miniGoalsPromises);
         }
 
-        // Create chat if there are multiple participants
-        const participantIds = input.participants ? input.participants.map((p: any) => p.user?.toString() ?? p.userId) : [];
-        const totalParticipants = [context.id, ...participantIds];
-        
-        if (totalParticipants.length > 1) {
-          console.log("💬 [createShardManual] Creating chat group (multiple participants)");
+        // Create chat for multi-participant shards
+        const manualParticipantIds = input.participants
+          ? input.participants.map((p: any) => p.user?.toString() ?? p.userId)
+          : [];
+        const manualTotalParticipants = [context.id, ...manualParticipantIds];
+
+        if (manualTotalParticipants.length > 1) {
           const [chatError, shardChat] = await catchError(
             Chat.create({
               type: "shard",
-              participants: totalParticipants,
+              participants: manualTotalParticipants,
               shardId: newShard._id,
               name: `${newShard.title} Chat`,
             })
           );
-
           if (!chatError && shardChat) {
-            // Update shard with chat ID
             await Shard.findByIdAndUpdate(newShard._id, { chatId: shardChat._id });
-            console.log("✅ [createShardManual] Chat created:", shardChat._id);
-          } else {
+          } else if (chatError) {
             logError("createShardManual:createChat", chatError);
           }
-        } else{
-          console.log("ℹ️ [createShardManual] Skipping chat creation (only one participant)");
+        }
+
+        // Enrich with AI XP values in the background — doesn't block the response
+        if (input.miniGoals?.length > 0) {
+          enrichManualShard({
+            title: input.title,
+            description: input.description || "",
+            miniGoals: input.miniGoals,
+            deadline: input.timeline?.endDate,
+          }).then(async (enrichment) => {
+            if (!enrichment) return;
+            await Shard.findByIdAndUpdate(newShard._id, {
+              rewards: [{ type: "xp", value: enrichment.mainQuestXP }],
+            });
+          }).catch((e) => logError("createShardManual:enrichBg", e));
         }
 
         SaveAuditTrail({

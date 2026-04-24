@@ -26,7 +26,7 @@ export default `#graphql
     
     # Chat queries
     myChats: ChatsResponse!
-    getChatMessages(chatId: ID!, limit: Int, skip: Int): ChatMessagesResponse!
+    getChatMessages(chatId: ID!, limit: Int, skip: Int, before: ID): ChatMessagesResponse!
     getUnreadCount: UnreadCountResponse!
     getChat(chatId: ID!): GetChatResponse!
     
@@ -572,10 +572,21 @@ export default `#graphql
     profilePic: String
   }
 
+  type LastMessageData {
+    id: ID!
+    content: String!
+    type: String!
+    sender: ChatParticipant!
+    createdAt: String!
+  }
+
   type ChatSummary {
     id: ID!
     type: String!
+    name: String
     participants: [ChatParticipant!]!
+    lastMessage: LastMessageData
+    unreadCount: Int!
     createdAt: String!
     updatedAt: String!
   }
@@ -631,6 +642,8 @@ export default `#graphql
     success: Boolean!
     message: String
     messages: [MessageData!]!
+    nextCursor: ID
+    hasMore: Boolean
   }
 
   type SendMessageResponse {

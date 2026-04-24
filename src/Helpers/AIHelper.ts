@@ -1,10 +1,26 @@
 import "dotenv/config";
 import Groq from "groq-sdk";
 
-// Initialize Groq client
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
-});
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+const HEAVY_MODEL = "llama-3.3-70b-versatile";  // full reasoning — quest breakdowns
+const LIGHT_MODEL = "llama-3.1-8b-instant";      // fast + cheap — nudges, summaries, tips
+
+// Retry wrapper: retries on 429/5xx with exponential backoff
+async function withRetry<T>(fn: () => Promise<T>, attempts = 2): Promise<T> {
+  let lastError: any;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+      const isRetryable = err?.status === 429 || (err?.status >= 500 && err?.status < 600);
+      if (!isRetryable || i === attempts - 1) throw err;
+      await new Promise((r) => setTimeout(r, 1000 * 2 ** i));
+    }
+  }
+  throw lastError;
+}
 
 import { User } from "../models/User.js";
 
@@ -201,22 +217,16 @@ export async function breakDownGoalWithAI(goal: string, deadline?: string, userC
   const userPrompt = `Goal: ${goal}${deadline ? `\nDeadline: ${deadline}` : ''}${userProfile}\n\nPlease break this down into a structured quest.`;
 
   try {
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+    const completion = await withRetry(() => groq.chat.completions.create({
+      model: HEAVY_MODEL,
       messages: [
-        {
-          role: "system",
-          content: QUEST_ARCHITECT_PROMPT,
-        },
-        {
-          role: "user",
-          content: userPrompt,
-        },
+        { role: "system", content: QUEST_ARCHITECT_PROMPT },
+        { role: "user", content: userPrompt },
       ],
       temperature: 0.7,
       max_completion_tokens: 8192,
       top_p: 1,
-    });
+    }));
 
     const content = completion.choices?.[0]?.message?.content;
 
@@ -277,22 +287,16 @@ export function filterUnsafeTasks(tasks: Array<{ title?: string; text?: string }
  */
 export async function getProductivityTips(context: string): Promise<string[]> {
   try {
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+    const completion = await withRetry(() => groq.chat.completions.create({
+      model: LIGHT_MODEL,
       messages: [
-        {
-          role: "system",
-          content: "You are a productivity coach. Provide 3-5 actionable, encouraging tips based on the user's context. Return as a JSON array of strings.",
-        },
-        {
-          role: "user",
-          content: context,
-        },
+        { role: "system", content: "You are a productivity coach. Provide 3-5 actionable, encouraging tips based on the user's context. Return as a JSON array of strings." },
+        { role: "user", content: context },
       ],
       temperature: 0.7,
-      max_completion_tokens: 1024,
+      max_completion_tokens: 512,
       top_p: 1,
-    });
+    }));
 
     const content = completion.choices?.[0]?.message?.content;
 
@@ -362,22 +366,16 @@ ${shardData.deadline ? `Deadline: ${shardData.deadline}\n` : ''}\nMini-Goals:\n$
 Please suggest XP rewards and timelines for this quest structure.`;
 
   try {
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+    const completion = await withRetry(() => groq.chat.completions.create({
+      model: LIGHT_MODEL,
       messages: [
-        {
-          role: "system",
-          content: enrichmentPrompt,
-        },
-        {
-          role: "user",
-          content: userPrompt,
-        },
+        { role: "system", content: enrichmentPrompt },
+        { role: "user", content: userPrompt },
       ],
       temperature: 0.5,
-      max_completion_tokens: 4096,
+      max_completion_tokens: 2048,
       top_p: 1,
-    });
+    }));
 
     const content = completion.choices?.[0]?.message?.content;
 
@@ -439,13 +437,13 @@ Stats:
 Return ONLY a JSON array of strings. No extra text.
 Example: ["🔥 You're on a 5-day streak — don't break it now!", "📈 Completion up 12% vs last week!"]`;
 
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+    const completion = await withRetry(() => groq.chat.completions.create({
+      model: LIGHT_MODEL,
       messages: [{ role: "user", content: prompt }],
       temperature: 0.8,
       max_completion_tokens: 512,
       top_p: 1,
-    });
+    }));
 
     const content = completion.choices?.[0]?.message?.content;
     if (!content) return [];
@@ -488,13 +486,13 @@ Return ONLY valid JSON:
   "xpReward": 30
 }`;
 
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+    const completion = await withRetry(() => groq.chat.completions.create({
+      model: LIGHT_MODEL,
       messages: [{ role: "user", content: prompt }],
       temperature: 0.6,
       max_completion_tokens: 512,
       top_p: 1,
-    });
+    }));
 
     const content = completion.choices?.[0]?.message?.content;
     if (!content) return null;
@@ -539,13 +537,13 @@ Return ONLY a JSON array in this exact format:
 
 No additional text, just the JSON array.`;
 
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+    const completion = await withRetry(() => groq.chat.completions.create({
+      model: LIGHT_MODEL,
       messages: [{ role: "user", content: prompt }],
       temperature: 0.7,
       max_completion_tokens: 1024,
       top_p: 1,
-    });
+    }));
 
     const content = completion.choices[0]?.message?.content;
     if (!content) {
@@ -615,8 +613,8 @@ export async function generateInactivityNudge(
   staleDays: number
 ): Promise<string> {
   try {
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+    const completion = await withRetry(() => groq.chat.completions.create({
+      model: LIGHT_MODEL,
       messages: [{
         role: "user",
         content: `A user hasn't worked on their quest "${shardTitle}" in ${staleDays} days. Write ONE motivational nudge (max 2 sentences, friendly, gamified tone, one emoji). No greetings.`,
@@ -624,7 +622,7 @@ export async function generateInactivityNudge(
       temperature: 0.8,
       max_completion_tokens: 256,
       top_p: 1,
-    });
+    }));
     return completion.choices[0]?.message?.content?.trim() || COACH_TEMPLATES.inactivity(shardTitle);
   } catch {
     return COACH_TEMPLATES.inactivity(shardTitle);
@@ -641,8 +639,8 @@ export async function generateSimplifiedTasks(
 ): Promise<string[]> {
   try {
     const taskList = incompleteTasks.slice(0, 5).join(", ");
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+    const completion = await withRetry(() => groq.chat.completions.create({
+      model: LIGHT_MODEL,
       messages: [{
         role: "user",
         content: `The user lost their streak on "${shardTitle}". Incomplete tasks: ${taskList}. Rewrite as 3–5 simpler micro-tasks (max 10 words each) to help them restart. Return ONLY a JSON array of strings.`,
@@ -650,7 +648,7 @@ export async function generateSimplifiedTasks(
       temperature: 0.7,
       max_completion_tokens: 256,
       top_p: 1,
-    });
+    }));
     const content = completion.choices[0]?.message?.content || "";
     const match = content.match(/\[[\s\S]*\]/);
     if (!match) return [];
@@ -669,8 +667,8 @@ export async function generateStretchGoal(
   streak: number
 ): Promise<string> {
   try {
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+    const completion = await withRetry(() => groq.chat.completions.create({
+      model: LIGHT_MODEL,
       messages: [{
         role: "user",
         content: `User hit a ${streak}-day streak on "${shardTitle}". Suggest ONE exciting bonus challenge they could add (max 15 words, action-oriented). No preamble.`,
@@ -678,9 +676,52 @@ export async function generateStretchGoal(
       temperature: 0.8,
       max_completion_tokens: 128,
       top_p: 1,
-    });
+    }));
     return completion.choices[0]?.message?.content?.trim() || COACH_TEMPLATES.milestone(streak);
   } catch {
     return COACH_TEMPLATES.milestone(streak);
+  }
+}
+
+/**
+ * Generate a real AI summary of a chat's recent messages.
+ * Used by the summonSummary mutation.
+ */
+export async function generateChatSummary(
+  messageHistory: string,
+  shardTitle?: string,
+  shardProgress?: number
+): Promise<string> {
+  try {
+    const completion = await withRetry(() => groq.chat.completions.create({
+      model: LIGHT_MODEL,
+      messages: [{
+        role: "user",
+        content: `You are an AI assistant for Shard, a collaborative goal-achievement app.
+
+Analyze this chat conversation from the "${shardTitle || 'shard'}" quest (${shardProgress ?? 0}% complete) and write a concise progress summary.
+
+Focus on:
+- Key decisions made
+- Progress discussed
+- Action items or blockers mentioned
+- Team momentum
+
+Chat history (most recent messages):
+${messageHistory || '(no messages yet)'}
+
+Write 2-4 sentences in a friendly, motivating tone. Start with a relevant emoji. Be specific about what was discussed — never generic.`,
+      }],
+      temperature: 0.6,
+      max_completion_tokens: 256,
+      top_p: 1,
+    }));
+
+    const content = completion.choices[0]?.message?.content?.trim();
+    if (!content) throw new Error("No content");
+    return content;
+  } catch (error) {
+    console.error("Chat summary generation error:", error);
+    return `📊 Summary for "${shardTitle || 'this shard'}": Your team has been active. ${shardProgress ? `You're ${shardProgress}% of the way there —` : ''} keep the momentum going! 💪`;
   }
 }

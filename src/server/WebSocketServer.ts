@@ -9,23 +9,18 @@ interface SocketUser {
   socketId: string;
 }
 
-interface ChatMessage {
-  chatId: string;
-  senderId: string;
-  senderUsername: string;
-  content: string;
-  type: string;
-  createdAt: Date;
-}
+// socketId → { userId, username }
+const socketUsers = new Map<string, { userId: string; username: string }>();
 
-interface TypingUser {
-  chatId: string;
-  userId: string;
-  username: string;
-}
+// userId → Set<socketId>  (multi-device: one user can have many sockets)
+const userSockets = new Map<string, Set<string>>();
 
-// Store active users
-const activeUsers = new Map<string, SocketUser>();
+// userId → Set<chatId>  (persists across reconnects so rooms are auto-rejoined)
+const userActiveChats = new Map<string, Set<string>>();
+
+// userId → last DB write timestamp  (throttle heartbeat writes)
+const lastHeartbeatWrite = new Map<string, number>();
+const HEARTBEAT_DB_INTERVAL = 60_000; // write lastActive at most once per minute per user
 
 export function setupWebSocketServer(httpServer: HTTPServer) {
   const io = new SocketIOServer(httpServer, {
@@ -40,19 +35,16 @@ export function setupWebSocketServer(httpServer: HTTPServer) {
   // Authentication middleware
   io.use(async (socket, next) => {
     try {
-      const token = socket.handshake.auth?.token || 
-                    socket.handshake.headers.authorization?.replace("Bearer ", "") ||
-                    socket.handshake.query?.token;
-      
-      if (!token) {
-        return next(new Error("Authentication error"));
-      }
+      const token =
+        socket.handshake.auth?.token ||
+        socket.handshake.headers.authorization?.replace("Bearer ", "") ||
+        socket.handshake.query?.token;
+
+      if (!token) return next(new Error("Authentication error"));
 
       const decoded: any = jwt.verify(token, process.env.JWT_ACCESS_TOKEN_SECRET!);
-      
       socket.data.userId = decoded.id;
       socket.data.username = decoded.username;
-      
       next();
     } catch (error) {
       console.error("WebSocket auth error:", error);
@@ -61,27 +53,37 @@ export function setupWebSocketServer(httpServer: HTTPServer) {
   });
 
   io.on("connection", (socket) => {
-    const userId = socket.data.userId;
-    const username = socket.data.username;
+    const userId: string = socket.data.userId;
+    const username: string = socket.data.username;
 
-    console.log(`✅ User connected: ${username} (${userId})`);
+    console.log(`✅ User connected: ${username} (${userId}) socket=${socket.id}`);
 
-    // Add user to active users
-    activeUsers.set(userId, {
-      userId,
-      username,
-      socketId: socket.id,
-    });
+    // Track socket → user mapping
+    socketUsers.set(socket.id, { userId, username });
 
-    // Persist lastActive on connect
-    User.findByIdAndUpdate(userId, { lastActive: new Date() }).catch(() => {});
+    // Track user → sockets (multi-device)
+    const isFirstSocket = !userSockets.has(userId) || userSockets.get(userId)!.size === 0;
+    if (!userSockets.has(userId)) userSockets.set(userId, new Set());
+    userSockets.get(userId)!.add(socket.id);
 
-    // Broadcast user is online
-    socket.broadcast.emit("user:online", { userId, username });
+    // Auto-rejoin any chats this user was subscribed to before disconnect
+    const knownChats = userActiveChats.get(userId);
+    if (knownChats) {
+      for (const chatId of knownChats) {
+        socket.join(`chat:${chatId}`);
+      }
+      console.log(`🔄 Auto-rejoined ${knownChats.size} chat(s) for ${username}`);
+    }
 
-    // Handle typing indicator
-    socket.on("typing:start", (data: TypingUser) => {
-      socket.to(data.chatId).emit("typing:indicator", {
+    // Only broadcast online + update DB on first socket for this user
+    if (isFirstSocket) {
+      User.findByIdAndUpdate(userId, { lastActive: new Date() }).catch(() => {});
+      socket.broadcast.emit("user:online", { userId, username });
+    }
+
+    // Typing indicators — must use chat: prefix to match room names
+    socket.on("typing:start", (data: { chatId: string }) => {
+      socket.to(`chat:${data.chatId}`).emit("typing:indicator", {
         chatId: data.chatId,
         userId,
         username,
@@ -89,8 +91,8 @@ export function setupWebSocketServer(httpServer: HTTPServer) {
       });
     });
 
-    socket.on("typing:stop", (data: TypingUser) => {
-      socket.to(data.chatId).emit("typing:indicator", {
+    socket.on("typing:stop", (data: { chatId: string }) => {
+      socket.to(`chat:${data.chatId}`).emit("typing:indicator", {
         chatId: data.chatId,
         userId,
         username,
@@ -98,54 +100,61 @@ export function setupWebSocketServer(httpServer: HTTPServer) {
       });
     });
 
-    // Handle new message (from GraphQL, notify others)
-    socket.on("message:new", (data: ChatMessage) => {
-      socket.to(data.chatId).emit("message:received", data);
-    });
-
-    // Handle message read receipt
-    socket.on("message:read", (data: { messageId: string, userId: string }) => {
-      socket.to(data.messageId).emit("message:read", data);
-    });
-
-    // Join chat room
+    // Join a chat room
     socket.on("chat:join", (chatId: string) => {
       socket.join(`chat:${chatId}`);
-      console.log(`📨 User ${username} joined chat ${chatId}`);
+      if (!userActiveChats.has(userId)) userActiveChats.set(userId, new Set());
+      userActiveChats.get(userId)!.add(chatId);
+      console.log(`📨 ${username} joined chat ${chatId}`);
     });
 
-    // Leave chat room
+    // Leave a chat room
     socket.on("chat:leave", (chatId: string) => {
       socket.leave(`chat:${chatId}`);
-      console.log(`👋 User ${username} left chat ${chatId}`);
+      userActiveChats.get(userId)?.delete(chatId);
+      console.log(`👋 ${username} left chat ${chatId}`);
     });
 
-    // Handle connection to multiple chats
+    // Join multiple chats at once (e.g. on app start)
     socket.on("chats:join", (chatIds: string[]) => {
+      if (!userActiveChats.has(userId)) userActiveChats.set(userId, new Set());
       chatIds.forEach((chatId) => {
         socket.join(`chat:${chatId}`);
+        userActiveChats.get(userId)!.add(chatId);
       });
     });
 
-    // Heartbeat to keep lastActive fresh during long sessions
+    // Heartbeat — throttled to one DB write per minute to avoid hammering Mongo
     socket.on("heartbeat", () => {
-      User.findByIdAndUpdate(userId, { lastActive: new Date() }).catch(() => {});
+      const now = Date.now();
+      const last = lastHeartbeatWrite.get(userId) ?? 0;
+      if (now - last >= HEARTBEAT_DB_INTERVAL) {
+        lastHeartbeatWrite.set(userId, now);
+        User.findByIdAndUpdate(userId, { lastActive: new Date() }).catch(() => {});
+      }
     });
 
-    // Handle disconnection
+    // Disconnection
     socket.on("disconnect", () => {
-      activeUsers.delete(userId);
+      socketUsers.delete(socket.id);
 
-      // Persist lastActive on disconnect (records last-seen time)
-      User.findByIdAndUpdate(userId, { lastActive: new Date() }).catch(() => {});
+      const userSocketSet = userSockets.get(userId);
+      if (userSocketSet) {
+        userSocketSet.delete(socket.id);
 
-      // Broadcast user is offline
-      socket.broadcast.emit("user:offline", { userId, username });
-      
-      console.log(`❌ User disconnected: ${username} (${userId})`);
+        if (userSocketSet.size === 0) {
+          // Last socket for this user — they're fully offline
+          userSockets.delete(userId);
+          lastHeartbeatWrite.delete(userId);
+          User.findByIdAndUpdate(userId, { lastActive: new Date() }).catch(() => {});
+          socket.broadcast.emit("user:offline", { userId, username });
+          console.log(`❌ ${username} fully disconnected`);
+        } else {
+          console.log(`📱 Socket closed for ${username}, ${userSocketSet.size} device(s) still connected`);
+        }
+      }
     });
 
-    // Handle errors
     socket.on("error", (error) => {
       console.error("Socket error:", error);
     });
@@ -154,26 +163,29 @@ export function setupWebSocketServer(httpServer: HTTPServer) {
   return io;
 }
 
-// Helper function to emit to specific chat (must be called with io instance)
+// Emit to all active sockets for a user (multi-device aware)
+export function emitToUser(io: SocketIOServer, userId: string, event: string, data: any) {
+  const socketIds = userSockets.get(userId);
+  if (socketIds) {
+    for (const socketId of socketIds) {
+      io.to(socketId).emit(event, data);
+    }
+  }
+}
+
 export function emitToChat(io: SocketIOServer, chatId: string, event: string, data: any) {
   io.to(`chat:${chatId}`).emit(event, data);
 }
 
-// Helper function to emit to specific user (must be called with io instance)
-export function emitToUser(io: SocketIOServer, userId: string, event: string, data: any) {
-  const user = activeUsers.get(userId);
-  if (user) {
-    io.to(user.socketId).emit(event, data);
-  }
-}
-
-// Helper function to check if user is online
 export function isUserOnline(userId: string): boolean {
-  return activeUsers.has(userId);
+  const sockets = userSockets.get(userId);
+  return !!(sockets && sockets.size > 0);
 }
 
-// Helper function to get online users
 export function getOnlineUsers(): SocketUser[] {
-  return Array.from(activeUsers.values());
+  return Array.from(userSockets.entries()).map(([userId, socketIds]) => {
+    const firstSocketId = socketIds.values().next().value ?? "";
+    const user = socketUsers.get(firstSocketId);
+    return { userId, username: user?.username ?? "", socketId: firstSocketId };
+  });
 }
-
