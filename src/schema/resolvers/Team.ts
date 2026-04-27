@@ -77,7 +77,7 @@ export default {
 
       if (!chatErr && chat) {
         await Team.findByIdAndUpdate(team._id, { chatId: chat._id });
-        team.chatId = chat._id;
+        team.chatId = chat._id as any;
       }
 
       SaveAuditTrail({
