@@ -1663,7 +1663,7 @@ export default {
             { "participants.user": context.id },
           ],
         })
-          .select("title description image status progress timeline participants createdAt updatedAt")
+          .select("title description image status progress timeline participants chatId createdAt updatedAt")
           .sort({ createdAt: -1 })
           .lean()
       );
@@ -1687,6 +1687,7 @@ export default {
           progress: s.progress,
           timeline: s.timeline,
           participantsCount: s.participants?.length || 0,
+          chatId: s.chatId?.toString() || null,
         })),
       };
     },

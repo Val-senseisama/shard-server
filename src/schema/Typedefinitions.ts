@@ -39,6 +39,10 @@ export default `#graphql
     myChallenges: ChallengesResponse!
     getActiveChallengesCount: CountResponse!
     
+    # Team queries
+    myTeams: TeamsResponse!
+    getTeam(teamId: ID!): TeamResponse!
+
     # Side Quest queries
     mySideQuests: SideQuestsResponse!
     canGenerateSideQuest: GenerateCheckResponse!
@@ -126,6 +130,12 @@ export default `#graphql
     completeTask(shardId: ID!, miniGoalId: ID!, taskIndex: Int!): CompleteTaskResponse!
     clearPendingAchievements: MessageResponse!
     
+    # Team mutations
+    createTeam(name: String!, memberIds: [ID!]!): TeamResponse!
+    updateTeam(teamId: ID!, name: String, addMemberIds: [ID!], removeMemberIds: [ID!]): TeamResponse!
+    deleteTeam(teamId: ID!): MessageResponse!
+    leaveTeam(teamId: ID!): MessageResponse!
+
     # Challenge mutations
     createChallenge(input: CreateChallengeInput!): ChallengeResponse!
     completeChallenge(challengeId: ID!): CompleteChallengeResponse!
@@ -471,6 +481,7 @@ export default `#graphql
     aiCallsRemaining: Int
     miniGoals: [MiniGoalPreview!]
     participantsCount: Int
+    chatId: ID
   }
 
   type ShardResponse {
@@ -804,6 +815,35 @@ export default `#graphql
   type SideQuestsResponse {
     success: Boolean!
     sideQuests: [SideQuestSummary!]!
+  }
+
+  # ─── Teams ────────────────────────────────────────────────────────────────────
+
+  type TeamMember {
+    id: ID!
+    username: String!
+    profilePic: String
+  }
+
+  type Team {
+    id: ID!
+    name: String!
+    owner: TeamMember!
+    members: [TeamMember!]!
+    memberCount: Int!
+    chatId: ID
+    createdAt: String!
+  }
+
+  type TeamResponse {
+    success: Boolean!
+    message: String
+    team: Team
+  }
+
+  type TeamsResponse {
+    success: Boolean!
+    teams: [Team!]!
   }
 
   type SideQuestResponse {
