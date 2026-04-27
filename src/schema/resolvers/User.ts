@@ -787,7 +787,7 @@ console.log("newUser", newUser);
           preferences: user.preferences,
           currentStreak: user.currentStreak || 0,
           longestStreak: user.longestStreak || 0,
-          birthdate: user.birthdate ? user.birthdate.toISOString() : null,
+          birthdate: user.birthdate ? new Date(user.birthdate).toISOString() : null,
           timezone: user.timezone || 'UTC',
           aiCredits: user.aiCredits || 0,
         },
