@@ -1669,9 +1669,9 @@ export default {
       );
 
       if (error) {
-        logError("myShards", error);
+        logError("myShards", error, { userId: context.id });
         return {
-          success: true,
+          success: false,
           shards: [],
         };
       }
