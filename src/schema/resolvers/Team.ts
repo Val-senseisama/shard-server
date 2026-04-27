@@ -127,16 +127,11 @@ export default {
       );
       if (updateErr || !updated) return { success: false, message: "Failed to update team." };
 
-      // Sync chat participants
+      // Sync chat participants and name in one update
       if (updated.chatId) {
-        await catchError(
-          Chat.findByIdAndUpdate(updated.chatId, {
-            $set: { participants: update.members },
-          })
-        );
-        if (update.name) {
-          await catchError(Chat.findByIdAndUpdate(updated.chatId, { name: update.name }));
-        }
+        const chatUpdate: Record<string, any> = { participants: update.members };
+        if (update.name) chatUpdate.name = update.name;
+        await catchError(Chat.findByIdAndUpdate(updated.chatId, { $set: chatUpdate }));
       }
 
       SaveAuditTrail({ userId: context.id, task: "Updated Team", details: `Updated team ${teamId}` });
@@ -187,6 +182,7 @@ export default {
         );
       }
 
+      SaveAuditTrail({ userId: context.id, task: "Left Team", details: `Left team ${teamId}` });
       return { success: true, message: "You have left the team." };
     },
   },
