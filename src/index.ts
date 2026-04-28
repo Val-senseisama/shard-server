@@ -30,6 +30,9 @@ app.use(helmet({
   contentSecurityPolicy: isProd ? undefined : false,
 }));
 
+// Trust Railway's reverse proxy so express-rate-limit reads the real client IP
+if (isProd) app.set('trust proxy', 1);
+
 // ─── Body size limits ────────────────────────────────────────────────────────
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true, limit: "2mb" }));
