@@ -42,6 +42,9 @@ const SCHEDULED_JOBS = [
 ];
 
 export async function initScheduledJobs() {
+  // BullMQ requires noeviction — set it once on startup (Railway Redis supports CONFIG SET)
+  await connection.config('SET', 'maxmemory-policy', 'noeviction').catch(() => {});
+
   for (const { name, pattern } of SCHEDULED_JOBS) {
     await shardQueue.add(name, {}, { repeat: { pattern } });
   }
