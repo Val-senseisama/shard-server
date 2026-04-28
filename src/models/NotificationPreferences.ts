@@ -45,8 +45,6 @@ const NotificationPreferencesSchema = new Schema<NotificationPreferencesDocument
   { timestamps: true }
 );
 
-// Index
-NotificationPreferencesSchema.index({ userId: 1 });
 
 export default model<NotificationPreferencesDocument>("NotificationPreference", NotificationPreferencesSchema);
 

@@ -15,16 +15,7 @@ import typeDefs from "./schema/Typedefinitions.js";
 import resolvers from "./schema/Resolvers.js";
 import cors from "cors";
 import { setupWebSocketServer } from "./server/WebSocketServer.js";
-import {
-  startOverdueTaskReschedule,
-  startDeletedTaskPurge,
-  startDeadlineReminders,
-  startOverdueAlerts,
-  startDailyTaskReminders,
-  startScheduledNotificationDispatcher,
-  startInactivityNudger,
-  startStreakEventDetector,
-} from './Helpers/CronJobs.js';
+import { initScheduledJobs } from './Helpers/CronJobs.js';
 import { handleRevenueCatWebhook } from "./controllers/WebhookController.js";
 
 const PORT = process.env.PORT || 4000;
@@ -121,14 +112,7 @@ export { authLimiter };
 
 connectDB();
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, async () => {
   console.log(`🚀 [SERVER] Running on port ${PORT} (${isProd ? "production" : "development"})`);
-  startOverdueTaskReschedule();
-  startDeletedTaskPurge();
-  startDeadlineReminders();
-  startOverdueAlerts();
-  startDailyTaskReminders();
-  startScheduledNotificationDispatcher();
-  startInactivityNudger();
-  startStreakEventDetector();
+  await initScheduledJobs();
 });

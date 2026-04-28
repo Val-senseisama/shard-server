@@ -293,8 +293,6 @@ const UserSchema: Schema<IUser> = new Schema(
 );
 
 // Add indexes for common queries
-UserSchema.index({ email: 1 }, { unique: true }); // Already unique, but explicit index helps
-UserSchema.index({ username: 1 }, { unique: true }); // Already unique, but explicit index helps
 UserSchema.index({ emailVerified: 1 });
 UserSchema.index({ isActive: 1 });
 UserSchema.index({ role: 1 });

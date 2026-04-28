@@ -8,7 +8,8 @@ import Shard from "../../models/Shard.js";
 import MiniGoal from "../../models/MiniGoal.js";
 import Chat, { Message } from "../../models/Chat.js";
 import { User } from "../../models/User.js";
-import { breakDownGoalWithAI, checkAIUsage, trackAIUsage, enrichManualShard, generateReflectionMission, UserContext } from "../../Helpers/AIHelper.js";
+import { breakDownGoalWithAI, checkAIUsage, trackAIUsage, enrichManualShard, UserContext } from "../../Helpers/AIHelper.js";
+import { enqueueReflectionMission } from "../../Helpers/CronJobs.js";
 import { moderate } from "../../Helpers/ContentModerator.js";
 import SideQuest from "../../models/SideQuest.js";
 import { createNotification } from "./Notifications.js";
@@ -668,20 +669,12 @@ export default {
 
       // Trigger reflection mission when shard is marked complete
       if (input.status === 'completed' && shard.status !== 'completed') {
-        generateReflectionMission(updatedShard.title, updatedShard.progress.completion)
-          .then(async (mission) => {
-            if (!mission) return;
-            await SideQuest.create({
-              userId: context.id,
-              title: mission.title,
-              description: mission.description,
-              difficulty: 'easy',
-              xpReward: mission.xpReward || 30,
-              category: 'reflection',
-              recommendedBy: 'ai',
-            });
-          })
-          .catch((err) => logError('reflectionMission', err));
+        enqueueReflectionMission({
+          userId: context.id,
+          shardId: updatedShard._id.toString(),
+          shardTitle: updatedShard.title,
+          completionRate: updatedShard.progress.completion,
+        }).catch((err) => logError('enqueueReflectionMission', err));
 
         await createNotification(
           context.id,

@@ -55,8 +55,6 @@ const AnalyticsSchema = new Schema<AnalyticsDocument>(
   { timestamps: true }
 );
 
-// Add indexes
-AnalyticsSchema.index({ userId: 1 });
 
 export default model<AnalyticsDocument>("Analytics", AnalyticsSchema);
 
