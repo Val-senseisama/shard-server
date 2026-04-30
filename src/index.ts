@@ -26,8 +26,29 @@ const httpServer = http.createServer(app);
 
 // ─── Security headers ────────────────────────────────────────────────────────
 app.use(helmet({
-  crossOriginEmbedderPolicy: false, // Allow Apollo Studio in dev
-  contentSecurityPolicy: isProd ? undefined : false,
+  crossOriginEmbedderPolicy: false,
+  contentSecurityPolicy: isProd ? {
+    directives: {
+      ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+      "script-src": [
+        "'self'", 
+        "'unsafe-inline'", 
+        "https://apollo-server-landing-page.cdn.apollographql.com", 
+        "https://embeddable-sandbox.cdn.apollographql.com", 
+        "https://embeddable-explorer.cdn.apollographql.com"
+      ],
+      "img-src": [
+        "'self'", 
+        "data:", 
+        "https://apollo-server-landing-page.cdn.apollographql.com"
+      ],
+      "frame-src": [
+        "'self'", 
+        "https://sandbox.embed.apollographql.com", 
+        "https://embeddable-sandbox.cdn.apollographql.com"
+      ],
+    },
+  } : false,
 }));
 
 // Trust Railway's reverse proxy so express-rate-limit reads the real client IP
@@ -92,7 +113,7 @@ const server = new ApolloServer({
   typeDefs,
   resolvers,
   formatError,
-  introspection: !isProd, // Disable schema exposure in production
+  introspection: true, // Enable schema exposure even in production for Sandbox/Explorer
   validationRules: [
     depthLimit(10), // Reject queries nested deeper than 10 levels
   ],
