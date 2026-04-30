@@ -1012,7 +1012,10 @@ export default {
             } : null,
           minitaskRef: m.minitaskRef
             ? {
-                ...m.minitaskRef,
+                miniGoalId: m.minitaskRef.miniGoalId?.toString() ?? "",
+                taskId: m.minitaskRef.taskId ?? "",
+                miniGoalTitle: m.minitaskRef.miniGoalTitle ?? null,
+                taskTitle: m.minitaskRef.taskTitle ?? null,
                 assignedTo: m.minitaskRef.assignedTo
                   ? {
                       id: m.minitaskRef.assignedTo._id?.toString(),

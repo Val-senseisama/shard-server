@@ -985,14 +985,23 @@ export default {
         await MiniGoal.findByIdAndUpdate(miniGoalId, { assignedTo: userId });
       }
 
-      // Inject system message into quest chat (fire-and-forget)
+      // Post assignment card into quest chat (fire-and-forget)
       if (shard.chatId) {
         Message.create({
           chatId: shard.chatId,
           sender: context.id,
           content: `${assignerName} assigned "${targetLabel}" to @${assigneeName}`,
-          type: "system",
-        }).catch((e: any) => logError("assignMiniGoal:systemMessage", e));
+          type: "minitask_assignment",
+          minitaskRef: {
+            miniGoalId: miniGoalId,
+            taskId: typeof taskIndex === "number" ? `task-${taskIndex}` : miniGoalId,
+            miniGoalTitle: minigoal.title,
+            taskTitle: typeof taskIndex === "number" ? targetLabel : undefined,
+            assignedTo: userId,
+          },
+          readBy: [context.id],
+          readAt: [{ userId: context.id, readAt: new Date() }],
+        }).catch((e: any) => logError("assignMiniGoal:message", e));
       }
 
       SaveAuditTrail({

@@ -47,6 +47,8 @@ export interface MessageDocument extends Document {
   minitaskRef?: {
     miniGoalId: Types.ObjectId;
     taskId: string;
+    miniGoalTitle?: string;
+    taskTitle?: string;
     assignedTo: Types.ObjectId;
   };
   createdAt: Date;
@@ -92,6 +94,8 @@ const MessageSchema = new Schema<MessageDocument>(
     minitaskRef: {
       miniGoalId: { type: Schema.Types.ObjectId, ref: "MiniGoal" },
       taskId: { type: String },
+      miniGoalTitle: { type: String },
+      taskTitle: { type: String },
       assignedTo: { type: Schema.Types.ObjectId, ref: "User" },
     },
   },

@@ -641,6 +641,8 @@ export default `#graphql
   type MiniTaskRefData {
     miniGoalId: ID!
     taskId: String!
+    miniGoalTitle: String
+    taskTitle: String
     assignedTo: ChatParticipant!
   }
 
