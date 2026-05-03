@@ -1125,7 +1125,10 @@ export default `#graphql
     adminGetSupportFlags(status: String, priority: String, page: Int, limit: Int): AdminSupportFlagsResponse!
 
     # Admin — Audit Trail
-    adminGetAuditTrail(userId: ID, page: Int, limit: Int): AdminAuditResponse!
+    adminGetAuditTrail(userId: ID, search: String, page: Int, limit: Int): AdminAuditResponse!
+
+    # Admin — Error Logs
+    adminGetErrorLogs(severity: String, search: String, page: Int, limit: Int): AdminErrorLogResponse!
 
     # Admin — Shards
     adminGetShardOverview(status: String, page: Int, limit: Int): AdminShardsResponse!
@@ -1300,6 +1303,7 @@ export default `#graphql
   type AuditEntry {
     id: ID!
     userId: String!
+    user: UserInfo
     task: String!
     details: String!
     createdAt: String!
@@ -1311,6 +1315,28 @@ export default `#graphql
     page: Int!
     limit: Int!
     entries: [AuditEntry!]!
+  }
+
+  type ErrorLog {
+    id: ID!
+    task: String!
+    resolver: String
+    errorMessage: String!
+    stack: String
+    userId: String
+    user: UserInfo
+    severity: String!
+    metadata: JSON
+    timestamp: String!
+    createdAt: String!
+  }
+
+  type AdminErrorLogResponse {
+    success: Boolean!
+    total: Int!
+    page: Int!
+    limit: Int!
+    logs: [ErrorLog!]!
   }
 
   type AdminShardSummary {

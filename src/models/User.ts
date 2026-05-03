@@ -10,7 +10,7 @@ export interface IUser extends Document {
   
   // OAuth fields
   googleId?: string;
-  authProvider: "email" | "google";
+  authProvider: "email" | "google" | "password";
 
   // Authentication & Security
   refreshTokens: string[];
@@ -108,7 +108,7 @@ const UserSchema: Schema<IUser> = new Schema(
     },
     authProvider: {
       type: String,
-      enum: ["email", "google"],
+      enum: ["email", "google", "password"],
       default: "email",
     },
 

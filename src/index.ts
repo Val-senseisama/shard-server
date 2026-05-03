@@ -102,6 +102,34 @@ const graphqlLimiter = rateLimit({
 // ─── Webhook (before GraphQL middleware) ─────────────────────────────────────
 app.post("/webhooks/revenuecat", handleRevenueCatWebhook);
 
+// ─── Error Logging API ────────────────────────────────────────────────────────
+import { logError } from "./Helpers/Helpers.js";
+app.post("/log-errors", async (req, res) => {
+  const { errors } = req.body;
+  if (!Array.isArray(errors)) {
+    return res.status(400).json({ success: false, message: "Invalid payload: 'errors' must be an array." });
+  }
+
+  try {
+    for (const err of errors) {
+      await logError(err.task || "client-error", err.error, {
+        severity: err.severity || "medium",
+        userId: err.userId,
+        metadata: { 
+          ...err.metadata, 
+          client: "mobile", 
+          platform: err.platform, 
+          version: err.version 
+        },
+      });
+    }
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error processing client logs:", error);
+    res.status(500).json({ success: false });
+  }
+});
+
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 const io = setupWebSocketServer(httpServer);
 import { setSocketIO } from "./schema/resolvers/Chat.js";

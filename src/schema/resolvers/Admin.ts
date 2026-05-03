@@ -16,8 +16,10 @@ import Subscription from "../../models/Subscription.js";
 import SubscriptionHistory from "../../models/SubscriptionHistory.js";
 import setJWT from "../../Helpers/setJWT.js";
 import { cache, cacheInvalidate } from "../../Helpers/Cache.js";
+import { enqueueEmail } from "../../Helpers/Queue.js";
 import { ACHIEVEMENTS, ACHIEVEMENT_MAP } from "../../data/achievements.js";
 import Offering from "../../models/Offering.js";
+import ErrorLog from "../../models/ErrorLog.js";
 
 // ─── Guard ────────────────────────────────────────────────────────────────────
 function requireAdmin(context: any) {
@@ -77,11 +79,11 @@ export default {
         passwordResetExpires: new Date(expiry),
       });
 
-      await EmailQueue.create({
-        toEmail: user.email,
-        subject: "Shard Admin — Your Login OTP",
-        message: `Your admin OTP is: ${otp}\n\nThis code expires in 10 minutes. Do not share it with anyone.`,
-      });
+      await enqueueEmail(
+        user.email,
+        "Shard Admin — Your Login OTP",
+        `Your admin OTP is: ${otp}\n\nThis code expires in 10 minutes. Do not share it with anyone.`
+      );
 
       SaveAuditTrail({
         userId: user._id.toString(),
@@ -736,25 +738,56 @@ export default {
 
     /**
      * Searchable, paginated audit trail.
-     * Optionally filter by userId; sorted newest-first.
+     * Optionally filter by userId or search by username/email.
      */
-    async adminGetAuditTrail(_, { userId, page, limit }, context) {
+    async adminGetAuditTrail(_, { userId, search, page, limit }, context) {
       requireAdmin(context);
 
       const { skip, limit: safeLimit } = paginate(page, limit);
-      const filter: any = {};
-      if (userId) filter.userId = userId;
+      
+      const pipeline: any[] = [];
 
-      const [countErr, total] = await catchError(
-        AuditTrail.countDocuments(filter),
-      );
-      const [listErr, entries] = await catchError(
-        AuditTrail.find(filter)
-          .sort({ createdAt: -1 })
-          .skip(skip)
-          .limit(safeLimit)
-          .lean(),
-      );
+      // 1. Initial filter by userId if provided
+      const match: any = {};
+      if (userId) match.userId = userId;
+      pipeline.push({ $match: match });
+
+      // 2. Lookup user details for searching
+      pipeline.push({
+        $lookup: {
+          from: "users",
+          localField: "userId",
+          foreignField: "_id",
+          as: "userDetails",
+        },
+      });
+
+      // 3. Filter by username/email if search provided
+      if (search && search.trim().length >= 2) {
+        const escaped = search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const regex = new RegExp(escaped, "i");
+        pipeline.push({
+          $match: {
+            $or: [
+              { "userDetails.username": regex },
+              { "userDetails.email": regex },
+              { task: regex },
+            ],
+          },
+        });
+      }
+
+      // 4. Sort and Count
+      const countPipeline = [...pipeline, { $count: "total" }];
+      const [countErr, countResult] = await catchError(AuditTrail.aggregate(countPipeline));
+      const total = countResult?.[0]?.total ?? 0;
+
+      // 5. Paginate and Sort
+      pipeline.push({ $sort: { createdAt: -1 } });
+      pipeline.push({ $skip: skip });
+      pipeline.push({ $limit: safeLimit });
+
+      const [listErr, entries] = await catchError<any[]>(AuditTrail.aggregate(pipeline));
 
       if (listErr) {
         logError("adminGetAuditTrail", listErr);
@@ -769,15 +802,107 @@ export default {
 
       return {
         success: true,
-        total: total ?? 0,
+        total,
         page,
         limit: safeLimit,
         entries: (entries ?? []).map((e: any) => ({
           id: e._id.toString(),
           userId: e.userId.toString(),
+          user: e.userDetails?.[0] ? { 
+            id: e.userDetails[0]._id.toString(), 
+            username: e.userDetails[0].username 
+          } : null,
           task: e.task,
           details: e.details,
           createdAt: e.createdAt,
+        })),
+      };
+    },
+
+    /**
+     * Searchable, paginated error logs.
+     */
+    async adminGetErrorLogs(_, { severity, search, page, limit }, context) {
+      requireAdmin(context);
+
+      const { skip, limit: safeLimit } = paginate(page, limit);
+      
+      const pipeline: any[] = [];
+
+      // 1. Initial filter by severity if provided
+      const match: any = {};
+      if (severity) match.severity = severity;
+      pipeline.push({ $match: match });
+
+      // 2. Lookup user details for searching
+      pipeline.push({
+        $lookup: {
+          from: "users",
+          localField: "userId",
+          foreignField: "_id",
+          as: "userDetails",
+        },
+      });
+
+      // 3. Filter by username/email/message if search provided
+      if (search && search.trim().length >= 2) {
+        const escaped = search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const regex = new RegExp(escaped, "i");
+        pipeline.push({
+          $match: {
+            $or: [
+              { "userDetails.username": regex },
+              { "userDetails.email": regex },
+              { errorMessage: regex },
+              { task: regex },
+            ],
+          },
+        });
+      }
+
+      // 4. Sort and Count
+      const countPipeline = [...pipeline, { $count: "total" }];
+      const [countErr, countResult] = await catchError(ErrorLog.aggregate(countPipeline));
+      const total = countResult?.[0]?.total ?? 0;
+
+      // 5. Paginate and Sort
+      pipeline.push({ $sort: { createdAt: -1 } });
+      pipeline.push({ $skip: skip });
+      pipeline.push({ $limit: safeLimit });
+
+      const [listErr, logs] = await catchError<any[]>(ErrorLog.aggregate(pipeline));
+
+      if (listErr) {
+        logError("adminGetErrorLogs", listErr);
+        return {
+          success: false,
+          logs: [],
+          total: 0,
+          page,
+          limit: safeLimit,
+        };
+      }
+
+      return {
+        success: true,
+        total,
+        page,
+        limit: safeLimit,
+        logs: (logs ?? []).map((l: any) => ({
+          id: l._id.toString(),
+          task: l.task,
+          resolver: l.resolver,
+          errorMessage: l.errorMessage,
+          stack: l.stack,
+          userId: l.userId ? l.userId.toString() : null,
+          user: l.userDetails?.[0] ? { 
+            id: l.userDetails[0]._id.toString(), 
+            username: l.userDetails[0].username 
+          } : null,
+          severity: l.severity || "medium",
+          metadata: l.metadata,
+          timestamp: l.timestamp,
+          createdAt: l.createdAt,
         })),
       };
     },

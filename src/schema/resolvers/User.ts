@@ -18,6 +18,7 @@ import { getCloudinarySignedUpload } from "../../Helpers/Cloudinary.js";
 import { verifyGoogleToken, generateUsernameFromGoogle } from "../../Helpers/GoogleAuth.js";
 import { moderate } from "../../Helpers/ContentModerator.js";
 import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
+import { enqueueEmail } from "../../Helpers/Queue.js";
 
 export default {
   Mutation: {
@@ -124,11 +125,11 @@ export default {
       const verificationCode = MakeID(6);
       const expiry = DateTime.now().plus({ minutes: 30 }).toISO();
 
-      await EmailQueue.create({
-        toEmail: email,
-        subject: "Verify Your Shard Account",
-        message: `Your verification code is: ${verificationCode}. It expires in 30 minutes.`,
-      });
+      await enqueueEmail(
+        email,
+        "Verify Your Shard Account",
+        `Your verification code is: ${verificationCode}. It expires in 30 minutes.`
+      );
 
       // Save verification code to user (you might want a separate table for this)
       // For now, we'll use verificationToken field
@@ -275,11 +276,11 @@ export default {
       );
 
       // Queue email
-      await EmailQueue.create({
-        toEmail: email,
-        subject: "Your Shard Login Code",
-        message: `Your login code is: ${code}. This code expires in ${process.env.LOGIN_CODE_EXPIRES_IN || 10} minutes.`,
-      });
+      await enqueueEmail(
+        email,
+        "Your Shard Login Code",
+        `Your login code is: ${code}. This code expires in ${process.env.LOGIN_CODE_EXPIRES_IN || 10} minutes.`
+      );
 
       return {
         success: true,
@@ -787,7 +788,7 @@ console.log("newUser", newUser);
           preferences: user.preferences,
           currentStreak: user.currentStreak || 0,
           longestStreak: user.longestStreak || 0,
-          birthdate: user.birthdate ? new Date(user.birthdate).toISOString() : null,
+          birthdate: user.birthdate ? (isNaN(new Date(user.birthdate).getTime()) ? null : new Date(user.birthdate).toISOString()) : null,
           timezone: user.timezone || 'UTC',
           aiCredits: user.aiCredits || 0,
         },

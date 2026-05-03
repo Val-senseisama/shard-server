@@ -1,6 +1,7 @@
 import { Queue, Worker, Job } from 'bullmq';
 import Redis from 'ioredis';
 import { sendNotificationToUsers } from './FirebaseMessaging.js';
+import SendMail from './SendMail.js';
 import { logError } from './Helpers.js';
 import dotenv from 'dotenv';
 
@@ -38,8 +39,10 @@ const chatWorker = new Worker('chat-jobs', async (job: Job) => {
   if (job.name === 'sendPushNotification') {
     const { recipientIds, payload, type } = job.data;
     await sendNotificationToUsers(recipientIds, payload, type as "messages" | "shardInvites" | "shardUpdates" | "questDeadlines" | "friendRequests" | "achievements");
+  } else if (job.name === 'sendEmail') {
+    const { toEmail, subject, message } = job.data;
+    await SendMail({ recipients: toEmail, subject, message });
   }
-  // Future jobs like mention processing or emails can be added here
 }, { connection });
 
 chatWorker.on('failed', (job, err) => {
@@ -66,5 +69,27 @@ export const enqueuePushNotification = async (recipientIds: string[], payload: a
     await sendNotificationToUsers(recipientIds, payload, type as "messages" | "shardInvites" | "shardUpdates" | "questDeadlines" | "friendRequests" | "achievements");
   } catch (err) {
     logError('enqueuePushNotification:inline', err);
+  }
+};
+
+/**
+ * Enqueues an email securely.
+ * Will silently degrade to inline execution if Redis is unavailable.
+ */
+export const enqueueEmail = async (toEmail: string, subject: string, message: string) => {
+  if (isRedisConnected) {
+    try {
+      await chatQueue.add('sendEmail', { toEmail, subject, message });
+      return;
+    } catch (err) {
+      console.warn('Failed to enqueue email job, falling back to inline.', err);
+    }
+  }
+
+  // Graceful degradation: Process inline
+  try {
+    await SendMail({ recipients: toEmail, subject, message });
+  } catch (err) {
+    logError('enqueueEmail:inline', err);
   }
 };
