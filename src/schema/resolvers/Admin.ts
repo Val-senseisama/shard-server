@@ -999,10 +999,7 @@ export default {
       const activeSubs = await Subscription.find({ status: "active" });
       let mrr = 0;
       activeSubs.forEach(sub => {
-        // Map sub.tier (e.g. 'premium') to a package if possible, or use a default.
-        // Actually, our current Subscription model uses 'free' or 'premium'.
-        // Let's assume 'premium' maps to 'monthly' price for MRR estimation.
-        if (sub.tier === "premium") {
+        if (sub.tier === "pro") {
           mrr += priceMap["monthly"] || 9.99;
         }
       });
