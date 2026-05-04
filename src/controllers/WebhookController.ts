@@ -54,7 +54,10 @@ export const handleRevenueCatWebhook = async (req: Request, res: Response) => {
     }
 
     if (user.subscriptionTier !== tier) {
-      await User.findByIdAndUpdate(app_user_id, { subscriptionTier: tier });
+      const userUpdate: Record<string, any> = { subscriptionTier: tier };
+      // Reset credits to free-tier allowance when a sub expires back to free
+      if (tier === "free") userUpdate.aiCredits = 100;
+      await User.findByIdAndUpdate(app_user_id, userUpdate);
     }
 
     await SubscriptionHistory.create({

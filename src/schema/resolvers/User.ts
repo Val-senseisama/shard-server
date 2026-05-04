@@ -102,7 +102,7 @@ export default {
           achievements: [],
           pendingAchievements: [],
           // Initialize AI credits (free tier)
-          aiCredits: 5,
+          aiCredits: 100,
           // Initialize preferences
           preferences: {
             workloadLevel: 'medium',

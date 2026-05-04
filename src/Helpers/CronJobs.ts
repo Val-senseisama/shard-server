@@ -39,6 +39,7 @@ const SCHEDULED_JOBS = [
   { name: 'inactivity-nudger',        pattern: '0 10 * * *'  },
   { name: 'streak-event-detector',    pattern: '0 11 * * *'  },
   { name: 'notification-dispatcher',  pattern: '*/5 * * * *' },
+  { name: 'monthly-credit-refill',    pattern: '0 0 1 * *'   },
 ];
 
 export async function initScheduledJobs() {
@@ -72,6 +73,7 @@ const worker = new Worker('shard-jobs', async (job: Job) => {
     case 'inactivity-nudger':        return runInactivityNudger();
     case 'streak-event-detector':    return runStreakEventDetector();
     case 'notification-dispatcher':  return runNotificationDispatcher();
+    case 'monthly-credit-refill':    return runMonthlyCreditRefill();
     case 'reflection-mission':       return runReflectionMission(job.data);
   }
 }, { connection });
@@ -433,6 +435,16 @@ async function runStreakEventDetector() {
   }
 
   console.log('✅ [Scheduler] Streak event detector done');
+}
+
+async function runMonthlyCreditRefill() {
+  console.log('💎 [Scheduler] Running monthly AI credit refill...');
+  const FREE_MONTHLY_CREDITS = 100;
+  const result = await User.updateMany(
+    { subscriptionTier: 'free', aiCredits: { $lt: FREE_MONTHLY_CREDITS } },
+    { $set: { aiCredits: FREE_MONTHLY_CREDITS } }
+  );
+  console.log(`✅ [Scheduler] Refilled credits for ${result.modifiedCount} free-tier users`);
 }
 
 async function runReflectionMission(data: {

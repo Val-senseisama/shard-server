@@ -2,7 +2,7 @@ import { Schema, model, Types, Document } from "mongoose";
 
 export interface SubscriptionDocument extends Document {
   userId: Types.ObjectId;
-  tier: "free" | "premium";
+  tier: "free" | "pro";
   startDate: Date;
   endDate?: Date; // null for lifetime, date for expiry
   cancelledAt?: Date;
@@ -15,7 +15,7 @@ const SubscriptionSchema = new Schema<SubscriptionDocument>(
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true, unique: true },
     tier: {
       type: String,
-      enum: ["free", "premium"],
+      enum: ["free", "pro"],
       default: "free",
     },
     startDate: { type: Date, default: Date.now },
