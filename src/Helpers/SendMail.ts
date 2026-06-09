@@ -3,7 +3,7 @@ import "dotenv/config";
 import { logError } from "./Helpers.js";
 
 const resend = new Resend(process.env.RESEND_API_KEY);
-const FROM = process.env.RESEND_FROM || "Shard <noreply@shard.app>";
+const FROM = process.env.RESEND_FROM || "Shard <shardsupportzy@zevbii.com>";
 
 const emailTemplate = `<!DOCTYPE html>
 <html lang="en">

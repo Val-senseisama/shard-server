@@ -5,7 +5,7 @@ import NotificationPreference from "../models/NotificationPreferences.js";
 import { User } from "../models/User.js";
 
 const resend = new Resend(process.env.RESEND_API_KEY);
-const FROM = process.env.RESEND_FROM || "Shard <noreply@shard.app>";
+const FROM = process.env.RESEND_FROM || "Shard <shardsupportzy@zevbii.com>";
 
 // ─── Quiet hours check (mirrors Notifications.ts) ─────────────────
 
