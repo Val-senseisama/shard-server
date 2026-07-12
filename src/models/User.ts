@@ -50,7 +50,7 @@ export interface IUser extends Document {
   comebackBonusUntil?: Date;
   previousStreak: number;
 
-  subscriptionTier: 'free' | 'pro';
+  subscriptionTier: 'free' | 'pro' | 'enterprise';
 
   birthdate?: Date;
   timezone?: string;
@@ -190,7 +190,7 @@ const UserSchema: Schema<IUser> = new Schema(
     },
     aiCredits: {
         type: Number,
-        default: 500
+        default: 100
     },
     level: { 
         type: Number,

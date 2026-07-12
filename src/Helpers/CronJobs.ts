@@ -10,6 +10,7 @@ import Notification from '../models/Notifications.js';
 import NotificationPreference from '../models/NotificationPreferences.js';
 import { sendEmailToUser } from './ResendEmail.js';
 import SideQuest from '../models/SideQuest.js';
+import { FREE_MONTHLY_CREDITS } from './Entitlements.js';
 import {
   canMakeCoachAICall,
   incrementCoachAICounter,
@@ -439,7 +440,6 @@ async function runStreakEventDetector() {
 
 async function runMonthlyCreditRefill() {
   console.log('💎 [Scheduler] Running monthly AI credit refill...');
-  const FREE_MONTHLY_CREDITS = 100;
   const result = await User.updateMany(
     { subscriptionTier: 'free', aiCredits: { $lt: FREE_MONTHLY_CREDITS } },
     { $set: { aiCredits: FREE_MONTHLY_CREDITS } }
