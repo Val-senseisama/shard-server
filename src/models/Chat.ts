@@ -2,7 +2,7 @@ import { Schema, model, Types, Document } from "mongoose";
 
 // Chat model for managing conversations
 export interface ChatDocument extends Document {
-  type: "direct" | "shard" | "group";
+  type: "direct" | "shard" | "group" | "ai";
   participants: Types.ObjectId[]; // Users in the chat
   shardId?: Types.ObjectId; // If this is a shard chat
   name?: string; // For group chats
@@ -14,7 +14,7 @@ const ChatSchema = new Schema<ChatDocument>(
   {
     type: {
       type: String,
-      enum: ["direct", "shard", "group"],
+      enum: ["direct", "shard", "group", "ai"],
       required: true,
     },
     participants: [{ type: Schema.Types.ObjectId, ref: "User", required: true }],
@@ -29,7 +29,7 @@ export interface MessageDocument extends Document {
   chatId: Types.ObjectId;
   sender: Types.ObjectId;
   content: string;
-  type: "text" | "system" | "nudge" | "image" | "audio" | "video" | "file" | "poll" | "minitask_assignment" | "summary_ping";
+  type: "text" | "system" | "nudge" | "image" | "audio" | "video" | "file" | "poll" | "minitask_assignment" | "summary_ping" | "ai_reply" | "ai_proposal";
   replyTo?: Types.ObjectId; // ID of the message this is a reply to
   readBy: Types.ObjectId[]; // Users who have read this message
   readAt?: { userId: Types.ObjectId; readAt: Date }[]; // Detailed read receipts with timestamps
@@ -51,6 +51,17 @@ export interface MessageDocument extends Document {
     taskTitle?: string;
     assignedTo: Types.ObjectId;
   };
+  // AI Quest Coach — a proposed structured change the user confirms before it applies
+  aiProposal?: {
+    status: "pending" | "applied" | "dismissed";
+    summary?: string;
+    actions: {
+      op: string;
+      miniGoalId?: Types.ObjectId;
+      taskIndex?: number;
+      payload?: any;
+    }[];
+  };
   createdAt: Date;
 }
 
@@ -61,7 +72,7 @@ const MessageSchema = new Schema<MessageDocument>(
     content: { type: String, required: true },
     type: {
       type: String,
-      enum: ["text", "system", "nudge", "image", "audio", "video", "file", "poll", "minitask_assignment", "summary_ping"],
+      enum: ["text", "system", "nudge", "image", "audio", "video", "file", "poll", "minitask_assignment", "summary_ping", "ai_reply", "ai_proposal"],
       default: "text",
     },
     replyTo: { type: Schema.Types.ObjectId, ref: "Message" },
@@ -97,6 +108,16 @@ const MessageSchema = new Schema<MessageDocument>(
       miniGoalTitle: { type: String },
       taskTitle: { type: String },
       assignedTo: { type: Schema.Types.ObjectId, ref: "User" },
+    },
+    aiProposal: {
+      status: { type: String, enum: ["pending", "applied", "dismissed"] },
+      summary: { type: String },
+      actions: [{
+        op: { type: String },
+        miniGoalId: { type: Schema.Types.ObjectId, ref: "MiniGoal" },
+        taskIndex: { type: Number },
+        payload: { type: Schema.Types.Mixed },
+      }],
     },
   },
   { timestamps: { createdAt: true, updatedAt: false } }

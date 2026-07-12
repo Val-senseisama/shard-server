@@ -681,6 +681,65 @@ export async function generateStretchGoal(
   }
 }
 
+// ─── Conversational Quest Assistant (Phase 1) ──────────────────────────────────
+
+const QUEST_ASSISTANT_PROMPT = `${SAFETY_RULES}
+
+You are the Quest Coach for Shard, a gamified goal app. The user is discussing ONE quest (a "shard")
+that has mini-goals, each containing tasks. You are given the quest context and recent conversation.
+
+1. Answer the user's question conversationally, specific to THIS quest. Be concise and encouraging.
+2. ONLY if the user asks to change the plan, also return a structured "proposal" of edits.
+   Allowed ops: "addTask", "updateTask", "deleteTask", "addMiniGoal", "updateMiniGoal", "updateShard".
+   - Reference only miniGoalId values that appear in the provided context.
+   - addTask payload: { "title": "..." }
+   - updateTask payload: { "taskIndex": <n>, "title": "..." }
+   - deleteTask payload: { "taskTitle": "..." }
+   - addMiniGoal payload: { "title": "...", "description": "...", "tasks": [{"title":"..."}] }
+   - updateMiniGoal payload: { "title": "...", "description": "..." }
+   - updateShard payload: { "title": "...", "description": "..." }
+3. If the user is only asking a question (no change requested), "proposal" MUST be null.
+
+Return STRICT JSON only:
+{"reply": "<prose answer>", "proposal": null | {"summary": "<what will change, one line>", "actions": [{"op": "addTask", "miniGoalId": "<id>", "payload": { ... }}]}}`;
+
+/**
+ * Conversational assistant for a single shard. Returns a prose reply and, when the user asks to
+ * change the plan, a structured proposal of whitelisted edits (applied only after user confirmation).
+ */
+export async function chatAboutShard(
+  userMessage: string,
+  shardContext: string,
+  history?: string
+): Promise<{ reply: string; proposal: { summary?: string; actions: any[] } | null }> {
+  try {
+    const completion = await withRetry(() => groq.chat.completions.create({
+      model: HEAVY_MODEL,
+      messages: [
+        { role: "system", content: QUEST_ASSISTANT_PROMPT },
+        { role: "user", content: `Quest context:\n${shardContext}\n\nRecent conversation:\n${history || "(none)"}\n\nUser: ${userMessage}` },
+      ],
+      temperature: 0.6,
+      max_completion_tokens: 1500,
+      top_p: 1,
+    }));
+
+    const content = completion.choices?.[0]?.message?.content || "";
+    const match = content.match(/\{[\s\S]*\}/);
+    if (!match) {
+      return { reply: content.trim() || "I'm not sure how to help with that — try rephrasing?", proposal: null };
+    }
+    const parsed = JSON.parse(match[0]);
+    const proposal = parsed.proposal && Array.isArray(parsed.proposal.actions) && parsed.proposal.actions.length > 0
+      ? { summary: parsed.proposal.summary, actions: parsed.proposal.actions }
+      : null;
+    return { reply: (parsed.reply || content.trim() || "").toString(), proposal };
+  } catch (error) {
+    console.error("chatAboutShard error:", error);
+    return { reply: "Sorry — I couldn't process that right now. Please try again.", proposal: null };
+  }
+}
+
 /**
  * Generate a real AI summary of a chat's recent messages.
  * Used by the summonSummary mutation.

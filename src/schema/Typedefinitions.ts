@@ -1414,4 +1414,52 @@ export default `#graphql
     category: String!
     rarity: String!
   }
+
+  # ─── AI Quest Coach (Phase 1) ───────────────────────────────
+  type QuestAIProposalAction {
+    op: String!
+    miniGoalId: ID
+    taskIndex: Int
+    payload: JSON
+  }
+  type QuestAIProposal {
+    status: String!
+    summary: String
+    actions: [QuestAIProposalAction!]!
+  }
+  type QuestAIMessage {
+    id: ID!
+    role: String!
+    content: String!
+    type: String!
+    proposal: QuestAIProposal
+    createdAt: String
+  }
+  type QuestAIResponse {
+    success: Boolean!
+    message: String
+    needsUpgrade: Boolean
+    chatId: ID
+    reply: String
+    proposal: QuestAIMessage
+  }
+  type QuestAIApplyResponse {
+    success: Boolean!
+    message: String
+    applied: [String!]!
+  }
+  type QuestAIChatResponse {
+    success: Boolean!
+    message: String
+    chatId: ID
+    messages: [QuestAIMessage!]!
+  }
+  extend type Mutation {
+    chatWithQuestAI(shardId: ID!, message: String!): QuestAIResponse!
+    applyQuestAISuggestion(messageId: ID!): QuestAIApplyResponse!
+    dismissQuestAISuggestion(messageId: ID!): QuestAIApplyResponse!
+  }
+  extend type Query {
+    getQuestAIChat(shardId: ID!): QuestAIChatResponse!
+  }
 `;

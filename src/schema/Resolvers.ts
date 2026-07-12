@@ -12,6 +12,7 @@ import ReportResolvers from "./resolvers/Report.js";
 import SupportResolvers from "./resolvers/Support.js";
 import AdminResolvers from "./resolvers/Admin.js";
 import TeamResolvers from "./resolvers/Team.js";
+import QuestAIResolvers from "./resolvers/QuestAI.js";
 import { GraphQLScalarType, Kind } from "graphql";
 import { withErrorLogging } from "../Helpers/Helpers.js";
 
@@ -60,6 +61,7 @@ const allQueries: Record<string, Function> = {
     ...SupportResolvers.Query,
     ...AdminResolvers.Query,
     ...TeamResolvers.Query,
+    ...QuestAIResolvers.Query,
 };
 
 const allMutations: Record<string, Function> = {
@@ -77,6 +79,7 @@ const allMutations: Record<string, Function> = {
     ...SupportResolvers.Mutation,
     ...AdminResolvers.Mutation,
     ...TeamResolvers.Mutation,
+    ...QuestAIResolvers.Mutation,
 };
 
 export default {
