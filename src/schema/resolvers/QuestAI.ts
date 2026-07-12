@@ -210,6 +210,14 @@ export default {
       if (msgErr || !msg || (msg as any).type !== "ai_proposal" || !(msg as any).aiProposal) {
         return { success: false, message: "Proposal not found.", applied: [] };
       }
+
+      // Authorization: only someone with access to the proposal's chat may dismiss it.
+      const [, chat] = await catchError(Chat.findById((msg as any).chatId).lean());
+      const isParticipant = ((chat as any)?.participants || []).some((p: any) => p.toString() === context.id);
+      if (!chat || !isParticipant) {
+        return { success: false, message: "Proposal not found.", applied: [] };
+      }
+
       if ((msg as any).aiProposal.status === "pending") {
         (msg as any).aiProposal.status = "dismissed";
         await (msg as any).save();

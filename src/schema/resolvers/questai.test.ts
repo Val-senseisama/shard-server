@@ -90,3 +90,26 @@ describe("applyQuestAISuggestion — fans out to existing resolvers", () => {
     expect(ShardResolvers.Mutation.addTask).not.toHaveBeenCalled();
   });
 });
+
+describe("dismissQuestAISuggestion — authorization (IDOR guard)", () => {
+  const makeDoc = () => ({ type: "ai_proposal", chatId: "c1", aiProposal: { status: "pending", actions: [] }, save: vi.fn(async () => {}) });
+
+  it("lets a chat participant dismiss their proposal", async () => {
+    const doc = makeDoc();
+    vi.mocked(Message.findById).mockResolvedValue(doc as any);
+    vi.mocked(Chat.findById).mockReturnValue(leanOf({ participants: ["owner1"] }) as any);
+    const res: any = await QuestAI.Mutation.dismissQuestAISuggestion({}, { messageId: "m1" }, ctx("owner1"));
+    expect(res.success).toBe(true);
+    expect(doc.aiProposal.status).toBe("dismissed");
+  });
+
+  it("rejects a user who is not a participant and leaves status unchanged", async () => {
+    const doc = makeDoc();
+    vi.mocked(Message.findById).mockResolvedValue(doc as any);
+    vi.mocked(Chat.findById).mockReturnValue(leanOf({ participants: ["owner1"] }) as any);
+    const res: any = await QuestAI.Mutation.dismissQuestAISuggestion({}, { messageId: "m1" }, ctx("intruder"));
+    expect(res.success).toBe(false);
+    expect(doc.aiProposal.status).toBe("pending");
+    expect(doc.save).not.toHaveBeenCalled();
+  });
+});
