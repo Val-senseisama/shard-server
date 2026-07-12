@@ -71,7 +71,7 @@ export default {
       if (!hasShardAccess(shard, context.id)) return { success: false, message: "You don't have access to this quest." };
 
       // Pro gate — AI Quest Coach is a Pro feature
-      const [, user] = await catchError(User.findById(context.id, "subscriptionTier role").lean());
+      const [, user] = await catchError(User.findById(context.id, "subscriptionTier role trialEndsAt").lean());
       if (tierOf(user as any) !== "pro") {
         return upgradeError("AI Quest Coach is a Pro feature. Upgrade to chat with your coach and refine quests!");
       }

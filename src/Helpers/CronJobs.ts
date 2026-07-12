@@ -41,6 +41,7 @@ const SCHEDULED_JOBS = [
   { name: 'streak-event-detector',    pattern: '0 11 * * *'  },
   { name: 'notification-dispatcher',  pattern: '*/5 * * * *' },
   { name: 'monthly-credit-refill',    pattern: '0 0 1 * *'   },
+  { name: 'trial-ending-reminders',   pattern: '0 12 * * *'  },
 ];
 
 export async function initScheduledJobs() {
@@ -75,6 +76,7 @@ const worker = new Worker('shard-jobs', async (job: Job) => {
     case 'streak-event-detector':    return runStreakEventDetector();
     case 'notification-dispatcher':  return runNotificationDispatcher();
     case 'monthly-credit-refill':    return runMonthlyCreditRefill();
+    case 'trial-ending-reminders':   return runTrialEndingReminders();
     case 'reflection-mission':       return runReflectionMission(job.data);
   }
 }, { connection });
@@ -445,6 +447,40 @@ async function runMonthlyCreditRefill() {
     { $set: { aiCredits: FREE_MONTHLY_CREDITS } }
   );
   console.log(`✅ [Scheduler] Refilled credits for ${result.modifiedCount} free-tier users`);
+}
+
+/**
+ * Mongo filter for free users whose Pro trial ends within `horizonHours` and who
+ * haven't been reminded yet. Exported so the selection window is unit-testable.
+ */
+export function trialEndingReminderFilter(now: Date = new Date(), horizonHours = 36) {
+  return {
+    subscriptionTier: 'free',
+    trialReminderSent: { $ne: true },
+    trialEndsAt: { $gt: now, $lte: new Date(now.getTime() + horizonHours * 60 * 60 * 1000) },
+  };
+}
+
+async function runTrialEndingReminders() {
+  console.log('⏳ [Scheduler] Running trial-ending reminders...');
+  const now = new Date();
+  const users = await User.find(trialEndingReminderFilter(now), '_id trialEndsAt').lean();
+
+  for (const u of users) {
+    const uid = u._id.toString();
+    const hoursLeft = Math.max(1, Math.round((new Date((u as any).trialEndsAt).getTime() - now.getTime()) / 3600000));
+    const body = `Your Shard Pro trial ends in about ${hoursLeft} hour${hoursLeft === 1 ? '' : 's'}. Keep unlimited AI quests, advanced analytics and your AI coach — upgrade before it expires.`;
+
+    // No preference type — this is a low-frequency, high-value account notice.
+    await sendNotificationToUser(uid, {
+      title: '⏳ Your Pro trial is ending',
+      body,
+      data: { screen: 'subscribe-pro', source: 'trial_ending' },
+    }).catch(() => {});
+    await createNotification(uid, body, 'trial_ending').catch(() => {});
+    await User.findByIdAndUpdate(uid, { trialReminderSent: true });
+  }
+  console.log(`✅ [Scheduler] Trial-ending reminders sent to ${users.length} users`);
 }
 
 async function runReflectionMission(data: {

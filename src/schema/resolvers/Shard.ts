@@ -6,6 +6,7 @@ import {
 } from "../../Helpers/Helpers.js";
 import Shard from "../../models/Shard.js";
 import MiniGoal from "../../models/MiniGoal.js";
+import { logEvent } from "../../Helpers/Telemetry.js";
 import Chat, { Message } from "../../models/Chat.js";
 import { User } from "../../models/User.js";
 import { breakDownGoalWithAI, checkAIUsage, trackAIUsage, enrichManualShard, UserContext } from "../../Helpers/AIHelper.js";
@@ -111,7 +112,7 @@ export default {
 
       try {
         const [userError, user] = await catchError(
-          User.findById(context.id, "role subscriptionTier username bio birthdate timezone level xp currentStreak strength intelligence charisma endurance creativity preferences").lean()
+          User.findById(context.id, "role subscriptionTier trialEndsAt username bio birthdate timezone level xp currentStreak strength intelligence charisma endurance creativity preferences").lean()
         );
 
         if (userError) {
@@ -339,6 +340,8 @@ export default {
 
         checkAchievements(context.id).catch(() => {});
 
+        logEvent({ name: "ai_quest_created", userId: context.id, tier: userTier, props: { mode: "ai" } });
+
         const [mgFetchError, createdMiniGoals] = await catchError(
           MiniGoal.find({ shardId: newShard._id }, "title tasks dueDate").lean()
         );
@@ -379,7 +382,7 @@ export default {
         // Free plan: cap active quests. Counts all active+paused Shards so the
         // manual path can't be used to bypass the createShard cap.
         const [capUserErr, capUser] = await catchError(
-          User.findById(context.id, "subscriptionTier role").lean()
+          User.findById(context.id, "subscriptionTier role trialEndsAt").lean()
         );
         if (!capUserErr && tierOf(capUser as any) === 'free') {
           const activeCount = await countActiveShards(context.id);
@@ -524,6 +527,8 @@ export default {
           task: "Created Shard Manually",
           details: `Created quest: ${newShard.title}`,
         });
+
+        logEvent({ name: "ai_quest_created", userId: context.id, props: { mode: "manual" } });
 
         // Fetch created mini-goals to return as preview
         const [mgFetchErr, createdMGs] = await catchError(
@@ -1155,8 +1160,8 @@ export default {
       }
 
       const { canMakeCoachAICall, incrementCoachAICounter, generateInactivityNudge, COACH_TEMPLATES } = await import("../../Helpers/AIHelper.js");
-      const [userErr, user] = await catchError(User.findById(context.id).select("subscriptionTier").lean());
-      const isPro = !userErr && (user as any)?.subscriptionTier === "pro";
+      const [userErr, user] = await catchError(User.findById(context.id).select("subscriptionTier role trialEndsAt").lean());
+      const isPro = !userErr && tierOf(user as any) === "pro";
 
       const staleDays = shard.lastActivityAt
         ? Math.floor((Date.now() - new Date(shard.lastActivityAt).getTime()) / 86400000)
@@ -1568,14 +1573,14 @@ export default {
         return { success: false, message: "Only the quest owner can regenerate the plan." };
 
       const [userError, user] = await catchError(
-        User.findById(context.id, "role subscriptionTier username bio level xp currentStreak strength intelligence charisma endurance creativity preferences").lean()
+        User.findById(context.id, "role subscriptionTier trialEndsAt username bio level xp currentStreak strength intelligence charisma endurance creativity preferences").lean()
       );
       if (userError || !user) return { success: false, message: "Failed to verify user." };
 
       const u = user as any;
       let usageCheck = { canProceed: true, limit: -1, used: 0, remaining: -1 };
       if (u?.role !== 'admin') {
-        const tier = u?.subscriptionTier || 'free';
+        const tier = tierOf(u);
         usageCheck = await checkAIUsage(context.id, tier);
         if (!usageCheck.canProceed)
           return { success: false, message: "You've reached your AI limit. Upgrade to Pro for unlimited AI!", needsUpgrade: true };
@@ -1651,10 +1656,10 @@ export default {
     async getAIUsage(_, __, context) {
       if (!context.id) ThrowError("Please login to continue.");
       const [userError, user] = await catchError(
-        User.findById(context.id, "subscriptionTier").lean()
+        User.findById(context.id, "subscriptionTier role trialEndsAt").lean()
       );
       if (userError || !user) return { success: false, remaining: 0, limit: 0, canProceed: false };
-      const tier = (user as any)?.subscriptionTier || 'free';
+      const tier = tierOf(user as any);
       const usage = await checkAIUsage(context.id, tier);
       return {
         success: true,

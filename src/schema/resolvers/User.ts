@@ -19,12 +19,15 @@ import { verifyGoogleToken, generateUsernameFromGoogle } from "../../Helpers/Goo
 import { moderate } from "../../Helpers/ContentModerator.js";
 import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
 import { enqueueEmail } from "../../Helpers/Queue.js";
+import { FREE_MONTHLY_CREDITS, TRIAL_DURATION_DAYS, isInTrial } from "../../Helpers/Entitlements.js";
+import { logEvent } from "../../Helpers/Telemetry.js";
+import { generateReferralCode, applyReferral } from "../../Helpers/Referral.js";
 
 export default {
   Mutation: {
     // Sign up with password
     async signup(_, { input }) {
-      const { email, password, username } = input;
+      const { email, password, username, referralCode } = input;
 
       // Moderate username at signup
       const signupMod = moderate(username, 'public_profile');
@@ -78,6 +81,9 @@ export default {
       // Generate default avatar URL
       const defaultAvatarUrl = `https://ui-avatars.com/api/?name=${encodeURIComponent(username)}&background=667eea&color=fff&size=150`;
 
+      // Own referral code (so this user can invite others)
+      const ownReferralCode = await generateReferralCode();
+
       // Create new user
       const [createError, newUser] = await catchError(
         User.create({
@@ -85,6 +91,7 @@ export default {
           username,
           passwordHash,
           emailHash,
+          referralCode: ownReferralCode,
           profilePic: defaultAvatarUrl,
           emailVerified: false,
           role: "user",
@@ -102,7 +109,10 @@ export default {
           achievements: [],
           pendingAchievements: [],
           // Initialize AI credits (free tier)
-          aiCredits: 100,
+          aiCredits: FREE_MONTHLY_CREDITS,
+          // 7-day Pro trial
+          trialStartedAt: new Date(),
+          trialEndsAt: new Date(Date.now() + TRIAL_DURATION_DAYS * 24 * 60 * 60 * 1000),
           // Initialize preferences
           preferences: {
             workloadLevel: 'medium',
@@ -142,6 +152,12 @@ export default {
         task: "Signed up",
         details: `New user registered (emailHash: ${emailHash.slice(0, 8)}…)`,
       });
+
+      logEvent({ name: "signup", userId: newUser._id.toString(), tier: "free", props: { provider: "email" } });
+      logEvent({ name: "trial_started", userId: newUser._id.toString(), tier: "pro", props: { days: TRIAL_DURATION_DAYS } });
+
+      // Reward both sides if they signed up with a valid referral code.
+      await applyReferral(newUser._id.toString(), referralCode).catch(() => {});
 
       return {
         success: true,
@@ -569,7 +585,7 @@ export default {
      * @param idToken - Google ID token from the client
      * @returns Authentication response with tokens and user data
      */
-    async googleSignIn(_, { idToken }) {
+    async googleSignIn(_, { idToken, referralCode }) {
       try {
         // Input validation
         if (!idToken || typeof idToken !== 'string') {
@@ -633,8 +649,10 @@ export default {
           // New user - create account
           const username = generateUsernameFromGoogle(googleUser.email, googleUser.name);
           console.log("username", username);
-          
+
+          const googleReferralCode = await generateReferralCode();
           const newUserData = {
+            referralCode: googleReferralCode,
             email: googleUser.email.toLowerCase(),
             emailHash: createHash('sha256').update(googleUser.email.toLowerCase()).digest('hex'),
             username,
@@ -655,6 +673,9 @@ export default {
             streaks: 0,
             achievements: [],
             pendingAchievements: [],
+            // 7-day Pro trial
+            trialStartedAt: new Date(),
+            trialEndsAt: new Date(Date.now() + TRIAL_DURATION_DAYS * 24 * 60 * 60 * 1000),
           };
 
           const [createError, newUser] = await catchError(User.create(newUserData));
@@ -673,6 +694,12 @@ console.log("newUser", newUser);
             task: 'Signed up with Google',
             details: `New user signed up with Google: ${googleUser.email}`,
           });
+
+          logEvent({ name: "signup", userId: user._id.toString(), tier: "free", props: { provider: "google" } });
+          logEvent({ name: "trial_started", userId: user._id.toString(), tier: "pro", props: { days: TRIAL_DURATION_DAYS } });
+
+          // Reward both sides if this Google signup used a referral code.
+          await applyReferral(user._id.toString(), referralCode).catch(() => {});
         }
 
         // Generate authentication tokens
@@ -750,7 +777,7 @@ console.log("newUser", newUser);
         async () => {
           const [error, userData] = await catchError(
             User.findById(context.id)
-              .select("email username bio profilePic role emailVerified xp level achievements pendingAchievements strength intelligence charisma endurance creativity authProvider subscriptionTier preferences currentStreak longestStreak birthdate timezone aiCredits")
+              .select("email username bio profilePic role emailVerified xp level achievements pendingAchievements strength intelligence charisma endurance creativity authProvider subscriptionTier trialEndsAt referralCode referralCount preferences currentStreak longestStreak birthdate timezone aiCredits")
               .lean()
           );
 
@@ -785,6 +812,10 @@ console.log("newUser", newUser);
           authProvider: user.authProvider,
           pendingAchievements: user.pendingAchievements || [],
           subscriptionTier: user.subscriptionTier,
+          trialEndsAt: user.trialEndsAt ? new Date(user.trialEndsAt).toISOString() : null,
+          isInTrial: isInTrial(user as any),
+          referralCode: user.referralCode,
+          referralCount: user.referralCount || 0,
           preferences: user.preferences,
           currentStreak: user.currentStreak || 0,
           longestStreak: user.longestStreak || 0,

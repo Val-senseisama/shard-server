@@ -3,7 +3,8 @@ import mongoose from "mongoose";
 import { User } from "../models/User.js";
 import SubscriptionHistory from "../models/SubscriptionHistory.js";
 import { logError } from "../Helpers/Helpers.js";
-import { FREE_MONTHLY_CREDITS } from "../Helpers/Entitlements.js";
+import { FREE_MONTHLY_CREDITS, eventMatchesEntitlement } from "../Helpers/Entitlements.js";
+import { logEvent } from "../Helpers/Telemetry.js";
 
 export const handleRevenueCatWebhook = async (req: Request, res: Response) => {
   // Fail CLOSED — if the secret is missing from env, reject all requests
@@ -18,7 +19,7 @@ export const handleRevenueCatWebhook = async (req: Request, res: Response) => {
   const { event } = req.body;
   if (!event) return res.status(400).send("No event data");
 
-  const { type, app_user_id, price_in_purchased_currency, currency, transaction_id } = event;
+  const { type, app_user_id, price_in_purchased_currency, currency, transaction_id, entitlement_ids, entitlement_id } = event;
 
   // Validate app_user_id is a real MongoDB ObjectId before querying
   if (!app_user_id || !mongoose.isValidObjectId(app_user_id)) {
@@ -54,6 +55,18 @@ export const handleRevenueCatWebhook = async (req: Request, res: Response) => {
         return res.status(200).send("Event type not handled");
     }
 
+    // For grants (purchase/renewal), verify the event concerns OUR entitlement
+    // before unlocking Pro — a purchase of some other product must not grant access.
+    if ((action === "PURCHASE" || action === "RENEWAL") && tier !== "free") {
+      if (!eventMatchesEntitlement(entitlement_ids, entitlement_id)) {
+        logError("RevenueCatWebhook", "Entitlement id mismatch — not granting Pro", {
+          severity: "medium",
+          metadata: { app_user_id, entitlement_ids, entitlement_id },
+        });
+        return res.status(200).send("OK (entitlement not recognized)");
+      }
+    }
+
     if (user.subscriptionTier !== tier) {
       const userUpdate: Record<string, any> = { subscriptionTier: tier };
       // Reset credits to free-tier allowance when a sub expires back to free
@@ -70,6 +83,16 @@ export const handleRevenueCatWebhook = async (req: Request, res: Response) => {
       paymentId: transaction_id,
       timestamp: new Date(),
     });
+
+    // Authoritative purchase signal for the revenue funnel (a new paid subscription).
+    if (action === "PURCHASE") {
+      logEvent({
+        name: "subscription_activated",
+        userId: String(app_user_id),
+        tier,
+        props: { amount: price_in_purchased_currency || 0, currency: currency || "USD" },
+      });
+    }
 
     res.status(200).send("OK");
   } catch (error) {

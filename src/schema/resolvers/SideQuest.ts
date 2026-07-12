@@ -68,7 +68,7 @@ export default {
 
       // AI credit gate — side quests cost 1 credit for free users, unlimited for Pro
       const [tierErr, sqUser] = await catchError(
-        User.findById(context.id, "subscriptionTier role").lean()
+        User.findById(context.id, "subscriptionTier role trialEndsAt").lean()
       );
       const sqTier = tierOf(sqUser as any);
       if (sqTier === "free") {

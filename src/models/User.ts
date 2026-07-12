@@ -1,4 +1,4 @@
-import mongoose, { Schema, Document } from "mongoose";
+import mongoose, { Schema, Document, Types } from "mongoose";
 
 // Define the TypeScript interface for User
 export interface IUser extends Document {
@@ -39,6 +39,13 @@ export interface IUser extends Document {
   // Progression
   xp: number;
   aiCredits: number;
+  trialStartedAt?: Date;
+  trialEndsAt?: Date;
+  trialReminderSent?: boolean;
+  // Referral loop
+  referralCode?: string;
+  referredBy?: Types.ObjectId;
+  referralCount: number;
   level: number;
   streaks: number; // Legacy field - kept for backward compatibility
   
@@ -190,7 +197,36 @@ const UserSchema: Schema<IUser> = new Schema(
     },
     aiCredits: {
         type: Number,
-        default: 100
+        // Keep in sync with FREE_MONTHLY_CREDITS in Helpers/Entitlements.ts.
+        // Hardcoded (not imported) to avoid a circular import at model-eval time.
+        default: 15
+    },
+    // 7-day Pro trial granted at signup. Entitlement is computed on read
+    // (trialEndsAt > now) in Helpers/Entitlements.ts — no expiry cron needed.
+    trialStartedAt: {
+        type: Date
+    },
+    trialEndsAt: {
+        type: Date
+    },
+    // Set once when the "trial ending soon" reminder is sent (idempotency).
+    trialReminderSent: {
+        type: Boolean,
+        default: false
+    },
+    // Referral loop
+    referralCode: {
+        type: String,
+        unique: true,
+        sparse: true
+    },
+    referredBy: {
+        type: Schema.Types.ObjectId,
+        ref: "User"
+    },
+    referralCount: {
+        type: Number,
+        default: 0
     },
     level: { 
         type: Number,

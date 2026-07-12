@@ -92,7 +92,7 @@ export default {
 
       // Advanced analytics are Pro-only
       const [tierErr, anUser] = await catchError(
-        User.findById(context.id, "subscriptionTier role").lean()
+        User.findById(context.id, "subscriptionTier role trialEndsAt").lean()
       );
       if (tierOf(anUser as any) === "free") {
         return {

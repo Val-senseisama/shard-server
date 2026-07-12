@@ -729,7 +729,7 @@ export default {
 
       // AI credit gate — chat summaries cost 1 credit for free users, unlimited for Pro
       const [tierErr, sumUser] = await catchError(
-        User.findById(context.id, "subscriptionTier role").lean()
+        User.findById(context.id, "subscriptionTier role trialEndsAt").lean()
       );
       const sumTier = tierOf(sumUser as any);
       if (sumTier === "free") {

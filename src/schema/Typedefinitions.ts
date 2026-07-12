@@ -75,7 +75,7 @@ export default `#graphql
     login(email: String!, password: String!): AuthResponse!
     requestLoginCode(email: String!): MessageResponse!
     verifyLoginCode(email: String!, code: String!): AuthResponse!
-    googleSignIn(idToken: String!): AuthResponse!
+    googleSignIn(idToken: String!, referralCode: String): AuthResponse!
     logout: MessageResponse!
     updateProfile(input: UpdateProfileInput!): ProfileResponse!
     changePassword(currentPassword: String!, newPassword: String!): MessageResponse!
@@ -172,6 +172,7 @@ export default `#graphql
     email: String!
     username: String!
     password: String!
+    referralCode: String
   }
 
   input UpdateProfileInput {
@@ -222,6 +223,10 @@ export default `#graphql
     isNewUser: Boolean
     preferences: UserPreferences
     subscriptionTier: String
+    trialEndsAt: String
+    isInTrial: Boolean
+    referralCode: String
+    referralCount: Int
     pendingAchievements: [String]
     birthdate: String
     timezone: String
@@ -1461,5 +1466,62 @@ export default `#graphql
   }
   extend type Query {
     getQuestAIChat(shardId: ID!): QuestAIChatResponse!
+  }
+
+  # ── Product analytics (revenue funnel) ──
+  input TrackEventInput {
+    name: String!
+    source: String
+    props: JSON
+    platform: String
+    anonId: String
+  }
+  type SourceCount {
+    source: String!
+    count: Int!
+  }
+  type FunnelStatsResponse {
+    success: Boolean!
+    days: Int!
+    signups: Int!
+    activations: Int!
+    trialsStarted: Int!
+    referralsCompleted: Int!
+    paywallImpressions: Int!
+    upgradeTaps: Int!
+    purchasesCompleted: Int!
+    subscriptionsActivated: Int!
+    activationRate: Float!
+    trialConversionRate: Float!
+    impressionToTapRate: Float!
+    tapToPurchaseRate: Float!
+    impressionToPurchaseRate: Float!
+    impressionsBySource: [SourceCount!]!
+  }
+  extend type Mutation {
+    trackEvent(input: TrackEventInput!): MessageResponse!
+  }
+  extend type Query {
+    getFunnelStats(days: Int): FunnelStatsResponse!
+  }
+
+  # ── Leaderboard ──
+  type LeaderboardEntry {
+    id: ID!
+    username: String!
+    profilePic: String
+    xp: Int!
+    level: Int!
+    rank: Int!
+    isMe: Boolean!
+  }
+  type LeaderboardResponse {
+    success: Boolean!
+    scope: String!
+    myRank: Int
+    entries: [LeaderboardEntry!]!
+  }
+  extend type Query {
+    getLeaderboard(scope: String, limit: Int): LeaderboardResponse!
   }
 `;

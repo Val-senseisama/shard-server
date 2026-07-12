@@ -26,6 +26,7 @@ import Analytics from "../../models/Analytics.js";
 import { checkAIUsage, trackAIUsage, breakDownGoalWithAI } from "../../Helpers/AIHelper.js";
 import AnalyticsResolvers from "./Analytics.js";
 import SideQuestResolvers from "./SideQuest.js";
+import ShardResolvers from "./Shard.js";
 
 const ctx = (id = "u1") => ({ id });
 const asUser = (doc: any) => ({ lean: () => Promise.resolve(doc) }) as any;
@@ -47,6 +48,21 @@ describe("getProductivityData — advanced analytics is Pro-only", () => {
     const res: any = await AnalyticsResolvers.Query.getProductivityData({}, {}, ctx());
     expect(res.success).toBe(true);
     expect(res.needsUpgrade).toBeUndefined();
+  });
+});
+
+describe("createShard (AI) — the money screen: credit gate", () => {
+  it("refuses a free user at 0 credits with an upgrade payload and never calls the AI", async () => {
+    vi.mocked(User.findById).mockReturnValue(asUser({ subscriptionTier: "free", role: "user" }));
+    vi.mocked(Shard.countDocuments).mockResolvedValue(0 as any); // under the 3-quest cap
+    vi.mocked(checkAIUsage).mockResolvedValue({ canProceed: false, limit: 0, used: 0, remaining: 0 });
+    const res: any = await ShardResolvers.Mutation.createShard(
+      {}, { goal: "learn guitar" }, ctx()
+    );
+    expect(res.needsUpgrade).toBe(true);
+    expect(res.success).toBe(false);
+    expect(breakDownGoalWithAI).not.toHaveBeenCalled();
+    expect(trackAIUsage).not.toHaveBeenCalled();
   });
 });
 
