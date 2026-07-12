@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import { User } from "../models/User.js";
 import SubscriptionHistory from "../models/SubscriptionHistory.js";
 import { logError } from "../Helpers/Helpers.js";
+import { FREE_MONTHLY_CREDITS } from "../Helpers/Entitlements.js";
 
 export const handleRevenueCatWebhook = async (req: Request, res: Response) => {
   // Fail CLOSED — if the secret is missing from env, reject all requests
@@ -56,7 +57,7 @@ export const handleRevenueCatWebhook = async (req: Request, res: Response) => {
     if (user.subscriptionTier !== tier) {
       const userUpdate: Record<string, any> = { subscriptionTier: tier };
       // Reset credits to free-tier allowance when a sub expires back to free
-      if (tier === "free") userUpdate.aiCredits = 100;
+      if (tier === "free") userUpdate.aiCredits = FREE_MONTHLY_CREDITS;
       await User.findByIdAndUpdate(app_user_id, userUpdate);
     }
 

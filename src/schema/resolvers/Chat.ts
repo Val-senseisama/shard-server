@@ -14,7 +14,8 @@ import { createNotification } from "./Notifications.js";
 import { User } from "../../models/User.js";
 import { enqueuePushNotification } from "../../Helpers/Queue.js";
 import { moderate } from "../../Helpers/ContentModerator.js";
-import { generateChatSummary } from "../../Helpers/AIHelper.js";
+import { generateChatSummary, checkAIUsage, trackAIUsage } from "../../Helpers/AIHelper.js";
+import { tierOf } from "../../Helpers/Entitlements.js";
 import { Types } from "mongoose";
 
 const cacheInvalidateChat = cacheInvalidate.chat;
@@ -726,7 +727,26 @@ export default {
         .map((m: any) => `${m.sender?.username || "User"}: ${m.content}`)
         .join("\n");
 
+      // AI credit gate — chat summaries cost 1 credit for free users, unlimited for Pro
+      const [tierErr, sumUser] = await catchError(
+        User.findById(context.id, "subscriptionTier role").lean()
+      );
+      const sumTier = tierOf(sumUser as any);
+      if (sumTier === "free") {
+        const usage = await checkAIUsage(context.id, sumTier);
+        if (!usage.canProceed) {
+          return {
+            success: false,
+            message: "You're out of AI credits. Upgrade to Pro for unlimited AI summaries!",
+            needsUpgrade: true,
+          };
+        }
+      }
+
       const summaryContent = await generateChatSummary(messageHistory, shardTitle, shardProgress);
+
+      // Deduct one credit only after a successful AI call
+      if (sumTier === "free") await trackAIUsage(context.id, sumTier).catch(() => {});
 
       const [senderErr, sender] = await catchError(
         User.findById(context.id).select("username profilePic").lean()

@@ -663,6 +663,7 @@ export default `#graphql
     success: Boolean!
     message: String!
     messageData: MessageData
+    needsUpgrade: Boolean
   }
 
   type ChatResponse {
@@ -855,6 +856,7 @@ export default `#graphql
     needsToComplete: Boolean
     activeShardsCount: Int
     existingSideQuest: ExistingSideQuest
+    needsUpgrade: Boolean
   }
 
   type ExistingSideQuest {
@@ -933,6 +935,7 @@ export default `#graphql
     insights: [String!]!
     struggleAreas: [String!]!
     averageCompletionRate: Float!
+    needsUpgrade: Boolean
   }
 
   type StatsData {

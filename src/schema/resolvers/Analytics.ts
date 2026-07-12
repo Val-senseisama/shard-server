@@ -8,6 +8,7 @@ import Shard from "../../models/Shard.js";
 import MiniGoal from "../../models/MiniGoal.js";
 import { cache } from "../../Helpers/Cache.js";
 import { generateProductivityInsights } from "../../Helpers/AIHelper.js";
+import { tierOf } from "../../Helpers/Entitlements.js";
 import { User } from "../../models/User.js";
 
 /**
@@ -88,6 +89,23 @@ export default {
   Query: {
     async getProductivityData(_, __, context) {
       if (!context.id) ThrowError("Please login to continue.");
+
+      // Advanced analytics are Pro-only
+      const [tierErr, anUser] = await catchError(
+        User.findById(context.id, "subscriptionTier role").lean()
+      );
+      if (tierOf(anUser as any) === "free") {
+        return {
+          success: false,
+          message: "Advanced analytics are a Pro feature. Upgrade to unlock your productivity insights!",
+          needsUpgrade: true,
+          weeklyData: [],
+          monthlyData: [],
+          insights: [],
+          struggleAreas: [],
+          averageCompletionRate: 0,
+        };
+      }
 
       const analytics = await cache.getOrSet(
         `analytics:${context.id}`,

@@ -7,7 +7,9 @@ import {
 import SideQuest from "../../models/SideQuest.js";
 import Shard from "../../models/Shard.js";
 import { awardXP } from "./XP.js";
-import { breakDownGoalWithAI } from "../../Helpers/AIHelper.js";
+import { breakDownGoalWithAI, checkAIUsage, trackAIUsage } from "../../Helpers/AIHelper.js";
+import { tierOf, upgradeError } from "../../Helpers/Entitlements.js";
+import { User } from "../../models/User.js";
 import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
 
 export default {
@@ -64,11 +66,26 @@ export default {
         };
       }
 
+      // AI credit gate — side quests cost 1 credit for free users, unlimited for Pro
+      const [tierErr, sqUser] = await catchError(
+        User.findById(context.id, "subscriptionTier role").lean()
+      );
+      const sqTier = tierOf(sqUser as any);
+      if (sqTier === "free") {
+        const usage = await checkAIUsage(context.id, sqTier);
+        if (!usage.canProceed) {
+          return upgradeError("You're out of AI credits. Upgrade to Pro for unlimited AI!");
+        }
+      }
+
       // Generate AI side quest
       const goal = `Create a single side quest challenge related to ${category || "productivity"}. Make it achievable in 1-3 days.`;
 
       try {
         const questBreakdown = await breakDownGoalWithAI(goal);
+
+        // Deduct one credit only after a successful AI call
+        if (sqTier === "free") await trackAIUsage(context.id, sqTier).catch(() => {});
 
         // Use the first mini-quest as the side quest, fall back to main quest
         const sideQuestData = (questBreakdown.miniQuests && questBreakdown.miniQuests.length > 0)

@@ -9,6 +9,7 @@ import MiniGoal from "../../models/MiniGoal.js";
 import Chat, { Message } from "../../models/Chat.js";
 import { User } from "../../models/User.js";
 import { breakDownGoalWithAI, checkAIUsage, trackAIUsage, enrichManualShard, UserContext } from "../../Helpers/AIHelper.js";
+import { tierOf, countActiveShards, upgradeError, FREE_ACTIVE_SHARD_CAP } from "../../Helpers/Entitlements.js";
 import { enqueueReflectionMission } from "../../Helpers/CronJobs.js";
 import { moderate } from "../../Helpers/ContentModerator.js";
 import SideQuest from "../../models/SideQuest.js";
@@ -118,8 +119,17 @@ export default {
           return { success: false, message: "Failed to verify user." };
         }
 
+        // Free plan: cap active quests (counts active + paused, both create paths).
+        // Checked before the AI call so a blocked user never spends a credit.
+        const userTier: "free" | "pro" = tierOf(user as any);
+        if (userTier === 'free') {
+          const activeCount = await countActiveShards(context.id);
+          if (activeCount >= FREE_ACTIVE_SHARD_CAP) {
+            return upgradeError("Free plan is limited to 3 active quests. Upgrade to Pro for unlimited quests!");
+          }
+        }
+
         // Check AI credit limit before spending time on validation
-        const userTier: "free" | "pro" = (user as any)?.subscriptionTier === 'pro' ? 'pro' : 'free';
         let usageCheck = { canProceed: true, limit: -1, used: 0, remaining: -1 };
         if (user?.role !== 'admin') {
           usageCheck = await checkAIUsage(context.id, userTier);
@@ -366,6 +376,18 @@ export default {
       if (!context.id) ThrowError("Please login to continue.");
 
       try {
+        // Free plan: cap active quests. Counts all active+paused Shards so the
+        // manual path can't be used to bypass the createShard cap.
+        const [capUserErr, capUser] = await catchError(
+          User.findById(context.id, "subscriptionTier role").lean()
+        );
+        if (!capUserErr && tierOf(capUser as any) === 'free') {
+          const activeCount = await countActiveShards(context.id);
+          if (activeCount >= FREE_ACTIVE_SHARD_CAP) {
+            return upgradeError("Free plan is limited to 3 active quests. Upgrade to Pro for unlimited quests!");
+          }
+        }
+
         // Create shard immediately with default rewards — enrich with AI in background
         const [shardError, newShard] = await catchError(
           Shard.create({
