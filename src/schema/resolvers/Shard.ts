@@ -1878,6 +1878,8 @@ export default {
                 title: task.title,
                 dueDate: dueDateValue.getTime().toString(), // Return as timestamp string
                 completed: task.completed,
+                // Lets the client know whether the undo window is still open.
+                completedAt: task.completedAt ? new Date(task.completedAt).getTime().toString() : null,
                 xpReward: task.xpReward || 20,
                 miniGoalId: mg._id.toString(),
                 miniGoalTitle: mg.title,
@@ -1995,6 +1997,8 @@ export default {
                 title: task.title,
                 dueDate: dueDateValue.getTime().toString(), // Return as timestamp string
                 completed: task.completed,
+                // Lets the client know whether the undo window is still open.
+                completedAt: task.completedAt ? new Date(task.completedAt).getTime().toString() : null,
                 xpReward: task.xpReward || 20,
                 miniGoalId: mg._id.toString(),
                 miniGoalTitle: mg.title,

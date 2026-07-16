@@ -128,6 +128,7 @@ export default `#graphql
     
     # XP mutations
     completeTask(shardId: ID!, miniGoalId: ID!, taskIndex: Int!): CompleteTaskResponse!
+    uncompleteTask(shardId: ID!, miniGoalId: ID!, taskIndex: Int!): CompleteTaskResponse!
     clearPendingAchievements: MessageResponse!
     
     # Team mutations
@@ -520,6 +521,7 @@ export default `#graphql
     title: String!
     dueDate: String
     completed: Boolean!
+    completedAt: String
     xpReward: Int
     miniGoalId: ID
     miniGoalTitle: String

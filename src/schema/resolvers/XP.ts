@@ -369,7 +369,8 @@ export async function completeTask(userId: string, shardId: string, miniGoalId: 
 
   // Mark task as complete
   tasks[taskIndex].completed = true;
-  
+  tasks[taskIndex].completedAt = new Date();
+
   // Calculate completed tasks
   const completedCount = tasks.filter(t => t.completed).length;
   const progress = Math.floor((completedCount / tasks.length) * 100);
@@ -470,7 +471,15 @@ export async function completeTask(userId: string, shardId: string, miniGoalId: 
 
   // Award XP (20 XP per task - will be multiplied by awardXP if comeback bonus active)
   const xpResult = await awardXP(userId, 20, `Task in ${minigoal.title}`);
-  
+
+  // Record what was ACTUALLY paid out, so uncompleteTask can claw back the
+  // exact amount rather than guessing at the bonus multiplier.
+  const xpAwarded = Math.floor(20 * (xpResult?.bonusMultiplier ?? 1));
+  await MiniGoal.updateOne(
+    { _id: miniGoalId },
+    { $set: { [`tasks.${taskIndex}.xpAwarded`]: xpAwarded } }
+  );
+
   // Historical streak tracking widget update
   await updateStreak(userId, "task_completion");
 
@@ -486,12 +495,135 @@ export async function completeTask(userId: string, shardId: string, miniGoalId: 
   };
 }
 
+/** How long after completing a task you can still take it back. */
+export const UNDO_WINDOW_MINUTES = 5;
+
+/**
+ * Undo a task completion — for mis-taps, not for farming.
+ *
+ * Deliberate scope:
+ *  - XP IS clawed back, exactly (we stored `xpAwarded`, so the comeback-bonus
+ *    multiplier is accounted for). Without this, complete→undo→complete would
+ *    be an infinite XP loop.
+ *  - The STREAK IS NOT reverted. A streak answers "did you show up today", and
+ *    you did — you just mis-tapped one task. Unwinding it correctly is also
+ *    unsound: several completions on the same day each overwrite
+ *    `previousStreak`, so there's no reliable value to roll back to.
+ *  - ACHIEVEMENTS ARE NOT revoked. They're permanent by design and there is no
+ *    revocation path; taking a badge away over a mis-tap is worse than keeping it.
+ */
+export async function uncompleteTask(userId: string, shardId: string, miniGoalId: string, taskIndex: number) {
+  const [error, minigoal] = await catchError(MiniGoal.findById(miniGoalId).lean());
+
+  if (error || !minigoal || minigoal.shardId.toString() !== shardId) {
+    return { success: false, message: "Task not found.", xpEarned: 0, achievements: [] };
+  }
+
+  const [shardError, shard] = await catchError(Shard.findById(shardId).lean());
+  if (shardError || !shard) {
+    return { success: false, message: "Shard not found.", xpEarned: 0, achievements: [] };
+  }
+
+  const isOwner = shard.owner.toString() === userId;
+  const isCollaborator = shard.participants.some(
+    (p: any) => p.user.toString() === userId && p.role === "collaborator"
+  );
+  if (!isOwner && !isCollaborator) {
+    return {
+      success: false,
+      message: "You don't have permission to change tasks in this shard.",
+      xpEarned: 0,
+      achievements: [],
+    };
+  }
+
+  const tasks = minigoal.tasks;
+  if (taskIndex < 0 || taskIndex >= tasks.length) {
+    return { success: false, message: "Invalid task.", xpEarned: 0, achievements: [] };
+  }
+
+  const task = tasks[taskIndex];
+  if (!task.completed) {
+    return { success: true, message: "Task is not completed.", xpEarned: 0, achievements: [] };
+  }
+
+  // The undo window. Tasks completed before this feature shipped have no
+  // `completedAt` — treat those as out of window rather than granting a
+  // retroactive undo on historical data.
+  const completedAt = task.completedAt ? new Date(task.completedAt) : null;
+  const ageMs = completedAt ? Date.now() - completedAt.getTime() : Infinity;
+  if (ageMs > UNDO_WINDOW_MINUTES * 60 * 1000) {
+    return {
+      success: false,
+      message: `Tasks can only be undone within ${UNDO_WINDOW_MINUTES} minutes of completing them.`,
+      xpEarned: 0,
+      achievements: [],
+    };
+  }
+
+  // Revert the task
+  tasks[taskIndex].completed = false;
+  tasks[taskIndex].completedAt = undefined;
+  const clawback = task.xpAwarded ?? task.xpReward ?? 20;
+  tasks[taskIndex].xpAwarded = undefined;
+
+  const completedCount = tasks.filter((t) => t.completed).length;
+  const progress = Math.floor((completedCount / tasks.length) * 100);
+
+  await MiniGoal.findByIdAndUpdate(miniGoalId, {
+    tasks,
+    progress,
+    completed: progress === 100,
+  });
+
+  // Roll the parent shard's progress back too
+  const [allMgError, allMiniGoals] = await catchError(MiniGoal.find({ shardId }).lean());
+  if (!allMgError && allMiniGoals && allMiniGoals.length > 0) {
+    const totalProgress = allMiniGoals.reduce((sum: number, mg: any) => sum + mg.progress, 0);
+    await Shard.findByIdAndUpdate(shardId, {
+      "progress.completion": Math.floor(totalProgress / allMiniGoals.length),
+      lastActivityAt: new Date(),
+    });
+  }
+
+  // Claw back the XP, never below zero, and recompute the level from the result.
+  const [userError, rawUser] = await catchError(User.findById(userId).select("xp level").lean());
+  const user = rawUser as any;
+  let newXP = 0;
+  let newLevel = 1;
+  if (!userError && user) {
+    newXP = Math.max(0, (user.xp || 0) - clawback);
+    newLevel = calculateLevel(newXP);
+    await User.findByIdAndUpdate(userId, { $set: { xp: newXP, level: newLevel } });
+    await cacheInvalidate.user(userId);
+    SaveAuditTrail({
+      userId,
+      task: "Task Undone",
+      details: `Task in ${minigoal.title} undone; ${clawback} XP reclaimed`,
+    });
+  }
+
+  return {
+    success: true,
+    message: "Task undone.",
+    xpEarned: -clawback,
+    xpResult: { newXP, newLevel, leveledUp: false, bonusMultiplier: 1 },
+    achievements: [],
+  };
+}
+
 export default {
   Mutation: {
     // Complete task and award XP
     async completeTask(_, { shardId, miniGoalId, taskIndex }, context) {
       if (!context.id) ThrowError("Please login to continue.");
       return await completeTask(context.id, shardId, miniGoalId, taskIndex);
+    },
+
+    // Undo a task completion within the undo window, clawing the XP back
+    async uncompleteTask(_, { shardId, miniGoalId, taskIndex }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+      return await uncompleteTask(context.id, shardId, miniGoalId, taskIndex);
     },
 
     // Clear the pending achievements queue after the client has shown them

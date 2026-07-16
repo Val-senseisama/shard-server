@@ -5,6 +5,10 @@ interface Task {
   dueDate?: Date;
   completed: boolean;
   xpReward?: number;
+  // Undo support: when it was completed, and how much XP it ACTUALLY paid out
+  // (the comeback bonus multiplies the base reward, so we can't re-derive it).
+  completedAt?: Date;
+  xpAwarded?: number;
   // Soft delete
   deleted: boolean;
   deletedAt?: Date;
@@ -37,6 +41,8 @@ const TaskSchema = new Schema<Task>(
     dueDate: Date,
     completed: { type: Boolean, default: false },
     xpReward: { type: Number, default: 20 },
+    completedAt: Date,
+    xpAwarded: Number,
     // Soft delete
     deleted: { type: Boolean, default: false },
     deletedAt: Date,
