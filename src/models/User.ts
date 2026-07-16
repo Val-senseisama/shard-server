@@ -56,6 +56,7 @@ export interface IUser extends Document {
   streakFreezeTokens: number;
   comebackBonusUntil?: Date;
   previousStreak: number;
+  streakNudgeSentAt?: Date;
 
   subscriptionTier: 'free' | 'pro' | 'enterprise';
 
@@ -250,6 +251,7 @@ const UserSchema: Schema<IUser> = new Schema(
     streakFreezeTokens: { type: Number, default: 1 },
     comebackBonusUntil: Date,
     previousStreak: { type: Number, default: 0 },
+    streakNudgeSentAt: Date,
 
     achievements: {
          type: [String],

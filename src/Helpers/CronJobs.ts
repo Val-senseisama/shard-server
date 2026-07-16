@@ -5,7 +5,7 @@ import Shard from '../models/Shard.js';
 import { User } from '../models/User.js';
 import { logError } from './Helpers.js';
 import { createNotification } from '../schema/resolvers/Notifications.js';
-import { sendNotificationToUser, sendNotificationToTokens } from './FirebaseMessaging.js';
+import { sendNotificationToUser, sendNotificationToTokens, channelForType, localHour, dateKeyInZone, getUnreadBadgeCount } from './FirebaseMessaging.js';
 import Notification from '../models/Notifications.js';
 import NotificationPreference from '../models/NotificationPreferences.js';
 import { sendEmailToUser } from './ResendEmail.js';
@@ -39,6 +39,7 @@ const SCHEDULED_JOBS = [
   { name: 'overdue-alerts',           pattern: '0 9 * * *'   },
   { name: 'inactivity-nudger',        pattern: '0 10 * * *'  },
   { name: 'streak-event-detector',    pattern: '0 11 * * *'  },
+  { name: 'streak-expiring-nudge',    pattern: '0 * * * *'   },
   { name: 'notification-dispatcher',  pattern: '*/5 * * * *' },
   { name: 'monthly-credit-refill',    pattern: '0 0 1 * *'   },
   { name: 'trial-ending-reminders',   pattern: '0 12 * * *'  },
@@ -74,6 +75,7 @@ const worker = new Worker('shard-jobs', async (job: Job) => {
     case 'overdue-alerts':           return runOverdueAlerts();
     case 'inactivity-nudger':        return runInactivityNudger();
     case 'streak-event-detector':    return runStreakEventDetector();
+    case 'streak-expiring-nudge':    return runStreakExpiringNudge();
     case 'notification-dispatcher':  return runNotificationDispatcher();
     case 'monthly-credit-refill':    return runMonthlyCreditRefill();
     case 'trial-ending-reminders':   return runTrialEndingReminders();
@@ -321,11 +323,16 @@ async function runNotificationDispatcher() {
       const tokens = ((user as any)?.pushTokens ?? []).map((t: any) => t.token).filter(Boolean);
 
       if (tokens.length > 0) {
-        await sendNotificationToTokens(tokens, {
-          title: 'Shard',
-          body: notif.message,
-          data: { ...(notif.shardId ? { shardId: notif.shardId.toString() } : {}) },
-        });
+        await sendNotificationToTokens(
+          tokens,
+          {
+            title: 'Shard',
+            body: notif.message,
+            data: { ...(notif.shardId ? { shardId: notif.shardId.toString() } : {}) },
+          },
+          channelForType(notif.type),
+          await getUnreadBadgeCount(userId)
+        );
       }
 
       sendEmailToUser(userId, notif.type || 'general', { message: notif.message }).catch(() => {});
@@ -438,6 +445,47 @@ async function runStreakEventDetector() {
   }
 
   console.log('✅ [Scheduler] Streak event detector done');
+}
+
+/**
+ * Runs every hour; for each user it's currently ~8pm local for, nudges them if
+ * their streak is still unsafe (no completion yet today, their local day).
+ * Reactive breakage is handled by runStreakEventDetector — this is the
+ * preventive half, and the higher-leverage one: a nudge before the streak
+ * breaks beats a consolation message after.
+ */
+async function runStreakExpiringNudge() {
+  const candidates = await User.find({ currentStreak: { $gt: 0 } })
+    .select('_id timezone lastCompletionDate streakNudgeSentAt currentStreak').lean();
+
+  let sent = 0;
+  for (const u of candidates) {
+    const userId = u._id.toString();
+    const tz = (u as any).timezone;
+
+    if (localHour(tz) !== 20) continue;
+
+    const todayKey = dateKeyInZone(new Date(), tz);
+
+    const lastCompletionDate = (u as any).lastCompletionDate;
+    if (lastCompletionDate && dateKeyInZone(new Date(lastCompletionDate), tz) === todayKey) continue; // already safe
+
+    const nudgeSentAt = (u as any).streakNudgeSentAt;
+    if (nudgeSentAt && dateKeyInZone(new Date(nudgeSentAt), tz) === todayKey) continue; // already nudged today
+
+    const streak = (u as any).currentStreak as number;
+    const body = `Your ${streak}-day streak ends at midnight. Complete one task to keep it going!`;
+
+    await sendNotificationToUser(
+      userId,
+      { title: '🔥 Streak about to expire', body, data: { screen: '/schedule' } },
+      'questDeadlines'
+    );
+    await createNotification(userId, body, 'quest_deadline', {});
+    await User.findByIdAndUpdate(userId, { streakNudgeSentAt: new Date() });
+    sent++;
+  }
+  if (sent > 0) console.log(`✅ [Scheduler] Streak-expiring nudge sent to ${sent} user(s)`);
 }
 
 async function runMonthlyCreditRefill() {
