@@ -52,6 +52,8 @@ export default `#graphql
     getMyStats: StatsResponse!
     
     # Notification queries
+    """Fetch a generated share card (completion, milestone) by id."""
+    getShareCard(shareId: ID!): ShareCardResponse!
     getNotifications(limit: Int, skip: Int, shardId: ID): NotificationsResponse!
     getUnreadNotificationCount: UnreadNotificationCountResponse!
     getNotificationPreferences: NotificationPreferencesResponse!
@@ -75,8 +77,12 @@ export default `#graphql
     login(email: String!, password: String!): AuthResponse!
     requestLoginCode(email: String!): MessageResponse!
     verifyLoginCode(email: String!, code: String!): AuthResponse!
-    googleSignIn(idToken: String!, referralCode: String): AuthResponse!
+    googleSignIn(idToken: String!, referralCode: String, timezone: String): AuthResponse!
     logout: MessageResponse!
+    # Called on every app foreground: refreshes presence and keeps the stored
+    # IANA timezone in sync with the device, which is what all local-hour
+    # scheduling and quiet-hours evaluation depend on.
+    syncSession(timezone: String): MessageResponse!
     updateProfile(input: UpdateProfileInput!): ProfileResponse!
     changePassword(currentPassword: String!, newPassword: String!): MessageResponse!
     updateProfilePicture(cloudinaryUrl: String!): ProfilePictureResponse!
@@ -92,6 +98,24 @@ export default `#graphql
     assignMiniGoal(miniGoalId: ID!, userId: ID!, taskIndex: Int): MessageResponse!
     completeMiniGoal(miniGoalId: ID!): CompleteMiniGoalResponse!
     completeHabitCycle(shardId: ID!): CompleteHabitResponse!
+    """
+    Finish a quest and pay out its rewards (plus an on-time bonus). Idempotent.
+    """
+    completeShard(shardId: ID!): CompleteShardResponse!
+    """Record that the user shared a completion card outward, for the growth loop."""
+    recordShare(shareId: ID!, platform: String!): MessageResponse!
+    """
+    Resolve an overdue task: action is "reschedule" (with newDueDate, defaulting
+    to today) or "drop".
+    """
+    resolveOverdueTask(
+      miniGoalId: ID!
+      taskIndex: Int!
+      action: String!
+      newDueDate: String
+    ): MessageResponse!
+    """Restore a streak broken within the repair window."""
+    repairStreak: RepairStreakResponse!
     triggerCoachNudge(shardId: ID!): CoachNudgeResult!
     scheduleTasks(shardId: ID!): GenerateTasksResponse!
     generateWeeklyTasks(miniGoalId: ID!, weekNumber: Int, action: String): GenerateTasksResponse!
@@ -174,6 +198,7 @@ export default `#graphql
     username: String!
     password: String!
     referralCode: String
+    timezone: String
   }
 
   input UpdateProfileInput {
@@ -225,6 +250,12 @@ export default `#graphql
     preferences: UserPreferences
     subscriptionTier: String
     trialEndsAt: String
+    """Whole days of Pro trial left. The trial ends at the first finished quest
+    (floored at 7 days, capped at 30), not on a flat countdown."""
+    trialDaysRemaining: Int
+    """'milestone' if a finished quest is what ends it, 'expiry' if the clock is."""
+    trialEndReason: String
+    hasCompletedFirstQuest: Boolean
     isInTrial: Boolean
     referralCode: String
     referralCount: Int
@@ -365,6 +396,14 @@ export default `#graphql
     dueDate: String
     completed: Boolean!
     assignedTo: String
+    """What finishing this task is worth. XP is weighted per task now, so the
+    client can show the value and size the progress contribution."""
+    xpReward: Int
+    """Past due and still open. Set by the nightly sweep, which marks lateness
+    instead of silently moving the due date. Drives the overdue UI and the
+    reschedule-or-drop prompt."""
+    overdue: Boolean
+    overdueSince: String
   }
 
   input TaskInput {
@@ -523,6 +562,12 @@ export default `#graphql
     completed: Boolean!
     completedAt: String
     xpReward: Int
+    """Past due and still open — drives the overdue styling and the
+    reschedule-or-drop prompt. The server marks lateness rather than silently
+    moving the due date."""
+    overdue: Boolean
+    """0-based index within the parent mini-goal; needed by resolveOverdueTask."""
+    taskIndex: Int
     miniGoalId: ID
     miniGoalTitle: String
     shardId: ID
@@ -755,11 +800,63 @@ export default `#graphql
     currentStreak: Int!
     longestStreak: Int!
     lastActivityDate: String!
+    """
+    active | at_risk | frozen | broken | none — drives the streak UI and is what
+    the re-engagement campaigns key off.
+    """
+    state: String
+    freezesAvailable: Int
+    """True when today's streak isn't secured yet."""
+    atRiskToday: Boolean
   }
 
   type StreaksResponse {
     success: Boolean!
     streaks: [StreakInfo!]!
+  }
+
+  type CompleteShardResponse {
+    success: Boolean!
+    message: String!
+    xpEarned: Int
+    xpResult: XPResult
+    completion: Int
+    onTime: Boolean
+    """Id of the generated completion card, for sharing."""
+    shareId: ID
+    """The user's first-ever quest completion — ends the Pro trial and is the
+    moment the upsell is shown."""
+    isFirstCompletion: Boolean
+    alreadyComplete: Boolean
+  }
+
+  """A shareable artifact generated when something worth showing off happens."""
+  type ShareCard {
+    id: ID!
+    type: String!
+    headline: String!
+    subline: String
+    questTitle: String
+    completion: Int
+    xpEarned: Int
+    daysTaken: Int
+    onTime: Boolean
+    """Ready-made text for the OS share sheet."""
+    shareText: String!
+    createdAt: String!
+  }
+
+  type ShareCardResponse {
+    success: Boolean!
+    message: String
+    card: ShareCard
+  }
+
+  type RepairStreakResponse {
+    success: Boolean!
+    message: String!
+    """The streak length restored, when the repair succeeded."""
+    restored: Int
   }
 
   type CompleteTaskResponse {
@@ -962,6 +1059,14 @@ export default `#graphql
   type NotificationData {
     id: ID!
     message: String!
+    """Persisted notification type, e.g. quest_deadline."""
+    type: String
+    """Finer-grained bus kind, e.g. streak_at_risk."""
+    kind: String
+    """quests | social | rewards | system — what the filter tabs use."""
+    category: String
+    """Deep-link target for tapping the row, when there is one."""
+    screen: String
     shardId: ID
     miniGoalId: ID
     read: Boolean!
@@ -1499,6 +1604,21 @@ export default `#graphql
     tapToPurchaseRate: Float!
     impressionToPurchaseRate: Float!
     impressionsBySource: [SourceCount!]!
+
+    """Days a new user gets to reach activation."""
+    activationWindowDays: Int
+    """Signups in the window who have had the full activation window to convert."""
+    cohortSize: Int
+    """Of the cohort, how many completed a mini-goal inside the window."""
+    activatedInWindow: Int
+    activatedEver: Int
+    """THE number: did the generated plan actually get followed? (0..1)"""
+    weekOneActivationRate: Float
+    medianDaysToActivate: Float
+    firstQuestsCompleted: Int
+    sharesCompleted: Int
+    """Completion cards shared per quest finished — the growth loop (0..1)."""
+    shareRate: Float
   }
   extend type Mutation {
     trackEvent(input: TrackEventInput!): MessageResponse!

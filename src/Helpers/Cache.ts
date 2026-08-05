@@ -142,6 +142,11 @@ export const cacheKeys = {
   aiUsage: (userId: string, date: string) => `ai:usage:${userId}:${date}`,
   chat: (chatId: string) => `chat:${chatId}`,
   userChats: (userId: string) => `user:${userId}:chats`,
+  // Notification list is paginated, so the key carries skip/limit (and
+  // optionally a shard filter) — invalidation has to go by pattern.
+  userNotifications: (userId: string) => `notifications:${userId}*`,
+  unreadCount: (userId: string) => `unreadCount:${userId}`,
+  notificationPreferences: (userId: string) => `notificationPreferences:${userId}`,
 };
 
 /**
@@ -151,6 +156,20 @@ export const cacheInvalidate = {
   user: async (userId: string) => {
     await cache.del(cacheKeys.user(userId));
     await cache.delPattern(cacheKeys.userShards(userId));
+  },
+
+  /**
+   * Notification list + unread badge.
+   *
+   * `user()` does NOT cover these — it only clears `user:{id}` and
+   * `user:{id}:shards`. Creating a notification used to call `user()` and stop
+   * there, so the list stayed stale for its full 15-minute TTL and the badge for
+   * 5: the push arrived, the user opened the app, and the thing they were
+   * notified about wasn't there. Call this whenever notifications change.
+   */
+  notifications: async (userId: string) => {
+    await cache.delPattern(cacheKeys.userNotifications(userId));
+    await cache.del(cacheKeys.unreadCount(userId));
   },
 
   shard: async (shardId: string) => {

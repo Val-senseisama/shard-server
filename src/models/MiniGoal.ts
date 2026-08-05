@@ -16,6 +16,13 @@ interface Task {
   // Reschedule tracking
   rescheduled: boolean;
   originalDueDate?: Date;
+  /**
+   * Past its due date and still open. Set by the nightly lifecycle sweep, which
+   * used to silently rewrite `dueDate` to today instead — so nothing was ever
+   * late and deadlines meant nothing. Cleared when the user reschedules.
+   */
+  overdue: boolean;
+  overdueSince?: Date;
   // Assignment
   assignedTo?: string; // userId string
 }
@@ -50,6 +57,8 @@ const TaskSchema = new Schema<Task>(
     // Reschedule tracking
     rescheduled: { type: Boolean, default: false },
     originalDueDate: Date,
+    overdue: { type: Boolean, default: false },
+    overdueSince: Date,
     // Assignment
     assignedTo: { type: String, default: null },
   },

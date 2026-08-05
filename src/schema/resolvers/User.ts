@@ -19,15 +19,26 @@ import { verifyGoogleToken, generateUsernameFromGoogle } from "../../Helpers/Goo
 import { moderate } from "../../Helpers/ContentModerator.js";
 import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
 import { enqueueEmail } from "../../Helpers/Queue.js";
-import { FREE_MONTHLY_CREDITS, TRIAL_DURATION_DAYS, isInTrial } from "../../Helpers/Entitlements.js";
+import {
+  FREE_MONTHLY_CREDITS,
+  TRIAL_DURATION_DAYS,
+  isInTrial,
+  trialEndsAtEffective,
+  trialDaysRemaining,
+  trialEndReason,
+} from "../../Helpers/Entitlements.js";
 import { logEvent } from "../../Helpers/Telemetry.js";
 import { generateReferralCode, applyReferral } from "../../Helpers/Referral.js";
+import { normalizeTimeZone } from "../../Helpers/Timezone.js";
 
 export default {
   Mutation: {
     // Sign up with password
     async signup(_, { input }) {
       const { email, password, username, referralCode } = input;
+      // Capture the device's zone at signup. Without this every user sat on the
+      // 'UTC' schema default and every local-hour feature was effectively UTC-only.
+      const signupTimezone = normalizeTimeZone(input.timezone);
 
       // Moderate username at signup
       const signupMod = moderate(username, 'public_profile');
@@ -108,6 +119,7 @@ export default {
           streaks: 0,
           achievements: [],
           pendingAchievements: [],
+          ...(signupTimezone ? { timezone: signupTimezone } : {}),
           // Initialize AI credits (free tier)
           aiCredits: FREE_MONTHLY_CREDITS,
           // 7-day Pro trial
@@ -393,6 +405,38 @@ export default {
       };
     },
 
+    /**
+     * Cheap per-foreground ping. Two jobs:
+     *  - refresh `lastActive`, which the dormant/winback campaigns select on
+     *  - keep `timezone` in sync with the device
+     *
+     * Timezone belongs here rather than only at signup because people travel
+     * and move, and because it back-fills every account created before the
+     * signup capture existed. Everything local-hour (quiet hours, streak day
+     * boundaries, the cron buckets) is downstream of this one write.
+     */
+    async syncSession(_, { timezone }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+
+      const updates: Record<string, any> = { lastActive: new Date() };
+      const deviceTimezone = normalizeTimeZone(timezone);
+      if (deviceTimezone) updates.timezone = deviceTimezone;
+
+      const [error] = await catchError(
+        User.findByIdAndUpdate(context.id, { $set: updates })
+      );
+
+      if (error) {
+        logError("syncSession", error);
+        return { success: false, message: "Could not sync session." };
+      }
+
+      // The user doc is cached; a stale timezone here would defeat the point.
+      if (deviceTimezone) await cacheInvalidate.user(context.id);
+
+      return { success: true, message: "Session synced." };
+    },
+
     // Update profile
     async updateProfile(_, { input }, context) {
       if (!context.id) ThrowError("Please login to continue.");
@@ -413,7 +457,13 @@ export default {
       if (input.username) updateData.username = input.username;
       if (input.bio !== undefined) updateData.bio = input.bio;
       if (input.profilePic) updateData.profilePic = input.profilePic;
-      if (input.timezone) updateData.timezone = input.timezone;
+      // Validate before storing — an unparseable zone makes every Intl call
+      // downstream fall back to UTC, silently, forever.
+      if (input.timezone) {
+        const tz = normalizeTimeZone(input.timezone);
+        if (!tz) return { success: false, message: "Invalid timezone." };
+        updateData.timezone = tz;
+      }
       if (input.birthdate !== undefined) {
         updateData.birthdate = input.birthdate ? new Date(input.birthdate) : null;
       }
@@ -585,8 +635,9 @@ export default {
      * @param idToken - Google ID token from the client
      * @returns Authentication response with tokens and user data
      */
-    async googleSignIn(_, { idToken, referralCode }) {
+    async googleSignIn(_, { idToken, referralCode, timezone }) {
       try {
+        const deviceTimezone = normalizeTimeZone(timezone);
         // Input validation
         if (!idToken || typeof idToken !== 'string') {
           return {
@@ -629,6 +680,7 @@ export default {
           // Existing user - update Google ID if missing
           const updates: Record<string, any> = {
             lastLoginAt: new Date(),
+            ...(deviceTimezone ? { timezone: deviceTimezone } : {}),
           };
 
           if (!existingUser.googleId) {
@@ -659,6 +711,7 @@ export default {
             googleId: googleUser.googleId,
             profilePic: googleUser.picture || `https://ui-avatars.com/api/?name=${encodeURIComponent(googleUser.name || username)}&background=667eea&color=fff&size=150`,
             authProvider: 'google',
+            ...(deviceTimezone ? { timezone: deviceTimezone } : {}),
             emailVerified: true, // Google verifies emails
             role: 'user',
             isActive: true,
@@ -777,7 +830,7 @@ console.log("newUser", newUser);
         async () => {
           const [error, userData] = await catchError(
             User.findById(context.id)
-              .select("email username bio profilePic role emailVerified xp level achievements pendingAchievements strength intelligence charisma endurance creativity authProvider subscriptionTier trialEndsAt referralCode referralCount preferences currentStreak longestStreak birthdate timezone aiCredits")
+              .select("email username bio profilePic role emailVerified xp level achievements pendingAchievements strength intelligence charisma endurance creativity authProvider subscriptionTier trialStartedAt trialEndsAt firstQuestCompletedAt referralCode referralCount preferences currentStreak longestStreak birthdate timezone aiCredits")
               .lean()
           );
 
@@ -812,8 +865,17 @@ console.log("newUser", newUser);
           authProvider: user.authProvider,
           pendingAchievements: user.pendingAchievements || [],
           subscriptionTier: user.subscriptionTier,
-          trialEndsAt: user.trialEndsAt ? new Date(user.trialEndsAt).toISOString() : null,
+          // The EFFECTIVE end, which may be earlier than the stored outer bound
+          // because finishing a first quest ends the trial. The client shows the
+          // deadline the gating actually uses, not the raw field.
+          trialEndsAt: (() => {
+            const end = trialEndsAtEffective(user as any);
+            return end ? new Date(end).toISOString() : null;
+          })(),
           isInTrial: isInTrial(user as any),
+          trialDaysRemaining: trialDaysRemaining(user as any),
+          trialEndReason: trialEndReason(user as any),
+          hasCompletedFirstQuest: !!(user as any).firstQuestCompletedAt,
           referralCode: user.referralCode,
           referralCount: user.referralCount || 0,
           preferences: user.preferences,

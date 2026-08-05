@@ -10,13 +10,26 @@ import { cache } from "../../Helpers/Cache.js";
 import { generateProductivityInsights } from "../../Helpers/AIHelper.js";
 import { tierOf } from "../../Helpers/Entitlements.js";
 import { User } from "../../models/User.js";
+import { dateKeyInZone } from "../../Helpers/Timezone.js";
 
 /**
  * Update productivity metrics
  */
 async function updateProductivityMetrics(userId: string, activity: any) {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  // Bucket the day the USER is in, not the server's.
+  //
+  // This used to be `setHours(0,0,0,0)` — midnight on Railway, i.e. UTC — and
+  // then keyed on `toISOString()`. For anyone west of UTC an evening's work was
+  // credited to tomorrow's bar: the productivity chart showed today empty and
+  // yesterday doubled. Same bug class as the schedule bucketing and the streak
+  // boundaries; the day key is the one place it has to be right.
+  const [tzErr, tzUser] = await catchError(
+    User.findById(userId).select("timezone").lean()
+  );
+  const timezone = !tzErr ? (tzUser as any)?.timezone : undefined;
+  const todayStr = dateKeyInZone(new Date(), timezone);
+  // Stored at the user's local midnight so the recorded instant matches the key.
+  const today = new Date(`${todayStr}T00:00:00.000Z`);
 
   const [error, analytics] = await catchError(
     Analytics.findOne({ userId }).lean()
@@ -41,15 +54,14 @@ async function updateProductivityMetrics(userId: string, activity: any) {
   }
 
   // Check if today's record exists
-  const todayStr = today.toISOString().split('T')[0];
   const todayRecord = analytics.productivityHistory?.find(
-    (h: any) => h.date.toISOString().split('T')[0] === todayStr
+    (h: any) => new Date(h.date).toISOString().split('T')[0] === todayStr
   );
 
   if (todayRecord) {
     // Update today's record
     const updatedHistory = analytics.productivityHistory.map((h: any) => {
-      const dateStr = h.date.toISOString().split('T')[0];
+      const dateStr = new Date(h.date).toISOString().split('T')[0];
       if (dateStr === todayStr) {
         return {
           date: h.date,
@@ -92,7 +104,7 @@ export default {
 
       // Advanced analytics are Pro-only
       const [tierErr, anUser] = await catchError(
-        User.findById(context.id, "subscriptionTier role trialEndsAt").lean()
+        User.findById(context.id, "subscriptionTier role trialStartedAt trialEndsAt firstQuestCompletedAt").lean()
       );
       if (tierOf(anUser as any) === "free") {
         return {

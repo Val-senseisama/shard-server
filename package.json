@@ -9,7 +9,9 @@
     "dev": "nodemon --watch src -e ts --exec \"tsc && node dist/index.js\"",
     "start": "node dist/index.js",
     "seed:users": "node --loader ts-node/esm src/seed-users.ts",
-    "tunnel": "cloudflared tunnel --url http://localhost:4000"
+    "tunnel": "cloudflared tunnel --url http://localhost:4000",
+    "seed:offerings": "node --loader ts-node/esm src/seed-offerings.ts",
+    "sync:offerings": "node --loader ts-node/esm src/sync-offerings.ts"
   },
   "type": "module",
   "keywords": [],

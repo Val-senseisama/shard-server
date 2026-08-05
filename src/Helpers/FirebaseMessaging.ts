@@ -36,58 +36,18 @@ export const initializeFirebase = () => {
   }
 };
 
-/**
- * "HH:mm" for right now in `timezone`. Falls back to server-local time (UTC on
- * Railway) if the stored timezone string isn't IANA-valid, e.g. never set.
- */
-const currentTimeInZone = (timezone: string | undefined): string => {
-  const now = new Date();
-  try {
-    const parts = new Intl.DateTimeFormat('en-GB', {
-      timeZone: timezone || 'UTC',
-      hour: '2-digit',
-      minute: '2-digit',
-      hourCycle: 'h23',
-    }).formatToParts(now);
-    const hh = parts.find((p) => p.type === 'hour')?.value ?? '00';
-    const mm = parts.find((p) => p.type === 'minute')?.value ?? '00';
-    return `${hh}:${mm}`;
-  } catch {
-    return `${now.getUTCHours().toString().padStart(2, '0')}:${now.getUTCMinutes().toString().padStart(2, '0')}`;
-  }
-};
+// Time-of-day helpers live in Helpers/Timezone.ts now — there were three
+// divergent copies of this logic (here, the Notifications resolver, and
+// ResendEmail) and only this one was timezone-aware. Re-exported so existing
+// importers keep working.
+export { localHour, dateKeyInZone, currentTimeInZone } from './Timezone.js';
+import { currentTimeInZone, isWithinWindow } from './Timezone.js';
 
 /**
- * The hour (0-23) it currently is in `timezone`. Falls back to server-local
- * (UTC) if the stored timezone string isn't IANA-valid.
- */
-export const localHour = (timezone?: string): number => {
-  try {
-    return parseInt(
-      new Intl.DateTimeFormat('en-GB', { timeZone: timezone || 'UTC', hour: '2-digit', hourCycle: 'h23' }).format(new Date()),
-      10
-    );
-  } catch {
-    return new Date().getUTCHours();
-  }
-};
-
-/** "YYYY-MM-DD" for `date` as seen from `timezone` — for same-local-day comparisons. */
-export const dateKeyInZone = (date: Date, timezone?: string): string => {
-  try {
-    return new Intl.DateTimeFormat('en-CA', {
-      timeZone: timezone || 'UTC',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).format(date);
-  } catch {
-    return date.toISOString().slice(0, 10);
-  }
-};
-
-/**
- * Check if notification should be sent based on user preferences
+ * Check if notification should be sent based on user preferences.
+ *
+ * Prefer `notify()` in Helpers/Notify.ts — it applies this plus the daily
+ * budget, dedupe and telemetry. This stays exported for the low-level paths.
  */
 export const shouldSendNotification = async (
   userId: string,
@@ -100,19 +60,11 @@ export const shouldSendNotification = async (
     if (!prefs.pushEnabled) return false;
     if (prefs[notificationType] === false) return false;
 
-    // Check quiet hours — evaluated in the USER's timezone, not the server's.
-    // Server runs in UTC (Railway); comparing against server-local time meant
-    // "22:00-08:00" was silently wrong for every non-UTC user (same bug class
-    // as the schedule bucketing fix — see helpers/dateKeys.ts on the client).
+    // Quiet hours are evaluated in the USER's timezone, not the server's.
     if (prefs.quietHoursEnabled && prefs.quietHoursStart && prefs.quietHoursEnd) {
       const user = await User.findById(userId).select('timezone').lean();
       const currentTime = currentTimeInZone((user as any)?.timezone);
-
-      const isInQuietHours = (start: string, end: string, current: string) => {
-        return start <= end ? (current >= start && current <= end) : (current >= start || current <= end);
-      };
-
-      if (isInQuietHours(prefs.quietHoursStart, prefs.quietHoursEnd, currentTime)) {
+      if (isWithinWindow(prefs.quietHoursStart, prefs.quietHoursEnd, currentTime)) {
         return false;
       }
     }

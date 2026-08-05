@@ -2,6 +2,7 @@ import { ThrowError } from "../../Helpers/Helpers.js";
 import AnalyticsEvent from "../../models/AnalyticsEvent.js";
 import { User } from "../../models/User.js";
 import { logEvent } from "../../Helpers/Telemetry.js";
+import { activationCohort, ACTIVATION_WINDOW_DAYS } from "../../Helpers/Activation.js";
 
 const rate = (num: number, den: number) => (den > 0 ? Number((num / den).toFixed(4)) : 0);
 
@@ -16,7 +17,7 @@ export default {
 
       const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
-      const [byName, bySource] = await Promise.all([
+      const [byName, bySource, activation] = await Promise.all([
         AnalyticsEvent.aggregate([
           { $match: { createdAt: { $gte: since } } },
           { $group: { _id: "$name", count: { $sum: 1 } } },
@@ -26,13 +27,19 @@ export default {
           { $group: { _id: { $ifNull: ["$source", "unknown"] }, count: { $sum: 1 } } },
           { $sort: { count: -1 } },
         ]),
+        // Cohort-based, not an event ratio — see Helpers/Activation.ts.
+        activationCohort(days),
       ]);
 
       const c: Record<string, number> = {};
       for (const row of byName) c[row._id] = row.count;
 
       const signups = c["signup"] || 0;
+      // Quests CREATED. Kept because it isolates "did the AI produce something
+      // plausible" from "did the plan get followed" (see activation below).
       const activations = c["ai_quest_created"] || 0;
+      const firstQuestsCompleted = c["first_quest_completed"] || 0;
+      const sharesCompleted = c["share_completed"] || 0;
       const trialsStarted = c["trial_started"] || 0;
       const referralsCompleted = c["referral_completed"] || 0;
       const paywallImpressions = c["paywall_impression"] || 0;
@@ -58,6 +65,20 @@ export default {
         tapToPurchaseRate: rate(purchasesCompleted, upgradeTaps),
         impressionToPurchaseRate: rate(purchasesCompleted, paywallImpressions),
         impressionsBySource: bySource.map((r) => ({ source: r._id, count: r.count })),
+
+        // ── The headline: did the plan get followed? ──
+        activationWindowDays: ACTIVATION_WINDOW_DAYS,
+        cohortSize: activation.cohortSize,
+        activatedInWindow: activation.activatedInWindow,
+        activatedEver: activation.activated,
+        weekOneActivationRate: activation.weekOneActivationRate,
+        medianDaysToActivate: activation.medianDaysToActivate,
+
+        firstQuestsCompleted,
+        sharesCompleted,
+        // Of the people who finished a quest, how many shared the card? This is
+        // the growth loop's only real measurement.
+        shareRate: rate(sharesCompleted, firstQuestsCompleted),
       };
     },
   },

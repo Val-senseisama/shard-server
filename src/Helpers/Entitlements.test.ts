@@ -5,7 +5,21 @@ vi.mock("../models/Shard.js", () => ({
   default: { countDocuments: vi.fn(async () => 0) },
 }));
 
-import { isEntitled, isInTrial, tierOf, upgradeError, eventMatchesEntitlement, ENTITLEMENT_ID, FREE_ACTIVE_SHARD_CAP, FREE_MONTHLY_CREDITS, TRIAL_DURATION_DAYS } from "./Entitlements.js";
+import {
+  isEntitled,
+  isInTrial,
+  tierOf,
+  upgradeError,
+  eventMatchesEntitlement,
+  trialEndsAtEffective,
+  trialDaysRemaining,
+  trialEndReason,
+  ENTITLEMENT_ID,
+  FREE_ACTIVE_SHARD_CAP,
+  FREE_MONTHLY_CREDITS,
+  TRIAL_MIN_DAYS,
+  TRIAL_MAX_DAYS,
+} from "./Entitlements.js";
 
 const future = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
 const past = new Date(Date.now() - 24 * 60 * 60 * 1000);
@@ -84,6 +98,74 @@ describe("constants", () => {
   it("match the agreed free-tier limits", () => {
     expect(FREE_ACTIVE_SHARD_CAP).toBe(3);
     expect(FREE_MONTHLY_CREDITS).toBe(15);
-    expect(TRIAL_DURATION_DAYS).toBe(7);
+    // The trial is milestone-based now: it runs until the first quest is
+    // finished, floored at TRIAL_MIN_DAYS and capped at TRIAL_MAX_DAYS.
+    expect(TRIAL_MIN_DAYS).toBe(7);
+    expect(TRIAL_MAX_DAYS).toBe(30);
+  });
+});
+
+/**
+ * The trial used to be a flat 7-day countdown, which expired long before anyone
+ * could have evidence the product worked — this product's payoff is measured in
+ * weeks. It now ends at the moment of proof instead.
+ */
+describe("milestone-based trial", () => {
+  const DAY = 86_400_000;
+  const daysAgo = (n: number) => new Date(Date.now() - n * DAY);
+
+  const trialling = (over: Partial<any> = {}) => ({
+    subscriptionTier: "free",
+    trialStartedAt: daysAgo(2),
+    trialEndsAt: new Date(Date.now() + (TRIAL_MAX_DAYS - 2) * DAY),
+    ...over,
+  });
+
+  it("keeps a user Pro for far longer than a week if they haven't finished anything", () => {
+    const user = trialling({ trialStartedAt: daysAgo(20), trialEndsAt: new Date(Date.now() + 10 * DAY) });
+    expect(isInTrial(user)).toBe(true);
+    expect(tierOf(user)).toBe("pro");
+    expect(trialDaysRemaining(user)).toBeGreaterThan(7);
+  });
+
+  it("ends the trial once the first quest is finished", () => {
+    const user = trialling({ trialStartedAt: daysAgo(20), firstQuestCompletedAt: daysAgo(1) });
+    expect(isInTrial(user)).toBe(false);
+    expect(tierOf(user)).toBe("free");
+  });
+
+  it("does not punish a fast finisher — the minimum window still applies", () => {
+    // Signed up 2 days ago, finished today: still trialling until day 7.
+    const user = trialling({ trialStartedAt: daysAgo(2), firstQuestCompletedAt: new Date() });
+    expect(isInTrial(user)).toBe(true);
+    expect(trialDaysRemaining(user)).toBeLessThanOrEqual(TRIAL_MIN_DAYS);
+  });
+
+  it("never runs past the hard cap", () => {
+    const user = trialling({
+      trialStartedAt: daysAgo(TRIAL_MAX_DAYS + 5),
+      trialEndsAt: daysAgo(5),
+    });
+    expect(isInTrial(user)).toBe(false);
+  });
+
+  it("ignores the trial entirely for a paying subscriber", () => {
+    const user = trialling({ subscriptionTier: "pro", firstQuestCompletedAt: daysAgo(1) });
+    expect(trialEndsAtEffective(user)).toBeNull();
+    expect(tierOf(user)).toBe("pro");
+  });
+
+  it("has no trial for a user who was never granted one", () => {
+    expect(isInTrial({ subscriptionTier: "free" })).toBe(false);
+    expect(trialEndsAtEffective({ subscriptionTier: "free" })).toBeNull();
+    expect(trialDaysRemaining({ subscriptionTier: "free" })).toBe(0);
+  });
+
+  it("reports why the trial is ending, so the copy can be honest", () => {
+    expect(trialEndReason(trialling())).toBe("expiry");
+    expect(
+      trialEndReason(trialling({ trialStartedAt: daysAgo(2), firstQuestCompletedAt: new Date() }))
+    ).toBe("milestone");
+    expect(trialEndReason({ subscriptionTier: "pro" })).toBeNull();
   });
 });

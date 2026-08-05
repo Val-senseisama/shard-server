@@ -5,134 +5,51 @@ import {
 } from "../../Helpers/Helpers.js";
 import Notification from "../../models/Notifications.js";
 import NotificationPreference from "../../models/NotificationPreferences.js";
-import Shard from "../../models/Shard.js";
-import { User } from "../../models/User.js";
-import { cache, cacheInvalidate } from "../../Helpers/Cache.js";
-import { sendEmailToUser } from "../../Helpers/ResendEmail.js";
+import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
 
 /**
- * Calculate next time quiet hours end (so we can schedule the push for then).
+ * The client's filter tabs: quests | social | system.
+ * Derived server-side from the kind so the categories can't drift from the copy.
  */
-function nextQuietHoursEnd(preferences: any): Date {
-  const [endHour, endMin] = (preferences.quietHoursEnd || "08:00")
-    .split(":")
-    .map(Number);
-  const result = new Date();
-  result.setHours(endHour, endMin, 0, 0);
-  if (result <= new Date()) {
-    // The end time already passed today — push to tomorrow
-    result.setDate(result.getDate() + 1);
+function categoryOf(n: { kind?: string; type?: string; shardId?: unknown }): string {
+  const k = n.kind || n.type || "";
+  if (
+    [
+      "friend_request",
+      "friend_accepted",
+      "message",
+      "friend_overtook",
+      "partner_progress",
+      "shard_invite",
+    ].includes(k)
+  ) {
+    return "social";
   }
-  return result;
-}
-
-/**
- * Create a notification.
- * Always stores the in-app notification immediately.
- * If currently in quiet hours the push/email is deferred to when quiet hours end
- * (tracked via triggerAt + dispatched=false, picked up by the dispatcher cron).
- * If not in quiet hours the record is marked dispatched=true — the resolver
- * is responsible for firing the FCM push via sendNotificationToUser().
- */
-export async function createNotification(
-  userId: string,
-  message: string,
-  type: string,
-  options?: { shardId?: string; miniGoalId?: string; triggerAt?: Date }
-) {
-  // Check user preferences
-  const preferences = await NotificationPreference.findOne({ userId }).lean();
-
-  // If the user has explicitly disabled this notification type, skip entirely
-  if (preferences && !shouldNotify(preferences, type)) {
-    return;
+  if (["trial_ending"].includes(k)) return "system";
+  if (
+    [
+      "quest_deadline",
+      "quest_overdue",
+      "task_reminder",
+      "tasks_missed",
+      "daily_digest",
+      "shard_update",
+      "shard_completed",
+      "inactivity_nudge",
+      "empty_schedule",
+      "task_assigned",
+    ].includes(k)
+  ) {
+    return "quests";
   }
-
-  const inQuietHours =
-    preferences?.quietHoursEnabled && isQuietHours(preferences);
-
-  // When in quiet hours: defer push/email until quiet hours end.
-  // When not in quiet hours: mark dispatched immediately — resolver sends push.
-  const triggerAt = options?.triggerAt
-    ? options.triggerAt
-    : inQuietHours
-      ? nextQuietHoursEnd(preferences)
-      : new Date();
-
-  const dispatched = !inQuietHours;
-
-  try {
-    const notification = await Notification.create({
-      userId,
-      message,
-      type,
-      shardId: options?.shardId,
-      miniGoalId: options?.miniGoalId,
-      triggerAt,
-      dispatched,
-      read: false,
-    });
-
-    // Invalidate notifications cache
-    await cacheInvalidate.user(userId);
-
-    // Fire email immediately only when not in quiet hours
-    // (quiet-hours email is sent by the dispatcher cron)
-    if (!inQuietHours) {
-      sendEmailToUser(userId, type, { message }).catch(() => {});
-    }
-
-    return notification;
-  } catch (error) {
-    logError("createNotification", error);
-    return null;
+  if (["achievement", "level_up", "streak_milestone", "streak_freeze_used"].includes(k)) {
+    return "rewards";
   }
-}
-
-/**
- * Check if notification type is enabled
- */
-function shouldNotify(preferences: any, type: string): boolean {
-  switch (type) {
-    case "friend_request":
-      return preferences.friendRequests !== false;
-    case "message":
-      return preferences.messages !== false;
-    case "shard_invite":
-      return preferences.shardInvites !== false;
-    case "shard_update":
-      return preferences.shardUpdates !== false;
-    case "quest_deadline":
-      return preferences.questDeadlines !== false;
-    case "achievement":
-      return preferences.achievements !== false;
-    default:
-      return true;
+  if (["streak_at_risk", "streak_broken", "activation_nudge", "dormant_winback"].includes(k)) {
+    return "quests";
   }
-}
-
-/**
- * Check if currently in quiet hours
- */
-function isQuietHours(preferences: any): boolean {
-  if (!preferences.quietHoursEnabled) return false;
-
-  const now = new Date();
-  const currentHour = now.getHours();
-  const currentMinute = now.getMinutes();
-  const currentTime = `${String(currentHour).padStart(2, "0")}:${String(currentMinute).padStart(2, "0")}`;
-
-  const start = preferences.quietHoursStart;
-  const end = preferences.quietHoursEnd;
-
-  // Simple time comparison
-  if (start <= end) {
-    // Same day quiet hours (e.g., 22:00 to 01:00 next day)
-    return currentTime >= start || currentTime < end;
-  } else {
-    // Overnight quiet hours (e.g., 22:00 to 08:00 next day)
-    return currentTime >= start || currentTime < end;
-  }
+  // Unknown/legacy rows: fall back to whether they point at a shard.
+  return n.shardId ? "quests" : "system";
 }
 
 export default {
@@ -163,8 +80,10 @@ export default {
         read: true,
       });
 
-      // Invalidate cache
-      await cache.del(`notifications:${context.id}`);
+      // Clears the paginated list keys AND the unread badge. A plain
+      // `del('notifications:{id}')` never matched anything: the real keys carry
+      // skip/limit suffixes.
+      await cacheInvalidate.notifications(context.id);
 
       return {
         success: true,
@@ -181,8 +100,10 @@ export default {
         { read: true }
       );
 
-      // Invalidate cache
-      await cache.del(`notifications:${context.id}`);
+      // Clears the paginated list keys AND the unread badge. A plain
+      // `del('notifications:{id}')` never matched anything: the real keys carry
+      // skip/limit suffixes.
+      await cacheInvalidate.notifications(context.id);
 
       return {
         success: true,
@@ -211,7 +132,7 @@ export default {
       }
 
       // Invalidate cache
-      await cache.del(`notificationPreferences:${context.id}`);
+      await cache.del(cacheKeys.notificationPreferences(context.id));
 
       return {
         success: true,
@@ -256,8 +177,10 @@ export default {
 
       await Notification.findByIdAndDelete(notificationId);
 
-      // Invalidate cache
-      await cache.del(`notifications:${context.id}`);
+      // Clears the paginated list keys AND the unread badge. A plain
+      // `del('notifications:{id}')` never matched anything: the real keys carry
+      // skip/limit suffixes.
+      await cacheInvalidate.notifications(context.id);
 
       return {
         success: true,
@@ -288,7 +211,11 @@ export default {
               .sort({ createdAt: -1 })
               .limit(limit || 20)
               .skip(skip || 0)
-              .select("message shardId miniGoalId read triggerAt createdAt")
+              // `type`/`kind`/`data` are returned so the client can categorise
+              // and deep-link properly. Without them the app was inferring
+              // category by substring-matching the message text, which broke
+              // silently on any copy change.
+              .select("message type kind priority data shardId miniGoalId read triggerAt createdAt")
               .lean()
           );
 
@@ -307,6 +234,10 @@ export default {
         notifications: notifications.map((n: any) => ({
           id: n._id.toString(),
           message: n.message,
+          type: n.type || null,
+          kind: n.kind || null,
+          category: categoryOf(n),
+          screen: n.data?.screen ?? null,
           shardId: n.shardId?.toString(),
           miniGoalId: n.miniGoalId?.toString(),
           read: n.read,

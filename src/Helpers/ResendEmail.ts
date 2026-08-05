@@ -3,27 +3,23 @@ import "dotenv/config";
 import { logError } from "./Helpers.js";
 import NotificationPreference from "../models/NotificationPreferences.js";
 import { User } from "../models/User.js";
+import { currentTimeInZone, isWithinWindow } from "./Timezone.js";
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 const FROM = process.env.RESEND_FROM || "Shard <shardsupportzy@zevbii.com>";
 
-// ─── Quiet hours check (mirrors Notifications.ts) ─────────────────
+// ─── Quiet hours ──────────────────────────────────────────────────
+// Uses the shared timezone-aware helper. This file used to carry its own copy
+// that compared against SERVER-local time (UTC in production), so "22:00–08:00"
+// was silently wrong for every user outside UTC.
 
-function isQuietHours(preferences: any): boolean {
-  if (!preferences.quietHoursEnabled) return false;
-
-  const now = new Date();
-  const currentTime = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
-  const start = preferences.quietHoursStart || "22:00";
-  const end = preferences.quietHoursEnd || "08:00";
-
-  if (start > end) {
-    // Overnight: quiet from e.g. 22:00 → 08:00
-    return currentTime >= start || currentTime < end;
-  } else {
-    // Same-day: quiet from e.g. 09:00 → 17:00
-    return currentTime >= start && currentTime < end;
-  }
+function isQuietHours(preferences: any, timezone?: string): boolean {
+  if (!preferences?.quietHoursEnabled) return false;
+  return isWithinWindow(
+    preferences.quietHoursStart || "22:00",
+    preferences.quietHoursEnd || "08:00",
+    currentTimeInZone(timezone)
+  );
 }
 
 // ─── Per-type preference gate (mirrors shouldNotify) ──────────────
@@ -81,6 +77,21 @@ type TemplateData = {
   deadline?: string;
 };
 
+/**
+ * Every caller of `sendEmailToUser` passes `{ message }` and little else, but the
+ * templates below interpolate `actorName`, `shardTitle`, `miniGoalTitle` and
+ * `achievementName`. Missing fields used to render the literal string
+ * "undefined" straight into subject lines ("Deadline approaching:
+ * \"undefined\""). These accessors keep a template readable when the caller
+ * only had the message text.
+ */
+const field = (value: string | undefined, fallback: string): string =>
+  value && value.trim() ? value : fallback;
+
+/** A subject that degrades to the notification text rather than to "undefined". */
+const subjectOr = (parts: { when: string | undefined; then: string; else: string }): string =>
+  parts.when && parts.when.trim() ? parts.then : parts.else;
+
 function buildTemplate(
   type: string,
   recipientName: string,
@@ -89,66 +100,66 @@ function buildTemplate(
   switch (type) {
     case "friend_request":
       return {
-        subject: `${data.actorName} sent you a friend request`,
+        subject: subjectOr({ when: data.actorName, then: `${data.actorName} sent you a friend request`, else: "You have a new friend request" }),
         html: buildHtml(
           `Friend Request`,
           `<p>Hey <strong>${recipientName}</strong>,</p>
-           <p><strong>${data.actorName}</strong> wants to connect with you on Shard.</p>
+           <p><strong>${field(data.actorName, "Someone")}</strong> wants to connect with you on Shard.</p>
            <a href="${process.env.SITE_URL}" class="cta">View Request</a>`
         ),
       };
 
     case "shard_invite":
       return {
-        subject: `You've been invited to "${data.shardTitle}"`,
+        subject: subjectOr({ when: data.shardTitle, then: `You've been invited to "${data.shardTitle}"`, else: "You've been invited to a quest" }),
         html: buildHtml(
           `Shard Invitation`,
           `<p>Hey <strong>${recipientName}</strong>,</p>
-           <p><strong>${data.actorName}</strong> invited you to join the shard <strong>${data.shardTitle}</strong>.</p>
+           <p><strong>${field(data.actorName, "Someone")}</strong> invited you to join <strong>${field(data.shardTitle, "a quest")}</strong>.</p>
            <a href="${process.env.SITE_URL}" class="cta">View Invitation</a>`
         ),
       };
 
     case "shard_update":
       return {
-        subject: `Update in "${data.shardTitle}"`,
+        subject: subjectOr({ when: data.shardTitle, then: `Update in "${data.shardTitle}"`, else: field(data.message, "Update on your quest") }),
         html: buildHtml(
           `Shard Update`,
           `<p>Hey <strong>${recipientName}</strong>,</p>
-           <p>There's a new update in <strong>${data.shardTitle}</strong>: ${data.message || "Check it out!"}</p>
+           <p>There's a new update in <strong>${field(data.shardTitle, "one of your quests")}</strong>: ${field(data.message, "Check it out!")}</p>
            <a href="${process.env.SITE_URL}" class="cta">Open Shard</a>`
         ),
       };
 
     case "quest_deadline":
       return {
-        subject: `Deadline approaching: "${data.miniGoalTitle}"`,
+        subject: subjectOr({ when: data.miniGoalTitle, then: `Deadline approaching: "${data.miniGoalTitle}"`, else: field(data.message, "A deadline is coming up") }),
         html: buildHtml(
           `Quest Deadline`,
           `<p>Hey <strong>${recipientName}</strong>,</p>
-           <p>Your quest <strong>${data.miniGoalTitle}</strong> in <strong>${data.shardTitle}</strong> is due ${data.deadline ? `on <strong>${data.deadline}</strong>` : "soon"}.</p>
+           <p>${data.miniGoalTitle ? `Your goal <strong>${data.miniGoalTitle}</strong>${data.shardTitle ? ` in <strong>${data.shardTitle}</strong>` : ""} is due ${data.deadline ? `on <strong>${data.deadline}</strong>` : "soon"}.` : field(data.message, "You have a deadline coming up.")}</p>
            <a href="${process.env.SITE_URL}" class="cta">View Quest</a>`
         ),
       };
 
     case "message":
       return {
-        subject: `New message from ${data.actorName}`,
+        subject: subjectOr({ when: data.actorName, then: `New message from ${data.actorName}`, else: "You have a new message" }),
         html: buildHtml(
           `New Message`,
           `<p>Hey <strong>${recipientName}</strong>,</p>
-           <p><strong>${data.actorName}</strong> sent you a message in <strong>${data.shardTitle || "a shard"}</strong>.</p>
+           <p><strong>${field(data.actorName, "Someone")}</strong> sent you a message in <strong>${field(data.shardTitle, "a quest")}</strong>.</p>
            <a href="${process.env.SITE_URL}" class="cta">Read Message</a>`
         ),
       };
 
     case "achievement":
       return {
-        subject: `You unlocked: ${data.achievementName}`,
+        subject: subjectOr({ when: data.achievementName, then: `You unlocked: ${data.achievementName}`, else: "Achievement unlocked" }),
         html: buildHtml(
           `Achievement Unlocked! 🏆`,
           `<p>Hey <strong>${recipientName}</strong>,</p>
-           <p>You just earned the <strong>${data.achievementName}</strong> achievement. Keep it up!</p>
+           <p>${data.achievementName ? `You just earned the <strong>${data.achievementName}</strong> achievement.` : field(data.message, "You just earned an achievement.")} Keep it up!</p>
            <a href="${process.env.SITE_URL}" class="cta">View Achievements</a>`
         ),
       };
@@ -179,7 +190,7 @@ export async function sendEmailToUser(
 
   try {
     const [user, preferences] = await Promise.all([
-      User.findById(userId).select("email username").lean(),
+      User.findById(userId).select("email username timezone").lean(),
       NotificationPreference.findOne({ userId }).lean(),
     ]);
 
@@ -188,7 +199,7 @@ export async function sendEmailToUser(
     // Default preferences treat emailEnabled as false — opt-in only
     if (!preferences || preferences.emailEnabled !== true) return;
     if (!shouldSendEmail(preferences, type)) return;
-    if (isQuietHours(preferences)) return;
+    if (isQuietHours(preferences, (user as any).timezone)) return;
 
     const recipientName = (user as any).username || "there";
     const { subject, html } = buildTemplate(type, recipientName, data);

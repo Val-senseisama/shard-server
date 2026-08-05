@@ -7,6 +7,7 @@ import ChallengeResolvers from "./resolvers/Challenge.js";
 import SideQuestResolvers from "./resolvers/SideQuest.js";
 import AnalyticsResolvers from "./resolvers/Analytics.js";
 import NotificationResolvers from "./resolvers/Notifications.js";
+import ShareResolvers from "./resolvers/Share.js";
 import PushNotificationResolvers from "./resolvers/PushNotifications.js";
 import ReportResolvers from "./resolvers/Report.js";
 import SupportResolvers from "./resolvers/Support.js";
@@ -59,6 +60,7 @@ const allQueries: Record<string, Function> = {
     ...SideQuestResolvers.Query,
     ...AnalyticsResolvers.Query,
     ...NotificationResolvers.Query,
+    ...ShareResolvers.Query,
     ...ReportResolvers.Query,
     ...SupportResolvers.Query,
     ...AdminResolvers.Query,
@@ -78,6 +80,7 @@ const allMutations: Record<string, Function> = {
     ...SideQuestResolvers.Mutation,
     ...AnalyticsResolvers.Mutation,
     ...NotificationResolvers.Mutation,
+    ...ShareResolvers.Mutation,
     ...PushNotificationResolvers.Mutation,
     ...ReportResolvers.Mutation,
     ...SupportResolvers.Mutation,

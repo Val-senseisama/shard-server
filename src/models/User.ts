@@ -40,7 +40,20 @@ export interface IUser extends Document {
   xp: number;
   aiCredits: number;
   trialStartedAt?: Date;
+  /** Outer bound of the trial — see TRIAL_MAX_DAYS in Helpers/Entitlements.ts. */
   trialEndsAt?: Date;
+  /**
+   * When the user finished their FIRST quest. This is the milestone that ends the
+   * Pro trial: the payoff of this product takes weeks, so a flat countdown asked
+   * people to convert before they had any evidence it worked. Ending the trial at
+   * the moment of proof puts the paywall where the motivation is.
+   */
+  firstQuestCompletedAt?: Date;
+  /**
+   * First completed mini-goal — the activation milestone. Proof that a generated
+   * plan actually got followed, which is the product's whole thesis.
+   */
+  firstMiniGoalCompletedAt?: Date;
   trialReminderSent?: boolean;
   // Referral loop
   referralCode?: string;
@@ -49,13 +62,29 @@ export interface IUser extends Document {
   level: number;
   streaks: number; // Legacy field - kept for backward compatibility
   
-  // Streak System (new detailed tracking)
+  // Streak System — written ONLY by Helpers/Streak.ts
   currentStreak: number;
   longestStreak: number;
   lastCompletionDate?: Date;
+  /**
+   * `YYYY-MM-DD` of the last qualifying activity, in the user's OWN timezone.
+   * This — not `lastCompletionDate` — is the streak's notion of "a day", so a
+   * 9pm completion in UTC-8 counts for the day the user thinks it is.
+   */
+  lastStreakDayKey?: string;
+  /**
+   * The last day a *spent freeze* covers, kept separate from
+   * `lastStreakDayKey` so a freeze never forges activity. A freeze covers one
+   * isolated missed day and does not stack — see Helpers/Streak.ts.
+   */
+  freezeCoveredThrough?: string;
   streakFreezeTokens: number;
+  lastFreezeUsedAt?: Date;
   comebackBonusUntil?: Date;
+  /** The streak that was lost. Written once, at the break — see Streak.ts. */
   previousStreak: number;
+  /** When the streak broke; bounds the repair window. */
+  streakBrokenAt?: Date;
   streakNudgeSentAt?: Date;
 
   subscriptionTier: 'free' | 'pro' | 'enterprise';
@@ -210,6 +239,12 @@ const UserSchema: Schema<IUser> = new Schema(
     trialEndsAt: {
         type: Date
     },
+    firstQuestCompletedAt: {
+        type: Date
+    },
+    firstMiniGoalCompletedAt: {
+        type: Date
+    },
     // Set once when the "trial ending soon" reminder is sent (idempotency).
     trialReminderSent: {
         type: Boolean,
@@ -248,9 +283,13 @@ const UserSchema: Schema<IUser> = new Schema(
       default: 0
     },
     lastCompletionDate: Date,
+    lastStreakDayKey: { type: String },
+    freezeCoveredThrough: { type: String },
     streakFreezeTokens: { type: Number, default: 1 },
+    lastFreezeUsedAt: Date,
     comebackBonusUntil: Date,
     previousStreak: { type: Number, default: 0 },
+    streakBrokenAt: Date,
     streakNudgeSentAt: Date,
 
     achievements: {
@@ -335,6 +374,12 @@ UserSchema.index({ emailVerified: 1 });
 UserSchema.index({ isActive: 1 });
 UserSchema.index({ role: 1 });
 UserSchema.index({ "refreshTokens.0": 1 }); // Index on array element (useful for querying users with tokens)
+// Local-hour cron buckets select users by timezone every hour — keep it cheap.
+UserSchema.index({ timezone: 1 });
+// Dormant/winback campaigns scan on last activity.
+UserSchema.index({ lastActive: 1 });
+// Activation cohorts are selected by signup date.
+UserSchema.index({ createdAt: 1 });
 
 // Export the model
 export const User = mongoose.model<IUser>("User", UserSchema);

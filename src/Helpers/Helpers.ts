@@ -164,6 +164,38 @@ export const uuid = (): string => {
   ].join("-");
 };
 
+/**
+ * Run `worker` over `items` with at most `limit` in flight.
+ *
+ * The per-user retention jobs are inherently N×(a few queries). Awaiting them
+ * one at a time is correct but throughput-bound by round-trip latency: a bucket
+ * of 10k users at ~6 queries each is ~60k sequential round-trips, which at
+ * Railway latencies would run past the next hourly tick and overlap itself.
+ * A small concurrency window fixes that without restructuring the queries into
+ * aggregations — do that when a single bucket actually gets big.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<R>
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const width = Math.max(1, Math.min(limit, items.length));
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+
+  const runners = Array.from({ length: width }, async () => {
+    for (;;) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index]);
+    }
+  });
+
+  await Promise.all(runners);
+  return results;
+}
+
 export async function catchError<T>(
   promise: Promise<T>
 ): Promise<[undefined, T] | [Error]> {

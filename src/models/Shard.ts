@@ -21,7 +21,18 @@ export interface ShardDocument extends Document {
     xpEarned: number;
     level: number;
   };
-  status: "active" | "paused" | "completed" | "expired";
+  /**
+   * Lifecycle state — see Helpers/ShardLifecycle.ts for the transitions.
+   * `at_risk` and `stalled` are set by the nightly sweep from `lastActivityAt`;
+   * `completed` and `expired` are terminal.
+   */
+  status: "active" | "paused" | "at_risk" | "stalled" | "completed" | "expired" | "abandoned";
+  /** When the quest was finished, for the completion payout and stats. */
+  completedAt?: Date;
+  /** XP actually paid out on completion, so it can't be paid twice. */
+  completionXPAwarded?: number;
+  /** Habit quests: the period key (`YYYY-MM-DD` or `YYYY-Www`) last checked in. */
+  lastCycleKey?: string;
   // Removed miniGoals array - using separate MiniGoal collection instead
   rewards: { type: "xp" | "badge"; value: number | string }[];
   questType: "standard" | "habit";
@@ -58,9 +69,12 @@ const ShardSchema = new Schema<ShardDocument>(
     },
     status: {
       type: String,
-      enum: ["active", "paused", "completed", "expired"],
+      enum: ["active", "paused", "at_risk", "stalled", "completed", "expired", "abandoned"],
       default: "active",
     },
+    completedAt: Date,
+    completionXPAwarded: Number,
+    lastCycleKey: { type: String },
     // MiniGoals are now in their own collection (MiniGoal model)
     rewards: [
       {
@@ -95,5 +109,8 @@ const ShardSchema = new Schema<ShardDocument>(
 ShardSchema.index({ owner: 1 });
 ShardSchema.index({ status: 1 });
 ShardSchema.index({ "timeline.endDate": 1 });
+// The lifecycle sweep and campaigns both select open shards by staleness.
+ShardSchema.index({ status: 1, lastActivityAt: 1 });
+ShardSchema.index({ owner: 1, status: 1 });
 
 export default model<ShardDocument>("Shard", ShardSchema);

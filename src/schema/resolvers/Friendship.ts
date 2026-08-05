@@ -7,8 +7,7 @@ import {
 import Friendship from "../../models/Friendship.js";
 import { User } from "../../models/User.js";
 import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
-import { createNotification } from "./Notifications.js";
-import { sendNotificationToUser } from "../../Helpers/FirebaseMessaging.js";
+import { notify } from "../../Helpers/Notify.js";
 import { isUserOnline } from "../../server/WebSocketServer.js";
 import { checkAchievements } from "./XP.js";
 
@@ -100,21 +99,17 @@ export default {
       // Fire-and-forget: cache, notifications, audit trail
       cacheInvalidate.friendship(context.id, friendId).catch((e) => logError("sendFriendRequest:cacheInvalidate", e));
 
-      createNotification(
-        friendId,
-        `${senderName} wants to be friends with you`,
-        "friend_request"
-      ).catch((e) => logError("sendFriendRequest:createNotification", e));
-
-      sendNotificationToUser(
-        friendId,
-        {
-          title: "New Friend Request",
-          body: `${senderName} wants to be friends with you!`,
-          data: { screen: "/(screens)/friends" }
-        },
-        'friendRequests'
-      ).catch((e) => logError("sendFriendRequest:pushNotification", e));
+      notify({
+        userId: friendId,
+        kind: "friend_request",
+        title: "New Friend Request",
+        body: `${senderName} wants to be friends with you`,
+        data: { screen: "/(screens)/friends" },
+        emailData: { actorName: senderName },
+        // A second request from the same person shouldn't collapse into the
+        // first one's daily slot.
+        dedupeKey: null,
+      }).catch((e) => logError("sendFriendRequest:notify", e));
 
       SaveAuditTrail({
         userId: context.id,
@@ -163,29 +158,25 @@ export default {
       // Invalidate cache
       await cacheInvalidate.friendship(context.id, friendId);
 
-      // Get requester's username for notification
-      const [requesterError, requester] = await catchError(
-        User.findById(friendId).select("username").lean()
+      // The notification goes to the person who SENT the request, so it has to
+      // name the person who accepted it — i.e. the caller. Both messages here
+      // were wrong: the in-app one interpolated `context.id`, printing a raw
+      // ObjectId, and the push used the recipient's own username, telling them
+      // they had become their own friend.
+      const [accepterError, accepter] = await catchError(
+        User.findById(context.id).select("username").lean()
       );
+      const accepterName = !accepterError && accepter ? (accepter as any).username : "Someone";
 
-      if (!requesterError && requester) {
-        await createNotification(
-          friendId,
-          `${context.id} accepted your friend request!`,
-          "friend_request"
-        );
-
-        // Send Push Notification
-        await sendNotificationToUser(
-          friendId,
-          {
-            title: "Friend Request Accepted",
-            body: `${requester.username} is now your friend!`,
-            data: { screen: "/(screens)/friends" }
-          },
-          'friendRequests' // Check friend request notification preferences
-        );
-      }
+      await notify({
+        userId: friendId,
+        kind: "friend_accepted",
+        title: "Friend Request Accepted",
+        body: `${accepterName} accepted your friend request`,
+        data: { screen: "/(screens)/friends" },
+        emailData: { actorName: accepterName },
+        dedupeKey: null,
+      });
 
       SaveAuditTrail({
         userId: context.id,

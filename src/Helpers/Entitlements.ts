@@ -13,8 +13,29 @@ export const FREE_ACTIVE_SHARD_CAP = 3;
 // a circular import User -> Entitlements -> Shard -> User).
 export const FREE_MONTHLY_CREDITS = 15;
 
-// New users get a time-boxed Pro trial to experience the full product.
-export const TRIAL_DURATION_DAYS = 7;
+/**
+ * The Pro trial is **milestone-based**, not a flat countdown.
+ *
+ * A 7-day clock was the wrong shape for this product: the payoff is finishing a
+ * real goal, which takes weeks, so the trial expired long before a user could
+ * possibly have evidence Shard works for them. They were asked to convert on
+ * optimism.
+ *
+ * So the trial now runs until the user **finishes their first quest** — the
+ * moment of proof, and the best upsell moment there is — bounded on both sides:
+ *
+ *  - never shorter than TRIAL_MIN_DAYS, so a fast finisher isn't punished for
+ *    succeeding quickly
+ *  - never longer than TRIAL_MAX_DAYS, so it can't run forever
+ */
+export const TRIAL_MIN_DAYS = 7;
+export const TRIAL_MAX_DAYS = 30;
+
+/**
+ * @deprecated Kept so existing callers that stamp `trialEndsAt` at signup keep
+ * compiling. It is the OUTER bound now — see TRIAL_MAX_DAYS.
+ */
+export const TRIAL_DURATION_DAYS = TRIAL_MAX_DAYS;
 
 // The RevenueCat entitlement that maps to Shard Pro. Must match the client
 // (UserProvider.tsx / purchasesService.ts) and the RevenueCat dashboard.
@@ -44,33 +65,99 @@ export function isEntitled(tier?: string | null): boolean {
   return tier === "pro" || tier === "enterprise";
 }
 
+/** The fields the trial computation reads. */
+export interface TrialFields {
+  subscriptionTier?: string | null;
+  trialStartedAt?: Date | string | null;
+  trialEndsAt?: Date | string | null;
+  /** When the user completed their first quest — the milestone that ends the trial. */
+  firstQuestCompletedAt?: Date | string | null;
+}
+
+const DAY_MS = 86_400_000;
+const ms = (d?: Date | string | null) => (d ? new Date(d).getTime() : null);
+
 /**
- * True while a user is inside their 7-day Pro trial. Computed on read, so it
- * expires automatically with no cron. Only meaningful for non-paid users
- * (a paid subscription already grants Pro).
+ * The instant this user's trial actually ends, or null if they have no trial.
+ *
+ * Computed on read — no cron, and no way for a stale field to grant Pro forever.
+ * Exported so the client and the reminder job describe the same deadline the
+ * gating uses.
  */
-export function isInTrial(
-  user?: { subscriptionTier?: string | null; trialEndsAt?: Date | string | null } | null
-): boolean {
-  if (!user?.trialEndsAt || isEntitled(user.subscriptionTier)) return false;
-  return new Date(user.trialEndsAt).getTime() > Date.now();
+export function trialEndsAtEffective(user?: TrialFields | null): number | null {
+  if (!user || isEntitled(user.subscriptionTier)) return null;
+
+  const started = ms(user.trialStartedAt);
+  const hardCap = ms(user.trialEndsAt);
+  // No trial was ever granted.
+  if (!started && !hardCap) return null;
+
+  const floor = started ? started + TRIAL_MIN_DAYS * DAY_MS : null;
+  const ceiling = hardCap ?? (started! + TRIAL_MAX_DAYS * DAY_MS);
+
+  const milestone = ms(user.firstQuestCompletedAt);
+  if (!milestone) return ceiling;
+
+  // Finished a quest: the trial ends now, but never before the minimum window.
+  const end = floor ? Math.max(milestone, floor) : milestone;
+  return Math.min(end, ceiling);
+}
+
+/**
+ * True while a user is inside their Pro trial. Only meaningful for non-paid
+ * users (a paid subscription already grants Pro).
+ */
+export function isInTrial(user?: TrialFields | null): boolean {
+  const end = trialEndsAtEffective(user);
+  return end !== null && end > Date.now();
+}
+
+/** Whole days of trial left, floored at 0. For UI copy. */
+export function trialDaysRemaining(user?: TrialFields | null): number {
+  const end = trialEndsAtEffective(user);
+  if (end === null) return 0;
+  return Math.max(0, Math.ceil((end - Date.now()) / DAY_MS));
+}
+
+/**
+ * Why the trial is ending — lets the client pick honest copy instead of a
+ * generic countdown. "You finished your first quest" converts differently from
+ * "your 30 days are up".
+ */
+export function trialEndReason(user?: TrialFields | null): "milestone" | "expiry" | null {
+  if (!isInTrial(user)) return null;
+  return user?.firstQuestCompletedAt ? "milestone" : "expiry";
 }
 
 /**
  * Derive effective tier from the trusted fields. Pro if paid, admin, or in-trial.
- * NOTE: callers must select `trialEndsAt` (alongside subscriptionTier/role) or the
- * trial will be silently ignored.
+ * NOTE: callers must select `trialStartedAt`, `trialEndsAt` AND
+ * `firstQuestCompletedAt` (alongside subscriptionTier/role) or the trial will be
+ * silently mis-evaluated. `TRIAL_PROJECTION` exists so you can't forget one.
  */
 export function tierOf(
-  user?: { subscriptionTier?: string | null; role?: string | null; trialEndsAt?: Date | string | null } | null
+  user?: (TrialFields & { role?: string | null }) | null
 ): "free" | "pro" {
   if (isEntitled(user?.subscriptionTier) || user?.role === "admin" || isInTrial(user)) return "pro";
   return "free";
 }
 
+/**
+ * Every field `tierOf` needs. Append this to any projection that gates on tier —
+ * a missing field here silently downgrades a trialling user to free.
+ */
+export const TRIAL_PROJECTION = "subscriptionTier role trialStartedAt trialEndsAt firstQuestCompletedAt";
+
 /** Count a user's active (incl. paused) Shards — matches getMyStats / generateSideQuest. */
 export async function countActiveShards(userId: string): Promise<number> {
-  return Shard.countDocuments({ owner: userId, status: { $in: ["active", "paused"] } });
+  // `at_risk` and `stalled` are still the user's open workload — they're just
+  // lifecycle flags set by the nightly sweep, not a different kind of shard. If
+  // they didn't count here, letting a shard go quiet for five days would silently
+  // free up a slot and the free-tier cap would be trivial to bypass.
+  return Shard.countDocuments({
+    owner: userId,
+    status: { $in: ["active", "paused", "at_risk", "stalled"] },
+  });
 }
 
 /** Uniform failure payload the client keys off (needsUpgrade → show paywall). */

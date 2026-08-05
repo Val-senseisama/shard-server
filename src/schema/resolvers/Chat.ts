@@ -10,13 +10,12 @@ import Chat, { Message } from "../../models/Chat.js";
 import Friendship from "../../models/Friendship.js";
 import Shard from "../../models/Shard.js";
 import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
-import { createNotification } from "./Notifications.js";
 import { User } from "../../models/User.js";
-import { enqueuePushNotification } from "../../Helpers/Queue.js";
 import { moderate } from "../../Helpers/ContentModerator.js";
 import { generateChatSummary, checkAIUsage, trackAIUsage } from "../../Helpers/AIHelper.js";
 import { tierOf } from "../../Helpers/Entitlements.js";
 import { Types } from "mongoose";
+import { notifyMany } from "../../Helpers/Notify.js";
 
 const cacheInvalidateChat = cacheInvalidate.chat;
 const cacheInvalidateUserChats = cacheInvalidate.userChats;
@@ -76,15 +75,16 @@ async function processMentions(
   const uniqueMentions = [...new Set(mentionedIds)];
 
   if (uniqueMentions.length > 0) {
-    enqueuePushNotification(
-      uniqueMentions,
-      {
-        title: `@${senderUsername} mentioned you`,
-        body: content.length > 60 ? content.substring(0, 60) + "..." : content,
-        data: { chatId, screen: "/(screens)/shard/[id]/chat", isMention: "true" },
-      },
-      "messages"
-    ).catch((e) => logError("MentionNotificationError", e));
+    notifyMany(uniqueMentions, {
+      kind: "message",
+      title: `@${senderUsername} mentioned you`,
+      body: content.length > 60 ? content.substring(0, 60) + "..." : content,
+      data: { chatId, screen: "/(screens)/shard/[id]/chat", isMention: "true" },
+      emailData: { actorName: senderUsername },
+      // Chat is transactional and per-message — never collapse it into a
+      // once-a-day slot.
+      dedupeKey: null,
+    }).catch((e) => logError("notify:mention", e));
   }
 
   return uniqueMentions;
@@ -300,28 +300,21 @@ export default {
         (p: any) => p.toString() !== context.id
       );
 
-      for (const participant of otherParticipants) {
-        await createNotification(
-          participant.toString(),
-          `${sender?.username || "Someone"} sent you a message`,
-          "message"
-        );
-      }
-
+      // Mentioned users were already notified with the mention copy — don't
+      // send them a second, weaker "new message" on top.
       const recipientIds = otherParticipants
         .map((p: any) => p.toString())
         .filter((id) => !mentionedIds.includes(id));
 
       if (recipientIds.length > 0) {
-        enqueuePushNotification(
-          recipientIds,
-          {
-            title: `New message from ${sender?.username || "Someone"}`,
-            body: content.length > 50 ? content.substring(0, 50) + "..." : content,
-            data: { chatId: chatId.toString(), screen: "/(screens)/shard/[id]/chat" },
-          },
-          "messages"
-        ).catch((e) => logError("QueueDispatchError", e));
+        await notifyMany(recipientIds, {
+          kind: "message",
+          title: `New message from ${sender?.username || "Someone"}`,
+          body: content.length > 50 ? content.substring(0, 50) + "..." : content,
+          data: { chatId: chatId.toString(), screen: "/(screens)/shard/[id]/chat" },
+          emailData: { actorName: sender?.username },
+          dedupeKey: null,
+        }).catch((e) => logError("notify:message", e));
       }
 
       // Real-time broadcast — includes replyTo so clients can render quote previews
@@ -729,7 +722,7 @@ export default {
 
       // AI credit gate — chat summaries cost 1 credit for free users, unlimited for Pro
       const [tierErr, sumUser] = await catchError(
-        User.findById(context.id, "subscriptionTier role trialEndsAt").lean()
+        User.findById(context.id, "subscriptionTier role trialStartedAt trialEndsAt firstQuestCompletedAt").lean()
       );
       const sumTier = tierOf(sumUser as any);
       if (sumTier === "free") {

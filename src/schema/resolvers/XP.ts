@@ -5,13 +5,22 @@ import {
   ThrowError,
 } from "../../Helpers/Helpers.js";
 import { User } from "../../models/User.js";
-import Streak from "../../models/Streak.js";
 import MiniGoal from "../../models/MiniGoal.js";
 import Shard from "../../models/Shard.js";
 import Friendship from "../../models/Friendship.js";
 import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
 import { ACHIEVEMENTS, ACHIEVEMENT_MAP, type UserStats } from "../../data/achievements.js";
-import { createNotification } from "./Notifications.js";
+import { recordActivity, getStreak, xpMultiplierFor, repairStreak } from "../../Helpers/Streak.js";
+import { tierOf } from "../../Helpers/Entitlements.js";
+import { logEvent } from "../../Helpers/Telemetry.js";
+import { notify, notifyStreakProgress } from "../../Helpers/Notify.js";
+import { stampFirstMiniGoal } from "../../Helpers/Activation.js";
+import {
+  taskXPValue,
+  miniGoalProgress,
+  allTasksComplete,
+  recomputeShardProgress,
+} from "../../Helpers/Progress.js";
 
 /**
  * Calculate XP needed for next level
@@ -50,10 +59,7 @@ export async function awardXP(userId: string, amount: number, reason: string) {
     return;
   }
 
-  let multiplier = 1.0;
-  if (user.comebackBonusUntil && new Date(user.comebackBonusUntil) > new Date()) {
-    multiplier = 1.2;
-  }
+  const multiplier = xpMultiplierFor(user as any);
 
   const finalAmount = Math.floor(amount * multiplier);
   const newXP = user.xp + finalAmount;
@@ -207,14 +213,21 @@ export async function checkAchievements(userId: string): Promise<string[]> {
 
   await cacheInvalidate.user(userId);
 
-  // Fire one notification per unlock (fire-and-forget)
+  // One notification per unlock, and now an actual push — these only ever wrote
+  // an in-app row, so the moment a user earned something they weren't told
+  // unless they happened to be looking. Deduped per achievement id, so an
+  // unlock can't be announced twice.
   for (const id of newlyUnlocked) {
     const a = ACHIEVEMENT_MAP.get(id)!;
-    createNotification(
+    notify({
       userId,
-      `${a.icon} Achievement unlocked: ${a.name} — ${a.description}`,
-      "achievement"
-    ).catch(() => {});
+      kind: "achievement",
+      title: `${a.icon} Achievement unlocked`,
+      body: `${a.name} — ${a.description}`,
+      data: { screen: "/achievements" },
+      dedupeKey: `achievement:${id}`,
+      emailData: { achievementName: a.name },
+    }).catch(() => {});
   }
 
   SaveAuditTrail({
@@ -224,71 +237,6 @@ export async function checkAchievements(userId: string): Promise<string[]> {
   });
 
   return newlyUnlocked;
-}
-
-/**
- * Update streak
- */
-export async function updateStreak(userId: string, type: string) {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-
-  const [error, streak] = await catchError(
-    Streak.findOne({
-      userId,
-      type,
-    }).lean()
-  );
-
-  if (error) {
-    logError("updateStreak", error);
-    return;
-  }
-
-  if (!streak) {
-    // Create new streak
-    await Streak.create({
-      userId,
-      type,
-      currentStreak: 1,
-      longestStreak: 1,
-      lastActivityDate: today,
-      streakStartDate: today,
-    });
-    return;
-  }
-
-  const lastActivity = new Date(streak.lastActivityDate);
-  lastActivity.setHours(0, 0, 0, 0);
-
-  const daysSince = Math.floor((today.getTime() - lastActivity.getTime()) / (1000 * 60 * 60 * 24));
-
-  let newStreak = streak.currentStreak;
-  let newLongest = streak.longestStreak;
-  let newStartDate = streak.streakStartDate;
-
-  if (daysSince === 1) {
-    // Continue streak
-    newStreak++;
-    if (newStreak > newLongest) {
-      newLongest = newStreak;
-    }
-  } else if (daysSince > 1) {
-    // Streak broken
-    newStreak = 1;
-    newStartDate = today;
-  }
-  // If daysSince === 0, already updated today
-
-  await Streak.findOneAndUpdate(
-    { userId, type },
-    {
-      currentStreak: newStreak,
-      longestStreak: newLongest,
-      lastActivityDate: today,
-      streakStartDate: newStartDate,
-    }
-  );
 }
 
 /**
@@ -371,117 +319,49 @@ export async function completeTask(userId: string, shardId: string, miniGoalId: 
   tasks[taskIndex].completed = true;
   tasks[taskIndex].completedAt = new Date();
 
-  // Calculate completed tasks
-  const completedCount = tasks.filter(t => t.completed).length;
-  const progress = Math.floor((completedCount / tasks.length) * 100);
-
-  console.log(`✅ [completeTask] Task marked complete. New progress: ${progress}%`);
+  // Weighted progress — a task's XP value is its share of the work.
+  const progress = miniGoalProgress(tasks);
+  const miniGoalNowComplete = allTasksComplete(tasks);
 
   await MiniGoal.findByIdAndUpdate(miniGoalId, {
     tasks,
     progress,
-    completed: progress === 100,
+    completed: miniGoalNowComplete,
   });
 
-  // Update shard overall progress based on all mini-goals
-  const [allMgError, allMiniGoals] = await catchError(
-    MiniGoal.find({ shardId }).lean()
-  );
-
-  if (!allMgError && allMiniGoals && allMiniGoals.length > 0) {
-    const totalProgress = allMiniGoals.reduce((sum: number, mg: any) => sum + mg.progress, 0);
-    const shardProgress = Math.floor(totalProgress / allMiniGoals.length);
-    console.log(`📊 [completeTask] Updating shard progress to ${shardProgress}%`);
-    await Shard.findByIdAndUpdate(shardId, {
-      "progress.completion": shardProgress,
-      lastActivityAt: new Date(),
-    });
-  } else {
-    // Still update lastActivityAt even if no mini-goal aggregation needed
-    await Shard.findByIdAndUpdate(shardId, { lastActivityAt: new Date() });
+  // Finishing the last task finishes the mini-goal — the activation milestone
+  // reaches through this path too, not just the explicit completeMiniGoal call.
+  if (miniGoalNowComplete && !minigoal.completed) {
+    stampFirstMiniGoal(userId).catch(() => {});
   }
 
-  // === User Schema Streak Hardening & Comeback Bonus ===
-  const [userError, rawUser] = await catchError(User.findById(userId).select("currentStreak longestStreak lastCompletionDate streakFreezeTokens comebackBonusUntil").lean());
-  const user = rawUser as any;
-  
-  if (!userError && user) {
-    const now = new Date();
-    const lastCompletion = user.lastCompletionDate ? new Date(user.lastCompletionDate) : null;
-    
-    let newStreak = user.currentStreak || 0;
-    let newLongest = user.longestStreak || 0;
-    let newStreakFreezeTokens = user.streakFreezeTokens ?? 1;
-    let newComebackBonusUntil = user.comebackBonusUntil;
+  // One shard-progress formula, shared with completeMiniGoal (they used to
+  // disagree and overwrite each other), and it refreshes lastActivityAt.
+  await recomputeShardProgress(shardId);
 
-    if (lastCompletion) {
-      const todayMidnight = new Date(now);
-      todayMidnight.setHours(0, 0, 0, 0);
-      const lastMidnight = new Date(lastCompletion);
-      lastMidnight.setHours(0, 0, 0, 0);
-      
-      const daysDifference = Math.floor((todayMidnight.getTime() - lastMidnight.getTime()) / (1000 * 60 * 60 * 24));
-      
-      if (daysDifference > 7) {
-        // More than a week gone -> +20% comeback bonus for next 3 days
-        newComebackBonusUntil = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
-      }
+  // Streak: one engine, user-local day boundaries, idempotent per day.
+  // Must run BEFORE awardXP so a comeback bonus granted by this activity
+  // applies to the XP it earned.
+  const streak = await recordActivity(userId);
 
-      if (daysDifference === 1) {
-        newStreak += 1;
-      } else if (daysDifference > 1) {
-        if (newStreakFreezeTokens > 0) {
-          // Freeze token breaks the fall
-          newStreakFreezeTokens -= 1;
-          newStreak += 1;
-          console.log(`❄️ [completeTask] Consumed freeze token for user ${userId}. Tokens left: ${newStreakFreezeTokens}`);
-        } else {
-          // Streak broken completely
-          newStreak = 1;
-          console.log(`💔 [completeTask] Streak broken for user ${userId}. Reset to 1.`);
-        }
-      }
-      // If 0, same day, no change to streak length
-    } else {
-      // First ever task completion
-      newStreak = 1;
-    }
-
-    if (newStreak > newLongest) {
-      newLongest = newStreak;
-    }
-
-    const updatePayload: any = {
-      $set: {
-        currentStreak: newStreak,
-        longestStreak: newLongest,
-        lastCompletionDate: now,
-        streakFreezeTokens: newStreakFreezeTokens,
-        previousStreak: user.currentStreak || 0, // snapshot before update
-      }
-    };
-    if (newComebackBonusUntil) {
-      updatePayload.$set.comebackBonusUntil = newComebackBonusUntil;
-    } else {
-      updatePayload.$unset = { comebackBonusUntil: "" };
-    }
-
-    await User.findByIdAndUpdate(userId, updatePayload);
-  }
-
-  // Award XP (20 XP per task - will be multiplied by awardXP if comeback bonus active)
-  const xpResult = await awardXP(userId, 20, `Task in ${minigoal.title}`);
+  // XP scales with the task's own reward — the AI already sizes these per task
+  // (see AIHelper), so a 3-hour task no longer pays the same as a 5-minute one.
+  const baseXP = taskXPValue(tasks[taskIndex]);
+  const xpResult = await awardXP(userId, baseXP, `Task in ${minigoal.title}`);
 
   // Record what was ACTUALLY paid out, so uncompleteTask can claw back the
   // exact amount rather than guessing at the bonus multiplier.
-  const xpAwarded = Math.floor(20 * (xpResult?.bonusMultiplier ?? 1));
+  const xpAwarded = Math.floor(baseXP * (xpResult?.bonusMultiplier ?? 1));
   await MiniGoal.updateOne(
     { _id: miniGoalId },
     { $set: { [`tasks.${taskIndex}.xpAwarded`]: xpAwarded } }
   );
 
-  // Historical streak tracking widget update
-  await updateStreak(userId, "task_completion");
+  // Celebrate milestones / freeze saves at the moment they happen, rather than
+  // in a next-day cron that couldn't tell a new milestone from a stale one.
+  if (streak.counted) {
+    notifyStreakProgress(userId, streak).catch(() => {});
+  }
 
   // Check for achievements
   const achievements = await checkAchievements(userId);
@@ -489,7 +369,7 @@ export async function completeTask(userId: string, shardId: string, miniGoalId: 
   return {
     success: true,
     message: "Task completed!",
-    xpEarned: 20,
+    xpEarned: baseXP,
     xpResult,
     achievements,
   };
@@ -506,9 +386,8 @@ export const UNDO_WINDOW_MINUTES = 5;
  *    multiplier is accounted for). Without this, complete→undo→complete would
  *    be an infinite XP loop.
  *  - The STREAK IS NOT reverted. A streak answers "did you show up today", and
- *    you did — you just mis-tapped one task. Unwinding it correctly is also
- *    unsound: several completions on the same day each overwrite
- *    `previousStreak`, so there's no reliable value to roll back to.
+ *    you did — you just mis-tapped one task. The engine is idempotent per local
+ *    day anyway, so there is no per-completion state to unwind.
  *  - ACHIEVEMENTS ARE NOT revoked. They're permanent by design and there is no
  *    revocation path; taking a badge away over a mis-tap is worse than keeping it.
  */
@@ -564,27 +443,26 @@ export async function uncompleteTask(userId: string, shardId: string, miniGoalId
   // Revert the task
   tasks[taskIndex].completed = false;
   tasks[taskIndex].completedAt = undefined;
-  const clawback = task.xpAwarded ?? task.xpReward ?? 20;
+  const clawback = task.xpAwarded ?? taskXPValue(task);
   tasks[taskIndex].xpAwarded = undefined;
 
-  const completedCount = tasks.filter((t) => t.completed).length;
-  const progress = Math.floor((completedCount / tasks.length) * 100);
+  const progress = miniGoalProgress(tasks);
+  const miniGoalNowComplete = allTasksComplete(tasks);
 
   await MiniGoal.findByIdAndUpdate(miniGoalId, {
     tasks,
     progress,
-    completed: progress === 100,
+    completed: miniGoalNowComplete,
   });
 
-  // Roll the parent shard's progress back too
-  const [allMgError, allMiniGoals] = await catchError(MiniGoal.find({ shardId }).lean());
-  if (!allMgError && allMiniGoals && allMiniGoals.length > 0) {
-    const totalProgress = allMiniGoals.reduce((sum: number, mg: any) => sum + mg.progress, 0);
-    await Shard.findByIdAndUpdate(shardId, {
-      "progress.completion": Math.floor(totalProgress / allMiniGoals.length),
-      lastActivityAt: new Date(),
-    });
+  // Finishing the last task finishes the mini-goal — the activation milestone
+  // reaches through this path too, not just the explicit completeMiniGoal call.
+  if (miniGoalNowComplete && !minigoal.completed) {
+    stampFirstMiniGoal(userId).catch(() => {});
   }
+
+  // Roll the parent shard's progress back through the same one formula.
+  await recomputeShardProgress(shardId);
 
   // Claw back the XP, never below zero, and recompute the level from the result.
   const [userError, rawUser] = await catchError(User.findById(userId).select("xp level").lean());
@@ -624,6 +502,59 @@ export default {
     async uncompleteTask(_, { shardId, miniGoalId, taskIndex }, context) {
       if (!context.id) ThrowError("Please login to continue.");
       return await uncompleteTask(context.id, shardId, miniGoalId, taskIndex);
+    },
+
+    /**
+     * Restore a streak broken within the repair window.
+     *
+     * The strongest retention save in the product and a natural paid moment: a
+     * user who just lost a 23-day streak is the most motivated buyer you will
+     * ever have. Free users get one repair from a freeze token if they have one;
+     * Pro users can always repair.
+     */
+    async repairStreak(_, __, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+
+      const [userErr, user] = await catchError(
+        User.findById(context.id)
+          .select("subscriptionTier role trialStartedAt trialEndsAt firstQuestCompletedAt streakFreezeTokens")
+          .lean()
+      );
+      if (userErr || !user) return { success: false, message: "User not found." };
+
+      const isPro = tierOf(user as any) === "pro";
+      const freezes = (user as any).streakFreezeTokens ?? 0;
+
+      if (!isPro && freezes <= 0) {
+        return {
+          success: false,
+          message:
+            "You're out of streak freezes. Shard Pro includes unlimited streak repairs.",
+        };
+      }
+
+      const result = await repairStreak(context.id);
+      if (!result.success) return result;
+
+      // Free repairs cost a freeze token; Pro repairs don't.
+      if (!isPro) {
+        await User.findByIdAndUpdate(context.id, { $inc: { streakFreezeTokens: -1 } });
+      }
+
+      await cacheInvalidate.user(context.id);
+      SaveAuditTrail({
+        userId: context.id,
+        task: "Streak Repaired",
+        details: `Restored ${result.restored} day streak (${isPro ? "pro" : "freeze token"})`,
+      });
+      logEvent({
+        name: "streak_repaired",
+        userId: context.id,
+        tier: isPro ? "pro" : "free",
+        props: { restored: result.restored ?? 0 },
+      });
+
+      return result;
     },
 
     // Clear the pending achievements queue after the client has shown them
@@ -694,29 +625,35 @@ export default {
       };
     },
 
+    /**
+     * The user's streak, from the engine.
+     *
+     * Previously read the per-type `Streak` collection, which was written on
+     * every completion but never surfaced anywhere in the app — and computed its
+     * day boundaries in UTC, so it disagreed with the streak the user actually
+     * saw. The response shape is unchanged; there's now one authoritative entry.
+     */
     async getStreaks(_, __, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      const [error, streaks] = await catchError(
-        Streak.find({ userId: context.id }).lean()
-      );
-
-      if (error) {
-        logError("getStreaks", error);
-        return {
-          success: false,
-          streaks: [],
-        };
+      const snapshot = await getStreak(context.id);
+      if (!snapshot) {
+        return { success: false, streaks: [] };
       }
 
       return {
         success: true,
-        streaks: streaks.map((s: any) => ({
-          type: s.type,
-          currentStreak: s.currentStreak,
-          longestStreak: s.longestStreak,
-          lastActivityDate: s.lastActivityDate,
-        })),
+        streaks: [
+          {
+            type: "daily_activity",
+            currentStreak: snapshot.current,
+            longestStreak: snapshot.longest,
+            lastActivityDate: snapshot.lastDayKey ?? "",
+            state: snapshot.state,
+            freezesAvailable: snapshot.freezesAvailable,
+            atRiskToday: snapshot.atRiskToday,
+          },
+        ],
       };
     },
   },

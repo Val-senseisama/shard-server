@@ -14,12 +14,214 @@ import { tierOf, countActiveShards, upgradeError, FREE_ACTIVE_SHARD_CAP } from "
 import { enqueueReflectionMission } from "../../Helpers/CronJobs.js";
 import { moderate } from "../../Helpers/ContentModerator.js";
 import SideQuest from "../../models/SideQuest.js";
-import { createNotification } from "./Notifications.js";
 import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
 import { awardXP, checkAchievements } from "./XP.js";
 import { getCloudinarySignedUpload } from "../../Helpers/Cloudinary.js";
 import { calculateDueDate, distributeDatesEvenly, smartSchedule, SchedulableTask } from "../../Helpers/DateHelper.js";
-import { enqueuePushNotification } from "../../Helpers/Queue.js";
+import { recordActivity } from "../../Helpers/Streak.js";
+import { stampFirstMiniGoal } from "../../Helpers/Activation.js";
+import { notifyStreakProgress, notify, notifyMany } from "../../Helpers/Notify.js";
+import {
+  recomputeShardProgress,
+  earlyCompletionBonus,
+  miniGoalProgress,
+  allTasksComplete,
+  taskXPValue,
+  cadencePeriodKey,
+  previousCadencePeriodKey,
+  shardCompletionXP,
+  MINI_GOAL_COMPLETION_XP,
+} from "../../Helpers/Progress.js";
+import SocialShare from "../../models/SocialShare.js";
+import { OPEN_STATUSES } from "../../Helpers/ShardLifecycle.js";
+
+/**
+ * Finish a quest and pay out its rewards. Shared by the `completeShard`
+ * mutation and by `updateShard(status: 'completed')`, so a completion cannot
+ * skip the payout depending on which path the client happens to use.
+ *
+ * Idempotent: `completionXPAwarded` is the guard, so a double-tap, a retry, or
+ * both entry points firing at once can't pay twice.
+ */
+async function _completeShard(shardId: string, userId: string) {
+    if (!userId) ThrowError("Please login to continue.");
+
+    const [shardErr, shard] = await catchError(Shard.findById(shardId).lean());
+    if (shardErr || !shard) {
+      return { success: false, message: "Quest not found." };
+    }
+
+    if (shard.owner.toString() !== userId) {
+      return { success: false, message: "Only the quest owner can complete it." };
+    }
+
+    // Guard on the payout, not the status. `updateShard` sets status first and
+    // then delegates here, so a status-based check reported "already complete"
+    // for a quest that had never been paid — silently skipping the reward on
+    // exactly the path this helper was extracted to protect.
+    // `completionXPAwarded` is the only fact that means "we already paid".
+    if ((shard as any).completionXPAwarded != null) {
+      return {
+        success: true,
+        message: "This quest is already complete.",
+        xpEarned: 0,
+        alreadyComplete: true,
+      };
+    }
+
+    // Recompute rather than trusting the stored percentage, which a stale
+    // write could have left behind.
+    const { completion } = await recomputeShardProgress(shardId, { touchActivity: false });
+
+    const endDate = shard.timeline?.endDate ? new Date(shard.timeline.endDate) : null;
+    const onTime = !endDate || Date.now() <= endDate.getTime();
+
+    const payout = shardCompletionXP(shard.rewards as any[], { onTime, completion });
+
+    const updated = await Shard.findOneAndUpdate(
+      // The guard: only pay if nobody has paid yet.
+      { _id: shardId, completionXPAwarded: { $exists: false } },
+      {
+        $set: {
+          status: "completed",
+          completedAt: new Date(),
+          completionXPAwarded: payout.total,
+          "progress.completion": completion,
+          lastActivityAt: new Date(),
+        },
+      },
+      { new: true }
+    );
+
+    if (!updated) {
+      // Lost the race — someone else completed it microseconds ago.
+      return {
+        success: true,
+        message: "This quest is already complete.",
+        xpEarned: 0,
+        alreadyComplete: true,
+      };
+    }
+
+    const xpResult = await awardXP(userId, payout.total, `Completed quest: ${shard.title}`);
+
+    // Completion is qualifying activity for the streak.
+    const streak = await recordActivity(userId);
+    if (streak.counted) notifyStreakProgress(userId, streak).catch(() => {});
+
+    // Stamp the trial-ending milestone, once. Finishing a quest is the moment the
+    // user has actual proof the product works, which is where the paywall belongs
+    // — not on day 7 of a countdown they had no way to evaluate.
+    // `$exists: false` makes this first-write-wins, so a second completion can't
+    // reset someone's trial.
+    const milestone = await User.findOneAndUpdate(
+      { _id: userId, firstQuestCompletedAt: { $exists: false } },
+      { $set: { firstQuestCompletedAt: new Date() } },
+      { new: false }
+    ).lean();
+    const isFirstEverCompletion = !!milestone;
+    if (isFirstEverCompletion) {
+      await cacheInvalidate.user(userId);
+      logEvent({
+        name: "first_quest_completed",
+        userId,
+        props: {
+          daysSinceSignup: Math.round(
+            (Date.now() - new Date((milestone as any).createdAt).getTime()) / 86_400_000
+          ),
+          completion,
+        },
+      });
+    }
+
+    // A share card — the SocialShare model existed but nothing ever wrote one.
+    const [shareErr, share] = await catchError(
+      SocialShare.create({
+        userId: userId,
+        shardId,
+        type: "shard_completed",
+        content: `Finished "${shard.title}" — ${completion}% complete, ${payout.total} XP.`,
+        metadata: {
+          shardTitle: shard.title,
+          completion,
+          xpEarned: payout.total,
+          onTime,
+          daysTaken: Math.max(
+            1,
+            Math.round(
+              (Date.now() - new Date(shard.timeline.startDate).getTime()) / 86_400_000
+            )
+          ),
+        },
+      })
+    );
+    if (shareErr) logError("completeShard:share", shareErr);
+
+    await notify({
+      userId: userId,
+      kind: "shard_completed",
+      title: "🏆 Quest complete",
+      body: `"${shard.title}" is done — ${payout.total} XP${onTime ? " including an on-time bonus" : ""}. A reflection mission is waiting.`,
+      shardId,
+      data: { screen: "/Home", shardId },
+      emailData: { shardTitle: shard.title },
+    });
+
+    // Tell collaborators too — the point of a shared quest.
+    const collaboratorIds = (shard.participants ?? [])
+      .map((p: any) => p.user.toString())
+      .filter((id: string) => id !== userId);
+    if (collaboratorIds.length > 0) {
+      notifyMany(collaboratorIds, {
+        kind: "shard_update",
+        title: "Quest complete",
+        body: `"${shard.title}" has been completed.`,
+        shardId,
+        data: { screen: "/Home", shardId },
+        emailData: { shardTitle: shard.title },
+      }).catch(() => {});
+    }
+
+    enqueueReflectionMission({
+      userId: userId,
+      shardId,
+      shardTitle: shard.title,
+      completionRate: completion,
+    }).catch((err) => logError("completeShard:reflection", err));
+
+    logEvent({
+      name: "shard_completed",
+      userId: userId,
+      props: { completion, onTime, xpEarned: payout.total },
+    });
+
+    SaveAuditTrail({
+      userId: userId,
+      task: "Completed Quest",
+      details: `${shard.title} — ${completion}%, ${payout.total} XP`,
+    });
+
+    checkAchievements(userId).catch(() => {});
+    await cacheInvalidate.shard(shardId);
+    await cacheInvalidate.shardList(userId);
+
+    return {
+      success: true,
+      message: onTime
+        ? `Quest complete! +${payout.total} XP (includes a ${payout.onTimeBonus} XP on-time bonus).`
+        : `Quest complete! +${payout.total} XP.`,
+      xpEarned: payout.total,
+      xpResult,
+      completion,
+      onTime,
+      shareId: share ? (share as any)._id.toString() : null,
+      // The client shows the upsell here rather than during onboarding: the user
+      // has just proved the product works for them, which is the only honest
+      // place to ask for money.
+      isFirstCompletion: isFirstEverCompletion,
+      alreadyComplete: false,
+    };
+}
 
 // ─── Standalone schedule helper (called by both scheduleTasks + generateWeeklyTasks) ───
 
@@ -112,7 +314,7 @@ export default {
 
       try {
         const [userError, user] = await catchError(
-          User.findById(context.id, "role subscriptionTier trialEndsAt username bio birthdate timezone level xp currentStreak strength intelligence charisma endurance creativity preferences").lean()
+          User.findById(context.id, "role subscriptionTier trialStartedAt trialEndsAt firstQuestCompletedAt username bio birthdate timezone level xp currentStreak strength intelligence charisma endurance creativity preferences").lean()
         );
 
         if (userError) {
@@ -320,15 +522,14 @@ export default {
         // Notify participants
         if (participants && participants.length > 0) {
           const participantIds = participants.map((p: any) => p.user);
-          await enqueuePushNotification(
-            participantIds,
-            {
-              title: "New Quest Invite",
-              body: `You've been invited to join the quest: ${newShard.title}`,
-              data: { shardId: newShard._id.toString(), screen: "/shard-info" }
-            },
-            'shardInvites' // Check shard invite preferences
-          ).catch(e => logError("PushNotificationError", e));
+          await notifyMany(participantIds, {
+            kind: "shard_invite",
+            title: "New Quest Invite",
+            body: `You've been invited to join the quest: ${newShard.title}`,
+            shardId: newShard._id.toString(),
+            data: { screen: "/shard-info" },
+            emailData: { shardTitle: newShard.title },
+          }).catch((e) => logError("notify:shardInvite", e));
         }
 
         console.log("🎉 [createShard] Shard creation complete!");
@@ -382,7 +583,7 @@ export default {
         // Free plan: cap active quests. Counts all active+paused Shards so the
         // manual path can't be used to bypass the createShard cap.
         const [capUserErr, capUser] = await catchError(
-          User.findById(context.id, "subscriptionTier role trialEndsAt").lean()
+          User.findById(context.id, "subscriptionTier role trialStartedAt trialEndsAt firstQuestCompletedAt").lean()
         );
         if (!capUserErr && tierOf(capUser as any) === 'free') {
           const activeCount = await countActiveShards(context.id);
@@ -597,7 +798,11 @@ export default {
       const setFields: any = {};
       if (input.title) setFields.title = input.title;
       if (input.description) setFields.description = input.description;
-      if (input.status) setFields.status = input.status;
+      // 'completed' is NOT written here — `_completeShard` below owns that
+      // transition so the status and the payout can never disagree. Writing it
+      // here as well would also re-introduce the ordering bug where the status
+      // landed first and the payout was then skipped as "already complete".
+      if (input.status && input.status !== 'completed') setFields.status = input.status;
       if (input.image !== undefined) setFields.image = input.image;
       if (input.isPrivate !== undefined) setFields.isPrivate = input.isPrivate;
       if (input.isAnonymous !== undefined) setFields.isAnonymous = input.isAnonymous;
@@ -670,45 +875,40 @@ export default {
 
       // Send "added to quest" to new participants
       if (newlyAddedIds.length > 0) {
-        await Promise.all(newlyAddedIds.map((uid: string) => {
-          cacheInvalidate.shardList(uid);
-          createNotification(uid, `${ownerName} added you to the quest: ${updatedShard.title}`, "shard_invite", { shardId: id });
-          return enqueuePushNotification([uid], {
-            title: "You've been added to a Quest!",
-            body: `${ownerName} added you to "${updatedShard.title}"`,
-            data: { shardId: id, screen: "/shard-info" }
-          }, 'shardInvites').catch(e => logError("PushNotificationError", e));
-        }));
+        newlyAddedIds.forEach((uid: string) => cacheInvalidate.shardList(uid));
+        await notifyMany(newlyAddedIds, {
+          kind: "shard_invite",
+          title: "You've been added to a Quest!",
+          body: `${ownerName} added you to "${updatedShard.title}"`,
+          shardId: id,
+          data: { screen: "/shard-info" },
+          emailData: { shardTitle: updatedShard.title, actorName: ownerName },
+        }).catch((e) => logError("notify:shardInvite", e));
       }
 
       // Send "quest updated" only to existing participants
       if (existingIds.length > 0) {
-        await enqueuePushNotification(
-          existingIds,
-          {
-            title: "Quest Updated",
-            body: `${updatedShard.title} has been updated.`,
-            data: { shardId: updatedShard._id.toString(), screen: "/shard-info" }
-          },
-          'shardUpdates'
-        ).catch(e => logError("PushNotificationError", e));
+        await notifyMany(existingIds, {
+          kind: "shard_update",
+          title: "Quest Updated",
+          body: `${updatedShard.title} has been updated.`,
+          shardId: updatedShard._id.toString(),
+          data: { screen: "/shard-info" },
+          emailData: { shardTitle: updatedShard.title, message: "Details changed." },
+        }).catch((e) => logError("notify:shardUpdate", e));
       }
 
-      // Trigger reflection mission when shard is marked complete
+      // Completing via a status write goes through the same payout path as the
+      // `completeShard` mutation. This branch used to fire a reflection mission
+      // and a notification and nothing else — no XP, no rewards, no share card —
+      // so which entry point the client used decided whether finishing a quest
+      // was worth anything.
       if (input.status === 'completed' && shard.status !== 'completed') {
-        enqueueReflectionMission({
-          userId: context.id,
-          shardId: updatedShard._id.toString(),
-          shardTitle: updatedShard.title,
-          completionRate: updatedShard.progress.completion,
-        }).catch((err) => logError('enqueueReflectionMission', err));
-
-        await createNotification(
-          context.id,
-          `Quest complete! A reflection mission is waiting for you.`,
-          'achievement',
-          { shardId: updatedShard._id.toString() }
-        );
+        // `_completeShard` owns the whole transition — status, completedAt, the
+        // payout, the share card and the notifications. It is also the only place
+        // that checks ownership, so a non-owner's status write is refused here
+        // rather than half-applied.
+        await _completeShard(id, context.id);
       }
 
       return {
@@ -863,22 +1063,15 @@ export default {
       const [ownerErr, owner] = await catchError(User.findById(context.id).select("username").lean());
       const ownerName = (!ownerErr && owner) ? (owner as any).username : "Someone";
 
-      await createNotification(
+      await notify({
         userId,
-        `${ownerName} added you to the quest: ${shard.title}`,
-        "shard_invite",
-        { shardId }
-      );
-
-      enqueuePushNotification(
-        [userId],
-        {
-          title: "You've been added to a Quest!",
-          body: `${ownerName} added you to "${shard.title}"`,
-          data: { shardId: shardId, screen: "/shard-info" }
-        },
-        'shardInvites'
-      ).catch(e => logError("QueueDispatchError", e));
+        kind: "shard_invite",
+        title: "You've been added to a Quest!",
+        body: `${ownerName} added you to "${shard.title}"`,
+        shardId,
+        data: { screen: "/shard-info" },
+        emailData: { shardTitle: shard.title, actorName: ownerName },
+      });
 
       return {
         success: true,
@@ -1038,21 +1231,33 @@ export default {
       });
 
       // Push notification to assignee
-      await enqueuePushNotification(
-        [userId],
-        {
-          title: "New Assignment",
-          body: `${assignerName} assigned "${targetLabel}" to you in ${shard.title}`,
-          data: { shardId: shard._id.toString(), screen: "/shard-info" }
-        },
-        'questDeadlines'
-      ).catch(e => logError("PushNotificationError", e));
+      await notify({
+        userId,
+        kind: "task_assigned",
+        title: "New Assignment",
+        body: `${assignerName} assigned "${targetLabel}" to you in ${shard.title}`,
+        shardId: shard._id.toString(),
+        data: { screen: "/shard-info" },
+        emailData: { shardTitle: shard.title, actorName: assignerName },
+      }).catch((e) => logError("notify:taskAssigned", e));
 
       return { success: true, message: "Assigned successfully." };
     },
 
 
-    // Complete mini-goal
+    /**
+     * Check in on a recurring habit quest for the current cadence period.
+     *
+     * Rewritten. The previous version:
+     *   - called CommonJS `require()` inside this ESM module, which threw a
+     *     ReferenceError *after* it had already awarded XP and bumped the
+     *     streak — a partial write that reported failure to the client;
+     *   - enforced no cadence at all, so it could be called in a loop, each call
+     *     doing `habitStreak + 1` and paying `20×tasks + 5×habitStreak`. XP grew
+     *     quadratically for anyone who noticed.
+     *
+     * Now one check-in per cadence period, keyed on the period the USER is in.
+     */
     async completeHabitCycle(_, { shardId }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
@@ -1069,27 +1274,55 @@ export default {
         (p: any) => p.user.toString() === context.id && p.role === "collaborator"
       );
       if (!isOwner && !isCollaborator) {
-        ThrowError("You do not have permission to reset this habit cycle.");
+        ThrowError("You do not have permission to check in on this habit.");
       }
+
+      const [tzErr, tzUser] = await catchError(
+        User.findById(context.id).select("timezone username").lean()
+      );
+      const timezone = !tzErr ? (tzUser as any)?.timezone : undefined;
+
+      // The cadence gate. One check-in per period, in the user's own clock.
+      const periodKey = cadencePeriodKey(shard.cadence, timezone);
+      if (shard.lastCycleKey === periodKey) {
+        return {
+          success: false,
+          message:
+            shard.cadence === "weekly"
+              ? "You've already checked in this week."
+              : "You've already checked in today.",
+          xpEarned: 0,
+          newStreak: shard.habitStreak || 0,
+        };
+      }
+
+      // A missed period breaks the habit streak rather than silently continuing it.
+      const continuing =
+        !shard.lastCycleKey ||
+        shard.lastCycleKey === previousCadencePeriodKey(shard.cadence, timezone);
+      const newHabitStreak = continuing ? (shard.habitStreak || 0) + 1 : 1;
 
       // Fetch all mini-goals for this shard
       const [mgError, miniGoals] = await catchError(MiniGoal.find({ shardId }).lean());
       if (mgError || !miniGoals) ThrowError("Failed to fetch mini goals");
 
-      // Count total tasks to award XP, and reset completed statuses
-      let totalTasksCompleted = 0;
+      // XP is the weight of the work actually completed this period, then the
+      // tasks reset for the next one.
+      let earnedWeight = 0;
 
       for (const mg of (miniGoals as any[])) {
         let mgChanged = false;
-        
+
         for (const task of mg.tasks) {
           if (task.completed) {
-            totalTasksCompleted++;
+            earnedWeight += taskXPValue(task);
             task.completed = false;
+            task.completedAt = undefined;
+            task.xpAwarded = undefined;
             mgChanged = true;
           }
         }
-        
+
         if (mgChanged) {
           await MiniGoal.findByIdAndUpdate(mg._id, {
             tasks: mg.tasks,
@@ -1099,35 +1332,40 @@ export default {
         }
       }
 
-      // Increment Habit streak and update progress back to 0
-      const newHabitStreak = (shard.habitStreak || 0) + 1;
-      
+      // Streak bonus, capped — the old uncapped `5 × habitStreak` was the other
+      // half of the farming exploit.
+      const streakBonus = Math.min(newHabitStreak, 20) * 5;
+      const xpEarned = earnedWeight + streakBonus;
+
       await Shard.findByIdAndUpdate(shardId, {
-        habitStreak: newHabitStreak,
-        "progress.completion": 0,
+        $set: {
+          habitStreak: newHabitStreak,
+          lastCycleKey: periodKey,
+          lastActivityAt: new Date(),
+          "progress.completion": 0,
+        },
       });
 
-      // Award XP using existing completeTask multiplier rules, if any
-      // We process the XP globally for the whole cycle reset
-      let xpEarned = totalTasksCompleted * 20;
+      // A habit check-in is qualifying activity for the daily streak too.
+      const streak = await recordActivity(context.id);
+      const xpResult = await awardXP(
+        context.id,
+        xpEarned,
+        `Habit check-in for ${shard.title}`
+      );
+      if (streak.counted) {
+        notifyStreakProgress(context.id, streak).catch(() => {});
+      }
 
-      // Add simple streak bonus: +5 XP per day in the streak
-      xpEarned += (newHabitStreak * 5);
-      
-      const { awardXP } = await import("./XP.js");
-      const xpResult = await awardXP(context.id, xpEarned, `Completed Habit Cycle for ${shard.title}`);
-
-      // Inject system message
-      const User = require("../../models/User").User;
-      const user = await User.findById(context.id).select("username").lean();
-      if (user && shard.chatId) {
-        const { Message } = await import("../../models/Chat.js");
+      // Inject system message. (This is where the ESM `require` crash lived.)
+      const username = (tzUser as any)?.username;
+      if (username && shard.chatId) {
         Message.create({
           chatId: shard.chatId,
           sender: context.id,
-          content: `${user.username} achieved a ${newHabitStreak}-cycle streak on "${shard.title}" ✨`,
+          content: `${username} kept the "${shard.title}" habit going — ${newHabitStreak} in a row ✨`,
           type: "system",
-        }).catch(e => console.error(e));
+        }).catch((e) => logError("completeHabitCycle:systemMessage", e));
       }
 
       // Invalidate caches
@@ -1136,8 +1374,11 @@ export default {
 
       return {
         success: true,
-        message: "Habit cycle completed and reset!",
+        message: continuing
+          ? `Checked in — ${newHabitStreak} ${shard.cadence === "weekly" ? "weeks" : "days"} in a row!`
+          : "Checked in — starting a fresh run.",
         xpEarned,
+        xpResult,
         newStreak: newHabitStreak,
       };
     },
@@ -1160,7 +1401,7 @@ export default {
       }
 
       const { canMakeCoachAICall, incrementCoachAICounter, generateInactivityNudge, COACH_TEMPLATES } = await import("../../Helpers/AIHelper.js");
-      const [userErr, user] = await catchError(User.findById(context.id).select("subscriptionTier role trialEndsAt").lean());
+      const [userErr, user] = await catchError(User.findById(context.id).select("subscriptionTier role trialStartedAt trialEndsAt firstQuestCompletedAt").lean());
       const isPro = !userErr && tierOf(user as any) === "pro";
 
       const staleDays = shard.lastActivityAt
@@ -1180,96 +1421,66 @@ export default {
       return { success: true, message: "Coach nudge generated!", nudge };
     },
 
-    async completeMiniGoal(_, { miniGoalId }, context) {
+    /** Finish a quest and pay out its rewards. See `_completeShard`. */
+    async completeShard(_, { shardId }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+      return _completeShard(shardId, context.id);
+    },
+
+    /**
+     * Reschedule an overdue task to a new date, or drop it.
+     *
+     * The explicit half of the decision the nightly sweep now asks for. The old
+     * `overdue-task-reschedule` cron made this choice silently for the user every
+     * night by rewriting `dueDate` to today, which is why deadlines carried no
+     * weight.
+     */
+    async resolveOverdueTask(_, { miniGoalId, taskIndex, action, newDueDate }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      const [error, minigoal] = await catchError(
-        MiniGoal.findById(miniGoalId)
-          .populate("shardId")
-          .lean()
-      );
+      const [mgErr, miniGoal] = await catchError(MiniGoal.findById(miniGoalId));
+      if (mgErr || !miniGoal) return { success: false, message: "Task not found." };
 
-      if (error || !minigoal) {
-        return {
-          success: false,
-          message: "Mini-goal not found.",
-        };
+      const [shardErr, shard] = await catchError(
+        Shard.findById(miniGoal.shardId).select("owner participants").lean()
+      );
+      if (shardErr || !shard) return { success: false, message: "Quest not found." };
+
+      const isOwner = (shard as any).owner.toString() === context.id;
+      const isCollaborator = ((shard as any).participants ?? []).some(
+        (p: any) => p.user.toString() === context.id && p.role === "collaborator"
+      );
+      if (!isOwner && !isCollaborator) {
+        return { success: false, message: "You don't have permission to change this task." };
       }
 
-      if (minigoal.completed) {
-        return {
-          success: true,
-          message: "Mini-goal already completed.",
-          xpEarned: 0,
-        };
+      const task = (miniGoal.tasks as any[])[taskIndex];
+      if (!task) return { success: false, message: "Invalid task." };
+
+      if (action === "drop") {
+        task.deleted = true;
+        task.deletedAt = new Date();
+        task.deletedBy = context.id;
+        task.overdue = false;
+      } else {
+        const target = newDueDate ? new Date(Number(newDueDate) || newDueDate) : new Date();
+        if (Number.isNaN(target.getTime())) {
+          return { success: false, message: "Invalid date." };
+        }
+        if (!task.rescheduled) task.originalDueDate = task.dueDate;
+        task.dueDate = target;
+        task.rescheduled = true;
+        task.overdue = false;
+        task.overdueSince = undefined;
       }
 
-      // Get shard to award XP
-      const shard: any = minigoal.shardId;
-
-      // Check for early completion bonus
-      const { updateStreak } = await import("../../Helpers/StreakHelper.js");
-      const { calculateEarlyCompletionBonus } = await import("../../Helpers/StreakHelper.js");
-      
-      const earlyBonus = calculateEarlyCompletionBonus(
-        minigoal.dueDate,
-        new Date()
-      );
-
-      // Base XP + early bonus
-      const totalXP = 100 + earlyBonus.bonusXP;
-
-      // Award XP for completing mini-goal
-      const xpResult = await awardXP(
-        context.id,
-        totalXP,
-        `Completed mini-goal: ${minigoal.title}${earlyBonus.isEarly ? ` (${earlyBonus.daysEarly} days early!)` : ''}`
-      );
-
-      // Update streak
-      await updateStreak(context.id);
-
-      // Update mini-goal
-      await MiniGoal.findByIdAndUpdate(miniGoalId, {
-        completed: true,
-        progress: 100,
-      });
-
-      // Check and update shard progress
-      const allMinigoals = await MiniGoal.find({ shardId: shard._id }).lean();
-      const completedCount = allMinigoals.filter((m: any) => m.completed).length;
-      const shardProgress = Math.floor((completedCount / allMinigoals.length) * 100);
-
-      // Update shard
-      await Shard.findByIdAndUpdate(shard._id, {
-        "progress.completion": shardProgress,
-      });
-
-      // Invalidate cache
-      await cacheInvalidate.shard(shard._id.toString());
-      await cacheInvalidate.shardList(context.id);
-
-      SaveAuditTrail({
-        userId: context.id,
-        task: "Completed Mini-Goal",
-        details: `Completed mini-goal: ${minigoal.title}${earlyBonus.isEarly ? ` (early completion bonus: +${earlyBonus.bonusXP} XP)` : ''}`,
-      });
-
-      // Check achievements (fire-and-forget — never blocks response)
-      checkAchievements(context.id).catch(() => {});
+      await miniGoal.save();
+      await recomputeShardProgress(miniGoal.shardId.toString());
+      await cacheInvalidate.shard(miniGoal.shardId.toString());
 
       return {
         success: true,
-        message: earlyBonus.isEarly
-          ? `Mini-goal completed ${earlyBonus.daysEarly} days early! Bonus: +${earlyBonus.bonusXP} XP`
-          : "Mini-goal completed!",
-        xpEarned: totalXP,
-        xpResult,
-        shardProgress,
-        earlyCompletion: earlyBonus.isEarly ? {
-          daysEarly: earlyBonus.daysEarly,
-          bonusXP: earlyBonus.bonusXP
-        } : null,
+        message: action === "drop" ? "Task dropped." : "Task rescheduled.",
       };
     },
 
@@ -1340,7 +1551,13 @@ export default {
       task.deletedAt = new Date();
       task.deletedBy = context.id;
 
+      // Deleting shrinks the denominator: removing the last unticked task has to
+      // be able to carry a mini-goal to complete, otherwise it can never finish.
+      miniGoal.progress = miniGoalProgress(miniGoal.tasks as any);
+      miniGoal.completed = allTasksComplete(miniGoal.tasks as any);
+
       await miniGoal.save();
+      await recomputeShardProgress(shard._id.toString());
       await cacheInvalidate.shard(shard._id.toString());
 
       return {
@@ -1394,7 +1611,13 @@ export default {
       task.deletedAt = undefined;
       task.deletedBy = undefined;
 
+      // The mirror of deleteTask: bringing an unticked task back has to be able
+      // to pull a mini-goal out of `completed`.
+      miniGoal.progress = miniGoalProgress(miniGoal.tasks as any);
+      miniGoal.completed = allTasksComplete(miniGoal.tasks as any);
+
       await miniGoal.save();
+      await recomputeShardProgress(shard._id.toString());
       await cacheInvalidate.shard(shard._id.toString());
 
       return {
@@ -1443,6 +1666,9 @@ export default {
         return { success: false, message: "Only the quest owner can delete mini-goals." };
 
       await MiniGoal.findByIdAndDelete(miniGoalId);
+      // Removing a mini-goal changes the shard's weighting, so the rolled-up
+      // completion is stale until it is recomputed from what actually remains.
+      await recomputeShardProgress(shard._id.toString());
       await cacheInvalidate.shard(shard._id.toString());
 
       SaveAuditTrail({
@@ -1479,6 +1705,9 @@ export default {
       );
       if (createError) return { success: false, message: "Failed to create mini-goal." };
 
+      // A new mini-goal adds unfinished weight, so the shard's completion has to
+      // come back down rather than keep the figure it had before.
+      await recomputeShardProgress(shardId);
       await cacheInvalidate.shard(shardId);
 
       return {
@@ -1524,7 +1753,15 @@ export default {
         rescheduled: false,
       });
 
+      // Adding a task changes the denominator, so the stored progress and the
+      // `completed` flag are both stale the moment the push lands. Without this,
+      // adding a task to a finished mini-goal leaves it sitting at 100% and
+      // `completed: true` while carrying an unticked task.
+      miniGoal.progress = miniGoalProgress(miniGoal.tasks as any);
+      miniGoal.completed = allTasksComplete(miniGoal.tasks as any);
+
       await miniGoal.save();
+      await recomputeShardProgress(shard._id.toString());
       await cacheInvalidate.shard(shard._id.toString());
 
       return { success: true, message: "Task added." };
@@ -1573,7 +1810,7 @@ export default {
         return { success: false, message: "Only the quest owner can regenerate the plan." };
 
       const [userError, user] = await catchError(
-        User.findById(context.id, "role subscriptionTier trialEndsAt username bio level xp currentStreak strength intelligence charisma endurance creativity preferences").lean()
+        User.findById(context.id, "role subscriptionTier trialStartedAt trialEndsAt firstQuestCompletedAt username bio level xp currentStreak strength intelligence charisma endurance creativity preferences").lean()
       );
       if (userError || !user) return { success: false, message: "Failed to verify user." };
 
@@ -1656,7 +1893,7 @@ export default {
     async getAIUsage(_, __, context) {
       if (!context.id) ThrowError("Please login to continue.");
       const [userError, user] = await catchError(
-        User.findById(context.id, "subscriptionTier role trialEndsAt").lean()
+        User.findById(context.id, "subscriptionTier role trialStartedAt trialEndsAt firstQuestCompletedAt").lean()
       );
       if (userError || !user) return { success: false, remaining: 0, limit: 0, canProceed: false };
       const tier = tierOf(user as any);
@@ -1880,7 +2117,12 @@ export default {
                 completed: task.completed,
                 // Lets the client know whether the undo window is still open.
                 completedAt: task.completedAt ? new Date(task.completedAt).getTime().toString() : null,
-                xpReward: task.xpReward || 20,
+                xpReward: taskXPValue(task),
+                // Marked by the nightly sweep. Sent so the client can style the
+                // row and offer reschedule-or-drop, which is the whole point of
+                // marking lateness instead of hiding it.
+                overdue: !!task.overdue,
+                taskIndex,
                 miniGoalId: mg._id.toString(),
                 miniGoalTitle: mg.title,
               };
@@ -1937,7 +2179,11 @@ export default {
               { owner: context.id },
               { 'participants.user': context.id }
             ],
-            status: 'active'
+            // Every open state, not just 'active'. A shard that the lifecycle
+            // sweep marked at_risk or stalled is exactly the one whose tasks the
+            // user still needs to see — dropping it from the schedule after five
+            // idle days would hide work at the worst possible moment.
+            status: { $in: OPEN_STATUSES },
           }).lean()
         );
 
@@ -1999,7 +2245,12 @@ export default {
                 completed: task.completed,
                 // Lets the client know whether the undo window is still open.
                 completedAt: task.completedAt ? new Date(task.completedAt).getTime().toString() : null,
-                xpReward: task.xpReward || 20,
+                xpReward: taskXPValue(task),
+                // Marked by the nightly sweep. Sent so the client can style the
+                // row and offer reschedule-or-drop, which is the whole point of
+                // marking lateness instead of hiding it.
+                overdue: !!task.overdue,
+                taskIndex,
                 miniGoalId: mg._id.toString(),
                 miniGoalTitle: mg.title,
                 shardId: mg.shardId.toString(),

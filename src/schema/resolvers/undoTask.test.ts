@@ -10,12 +10,10 @@ vi.mock("../../models/Shard.js", () => ({
 vi.mock("../../models/User.js", () => ({
   User: { findById: vi.fn(), findByIdAndUpdate: vi.fn(async () => ({})) },
 }));
-vi.mock("../../models/Streak.js", () => ({ default: {} }));
 vi.mock("../../models/Friendship.js", () => ({ default: { countDocuments: vi.fn() } }));
 vi.mock("../../Helpers/Cache.js", () => ({
   cache: {}, cacheKeys: {}, cacheInvalidate: { user: vi.fn(async () => {}) },
 }));
-vi.mock("./Notifications.js", () => ({ createNotification: vi.fn() }));
 
 import MiniGoal from "../../models/MiniGoal.js";
 import Shard from "../../models/Shard.js";
@@ -50,7 +48,8 @@ const ownedShard = { owner: { toString: () => USER }, participants: [] };
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(Shard.findById).mockReturnValue(lean(ownedShard));
-  vi.mocked(MiniGoal.find).mockReturnValue(lean([{ progress: 0 }]));
+  // recomputeShardProgress reads find().select().lean()
+  vi.mocked(MiniGoal.find).mockReturnValue(select([{ tasks: [], completed: false }]));
   vi.mocked(User.findById).mockReturnValue(select({ xp: 500, level: 3 }));
 });
 
