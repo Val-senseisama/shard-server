@@ -5,7 +5,7 @@ vi.mock("../../models/MiniGoal.js", () => ({ default: { find: vi.fn() } }));
 vi.mock("../../models/User.js", () => ({ User: { findById: vi.fn() } }));
 vi.mock("../../models/Chat.js", () => ({
   default: { findOne: vi.fn(), findById: vi.fn(), create: vi.fn() },
-  Message: { find: vi.fn(), create: vi.fn(), findById: vi.fn() },
+  Message: { find: vi.fn(), create: vi.fn(), findById: vi.fn(), countDocuments: vi.fn(async () => 0) },
 }));
 vi.mock("../../Helpers/AIHelper.js", () => ({ chatAboutShard: vi.fn() }));
 vi.mock("../../Helpers/ContentModerator.js", () => ({ moderate: vi.fn(() => ({ allowed: true })) }));
@@ -20,10 +20,16 @@ import { User } from "../../models/User.js";
 import Chat, { Message } from "../../models/Chat.js";
 import { chatAboutShard } from "../../Helpers/AIHelper.js";
 import ShardResolvers from "./Shard.js";
-import QuestAI from "./QuestAI.js";
+import QuestAI, { COACH_DAILY_MESSAGE_CAP } from "./QuestAI.js";
 
 const ctx = (id = "owner1") => ({ id });
-const leanOf = (v: any) => ({ lean: () => Promise.resolve(v) });
+// Chainable stub: callers mix .lean() and .select().lean().
+const leanOf = (v: any): any => {
+  const q: any = { lean: () => Promise.resolve(v) };
+  q.select = () => q;
+  q.sort = () => q;
+  return q;
+};
 const shardDoc = (owner = "owner1") => ({ _id: "s1", title: "Ship it", description: "d", progress: { completion: 10 }, owner, participants: [] });
 
 beforeEach(() => {
@@ -53,6 +59,46 @@ describe("chatWithQuestAI — Pro gate", () => {
     expect(res.proposal).toBeNull();
     // user message + ai_reply persisted (no proposal message)
     expect(Message.create).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("chatWithQuestAI — daily cost ceiling", () => {
+  // Pro means unlimited quests, not unlimited inference: this path runs the 70B
+  // model per message, so the tail has to be bounded.
+  beforeEach(() => {
+    vi.mocked(User.findById).mockReturnValue(leanOf({ subscriptionTier: "pro" }) as any);
+    vi.mocked(Chat.findOne).mockResolvedValue({ _id: { toString: () => "c1" } } as any);
+    vi.mocked(chatAboutShard).mockResolvedValue({ reply: "ok", proposal: null });
+  });
+
+  it("blocks a Pro user past the cap and never calls the model", async () => {
+    vi.mocked(Message.countDocuments).mockResolvedValue(COACH_DAILY_MESSAGE_CAP as any);
+
+    const res: any = await QuestAI.Mutation.chatWithQuestAI({}, { shardId: "s1", message: "hi" }, ctx());
+
+    expect(res.success).toBe(false);
+    expect(res.message).toMatch(/limit/i);
+    expect(chatAboutShard).not.toHaveBeenCalled();
+    expect(Message.create).not.toHaveBeenCalled();
+  });
+
+  it("lets a Pro user through one message below the cap", async () => {
+    vi.mocked(Message.countDocuments).mockResolvedValue((COACH_DAILY_MESSAGE_CAP - 1) as any);
+
+    const res: any = await QuestAI.Mutation.chatWithQuestAI({}, { shardId: "s1", message: "hi" }, ctx());
+
+    expect(res.success).toBe(true);
+    expect(chatAboutShard).toHaveBeenCalledTimes(1);
+  });
+
+  it("counts generated replies, not messages typed — that is what costs money", async () => {
+    vi.mocked(Message.countDocuments).mockResolvedValue(0 as any);
+
+    await QuestAI.Mutation.chatWithQuestAI({}, { shardId: "s1", message: "hi" }, ctx());
+
+    const query = vi.mocked(Message.countDocuments).mock.calls[0][0] as any;
+    expect(query.type).toBe("ai_reply");
+    expect(query.sender).toBe("owner1");
   });
 });
 
@@ -92,15 +138,50 @@ describe("applyQuestAISuggestion — fans out to existing resolvers", () => {
 });
 
 describe("dismissQuestAISuggestion — authorization (IDOR guard)", () => {
-  const makeDoc = () => ({ type: "ai_proposal", chatId: "c1", aiProposal: { status: "pending", actions: [] }, save: vi.fn(async () => {}) });
+  // sender = who asked the question that produced this proposal
+  const makeDoc = (sender = "owner1") => ({
+    type: "ai_proposal",
+    chatId: "c1",
+    sender: { toString: () => sender },
+    aiProposal: { status: "pending", actions: [] },
+    save: vi.fn(async () => {}),
+  });
 
-  it("lets a chat participant dismiss their proposal", async () => {
-    const doc = makeDoc();
+  it("lets whoever asked dismiss their own proposal", async () => {
+    const doc = makeDoc("owner1");
     vi.mocked(Message.findById).mockResolvedValue(doc as any);
-    vi.mocked(Chat.findById).mockReturnValue(leanOf({ participants: ["owner1"] }) as any);
+    vi.mocked(Chat.findById).mockReturnValue(leanOf({ participants: ["owner1"], shardId: "s1" }) as any);
     const res: any = await QuestAI.Mutation.dismissQuestAISuggestion({}, { messageId: "m1" }, ctx("owner1"));
     expect(res.success).toBe(true);
     expect(doc.aiProposal.status).toBe("dismissed");
+  });
+
+  it("lets the quest owner dismiss a proposal someone else asked for", async () => {
+    const doc = makeDoc("collab1");
+    vi.mocked(Message.findById).mockResolvedValue(doc as any);
+    vi.mocked(Chat.findById).mockReturnValue(leanOf({ participants: ["owner1", "collab1"], shardId: "s1" }) as any);
+    vi.mocked(Shard.findById).mockReturnValue(leanOf({ owner: { toString: () => "owner1" } }) as any);
+
+    const res: any = await QuestAI.Mutation.dismissQuestAISuggestion({}, { messageId: "m1" }, ctx("owner1"));
+
+    expect(res.success).toBe(true);
+    expect(doc.aiProposal.status).toBe("dismissed");
+  });
+
+  // Now that proposals land in the shared quest chat, plain membership is not
+  // enough — a collaborator could otherwise bin a plan change the owner is still
+  // weighing, and the card afterwards just reads "dismissed".
+  it("rejects a collaborator who neither owns the quest nor asked", async () => {
+    const doc = makeDoc("owner1");
+    vi.mocked(Message.findById).mockResolvedValue(doc as any);
+    vi.mocked(Chat.findById).mockReturnValue(leanOf({ participants: ["owner1", "collab1"], shardId: "s1" }) as any);
+    vi.mocked(Shard.findById).mockReturnValue(leanOf({ owner: { toString: () => "owner1" } }) as any);
+
+    const res: any = await QuestAI.Mutation.dismissQuestAISuggestion({}, { messageId: "m1" }, ctx("collab1"));
+
+    expect(res.success).toBe(false);
+    expect(doc.aiProposal.status).toBe("pending");
+    expect(doc.save).not.toHaveBeenCalled();
   });
 
   it("rejects a user who is not a participant and leaves status unchanged", async () => {

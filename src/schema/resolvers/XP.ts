@@ -102,64 +102,56 @@ async function buildUserStats(userId: string): Promise<UserStats | null> {
     .lean();
   if (!user) return null;
 
-  const [friendCount, shardsCreated, shardsCompleted, tasksCompleted, miniGoalsCompleted, collaborationsJoined] =
+  // Every shard this user touches. Resolving ids first lets the mini-goal stats
+  // below hit the `shardId` index directly instead of $lookup-ing the whole
+  // shards collection twice per achievement check.
+  //
+  // This is a normal Mongoose query, so the string `userId` is cast to an
+  // ObjectId automatically. That casting is exactly what the previous
+  // aggregation pipelines did NOT get — Mongoose does not cast inside an
+  // aggregate, so `{ "shard.owner": { $eq: userId } }` compared an ObjectId to a
+  // string, matched nothing, and silently pinned tasksCompleted and
+  // miniGoalsCompleted to 0 forever.
+  const myShards = await Shard.find(
+    { $or: [{ owner: userId }, { "participants.user": userId }] },
+    "_id owner"
+  ).lean();
+
+  const myShardIds = myShards.map((s: any) => s._id);
+  // "Joined" means a shard someone else owns — being in your own isn't a collab.
+  const joinedCount = myShards.filter((s: any) => s.owner.toString() !== userId).length;
+
+  const [friendCount, shardsCreated, shardsCompleted, tasksCompleted, miniGoalsCompleted] =
     await Promise.all([
+      // The Friendship model's fields are `user` / `friend`. This used to query
+      // `requester` / `recipient`, which exist on no schema, so it always
+      // returned 0 and no friend achievement could ever unlock.
       Friendship.countDocuments({
-        $or: [{ requester: userId }, { recipient: userId }],
+        $or: [{ user: userId }, { friend: userId }],
         status: "accepted",
       }),
       Shard.countDocuments({ owner: userId }),
       Shard.countDocuments({ owner: userId, status: "completed" }),
-      // tasksCompleted: sum completed tasks across all mini-goals the user owns
+      // tasksCompleted: sum of completed, non-deleted tasks across those shards
       MiniGoal.aggregate([
-        { $match: { "tasks.completed": true } },
-        { $lookup: { from: "shards", localField: "shardId", foreignField: "_id", as: "shard" } },
-        { $unwind: "$shard" },
-        {
-          $match: {
-            $or: [
-              { "shard.owner": { $eq: userId } },
-              { "shard.participants.user": { $eq: userId } },
-            ],
-          },
-        },
+        { $match: { shardId: { $in: myShardIds } } },
         {
           $project: {
             completedCount: {
-              $size: { $filter: { input: "$tasks", as: "t", cond: "$$t.completed" } },
+              $size: {
+                $filter: {
+                  input: { $ifNull: ["$tasks", []] },
+                  as: "t",
+                  cond: { $and: ["$$t.completed", { $ne: ["$$t.deleted", true] }] },
+                },
+              },
             },
           },
         },
         { $group: { _id: null, total: { $sum: "$completedCount" } } },
       ]).then((r) => r[0]?.total ?? 0),
-      MiniGoal.countDocuments({
-        completed: true,
-        $or: [
-          { "shard.owner": userId }, // handled via lookup below — use aggregate shortcut
-        ],
-      }).catch(() => 0) as unknown as Promise<number>, // fallback — recalculate below
-      Shard.countDocuments({
-        "participants.user": userId,
-        "participants.role": { $in: ["collaborator", "viewer"] },
-      }),
+      MiniGoal.countDocuments({ shardId: { $in: myShardIds }, completed: true }),
     ]);
-
-  // More accurate miniGoalsCompleted via aggregate
-  const miniGoalsAgg = await MiniGoal.aggregate([
-    { $match: { completed: true } },
-    { $lookup: { from: "shards", localField: "shardId", foreignField: "_id", as: "shard" } },
-    { $unwind: "$shard" },
-    {
-      $match: {
-        $or: [
-          { "shard.owner": { $eq: userId } },
-          { "shard.participants.user": { $eq: userId } },
-        ],
-      },
-    },
-    { $count: "total" },
-  ]);
-  const miniGoalsCompletedActual = miniGoalsAgg[0]?.total ?? 0;
 
   return {
     xp: user.xp,
@@ -169,9 +161,9 @@ async function buildUserStats(userId: string): Promise<UserStats | null> {
     friendCount,
     shardsCreated,
     shardsCompleted,
-    tasksCompleted: typeof tasksCompleted === "number" ? tasksCompleted : 0,
-    miniGoalsCompleted: miniGoalsCompletedActual,
-    collaborationsJoined,
+    tasksCompleted,
+    miniGoalsCompleted,
+    collaborationsJoined: joinedCount,
   };
 }
 
@@ -305,7 +297,28 @@ export async function completeTask(userId: string, shardId: string, miniGoalId: 
     };
   }
 
-  if (tasks[taskIndex].completed) {
+  // Claim the task with a single conditional write.
+  //
+  // This used to be a read-check-then-write-the-whole-array sequence, which had
+  // two failure modes. Writing the entire `tasks` array back meant two tasks in
+  // the same mini-goal completed at once would clobber each other — last write
+  // wins, one completion silently lost. And checking `completed` in application
+  // code before writing left a TOCTOU window where a double-tap paid XP twice.
+  //
+  // Matching on `completed: false` in the query makes the claim atomic: MongoDB
+  // applies it to a single document, and only one caller can ever observe
+  // `modifiedCount === 1`.
+  const claim = await MiniGoal.updateOne(
+    { _id: miniGoalId, [`tasks.${taskIndex}.completed`]: false },
+    {
+      $set: {
+        [`tasks.${taskIndex}.completed`]: true,
+        [`tasks.${taskIndex}.completedAt`]: new Date(),
+      },
+    }
+  );
+
+  if (claim.modifiedCount === 0) {
     console.log(`ℹ️ [completeTask] Task already completed`);
     return {
       success: true,
@@ -315,19 +328,23 @@ export async function completeTask(userId: string, shardId: string, miniGoalId: 
     };
   }
 
-  // Mark task as complete
-  tasks[taskIndex].completed = true;
-  tasks[taskIndex].completedAt = new Date();
+  // Re-read so progress is computed from the document as it now stands, rather
+  // than from the stale snapshot this function opened with — another writer may
+  // have completed a sibling task in between.
+  const [freshError, fresh] = await catchError(MiniGoal.findById(miniGoalId).lean());
+  if (freshError || !fresh) {
+    logError("completeTask:reread", freshError);
+    return { success: false, message: "Task not found.", xpEarned: 0, achievements: [] };
+  }
 
-  // Weighted progress — a task's XP value is its share of the work.
-  const progress = miniGoalProgress(tasks);
-  const miniGoalNowComplete = allTasksComplete(tasks);
+  const freshTasks = fresh.tasks;
+  const progress = miniGoalProgress(freshTasks);
+  const miniGoalNowComplete = allTasksComplete(freshTasks);
 
-  await MiniGoal.findByIdAndUpdate(miniGoalId, {
-    tasks,
-    progress,
-    completed: miniGoalNowComplete,
-  });
+  await MiniGoal.updateOne(
+    { _id: miniGoalId },
+    { $set: { progress, completed: miniGoalNowComplete } }
+  );
 
   // Finishing the last task finishes the mini-goal — the activation milestone
   // reaches through this path too, not just the explicit completeMiniGoal call.
@@ -346,7 +363,7 @@ export async function completeTask(userId: string, shardId: string, miniGoalId: 
 
   // XP scales with the task's own reward — the AI already sizes these per task
   // (see AIHelper), so a 3-hour task no longer pays the same as a 5-minute one.
-  const baseXP = taskXPValue(tasks[taskIndex]);
+  const baseXP = taskXPValue(freshTasks[taskIndex]);
   const xpResult = await awardXP(userId, baseXP, `Task in ${minigoal.title}`);
 
   // Record what was ACTUALLY paid out, so uncompleteTask can claw back the
@@ -440,20 +457,41 @@ export async function uncompleteTask(userId: string, shardId: string, miniGoalId
     };
   }
 
-  // Revert the task
-  tasks[taskIndex].completed = false;
-  tasks[taskIndex].completedAt = undefined;
+  // Release the task with a single conditional write, mirroring the claim in
+  // completeTask. Matching on `completed: true` means only one caller can undo a
+  // given completion, so two concurrent undos can't claw back the XP twice — and
+  // no sibling task's state is touched.
   const clawback = task.xpAwarded ?? taskXPValue(task);
-  tasks[taskIndex].xpAwarded = undefined;
 
-  const progress = miniGoalProgress(tasks);
-  const miniGoalNowComplete = allTasksComplete(tasks);
+  const release = await MiniGoal.updateOne(
+    { _id: miniGoalId, [`tasks.${taskIndex}.completed`]: true },
+    {
+      $set: { [`tasks.${taskIndex}.completed`]: false },
+      $unset: {
+        [`tasks.${taskIndex}.completedAt`]: "",
+        [`tasks.${taskIndex}.xpAwarded`]: "",
+      },
+    }
+  );
 
-  await MiniGoal.findByIdAndUpdate(miniGoalId, {
-    tasks,
-    progress,
-    completed: miniGoalNowComplete,
-  });
+  if (release.modifiedCount === 0) {
+    return { success: true, message: "Task is not completed.", xpEarned: 0, achievements: [] };
+  }
+
+  // Recompute from the document as it now stands, not the opening snapshot.
+  const [freshError, fresh] = await catchError(MiniGoal.findById(miniGoalId).lean());
+  if (freshError || !fresh) {
+    logError("uncompleteTask:reread", freshError);
+    return { success: false, message: "Task not found.", xpEarned: 0, achievements: [] };
+  }
+
+  const progress = miniGoalProgress(fresh.tasks);
+  const miniGoalNowComplete = allTasksComplete(fresh.tasks);
+
+  await MiniGoal.updateOne(
+    { _id: miniGoalId },
+    { $set: { progress, completed: miniGoalNowComplete } }
+  );
 
   // Finishing the last task finishes the mini-goal — the activation milestone
   // reaches through this path too, not just the explicit completeMiniGoal call.

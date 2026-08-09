@@ -11,9 +11,15 @@
     "seed:users": "node --loader ts-node/esm src/seed-users.ts",
     "tunnel": "cloudflared tunnel --url http://localhost:4000",
     "seed:offerings": "node --loader ts-node/esm src/seed-offerings.ts",
-    "sync:offerings": "node --loader ts-node/esm src/sync-offerings.ts"
+    "sync:offerings": "node --loader ts-node/esm src/sync-offerings.ts",
+    "ensure:indexes": "node --loader ts-node/esm src/ensure-indexes.ts",
+    "ensure:indexes:dry": "node --loader ts-node/esm src/ensure-indexes.ts --dry-run",
+    "smoke": "node --loader ts-node/esm src/smoke.ts"
   },
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -33,9 +39,9 @@
     "@apollo/server": "^5.0.0",
     "@as-integrations/express5": "^1.1.2",
     "@types/jsonwebtoken": "^9.0.10",
+    "@types/node-cron": "^3.0.11",
     "@types/socket.io": "^3.0.1",
     "bcrypt": "^6.0.0",
-    "bullmq": "^5.76.1",
     "cors": "^2.8.5",
     "dotenv": "^17.2.2",
     "express": "^5.1.0",

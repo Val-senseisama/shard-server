@@ -380,6 +380,9 @@ UserSchema.index({ timezone: 1 });
 UserSchema.index({ lastActive: 1 });
 // Activation cohorts are selected by signup date.
 UserSchema.index({ createdAt: 1 });
+// The global leaderboard both sorts on xp and counts how many users are ahead
+// of you. Without this it is two collection scans per call.
+UserSchema.index({ xp: -1 });
 
 // Export the model
 export const User = mongoose.model<IUser>("User", UserSchema);

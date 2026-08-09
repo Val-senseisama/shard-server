@@ -33,7 +33,11 @@ const setJWT = async (userID: string) => {
       role: currentUser.role,
     },
     process.env.JWT_ACCESS_TOKEN_SECRET!,
-    { expiresIn: +process.env.JWT_ACCESS_TOKEN_EXPIRES_IN! * 60 * 1000 }
+    // jsonwebtoken reads a NUMERIC expiresIn as SECONDS. This used to multiply
+    // by 60 * 1000, so the "15 minute" access token actually lived 10.4 days —
+    // which meant a deactivated user kept full access for a week and a half and
+    // a stolen token stayed valid just as long. Minutes -> seconds is * 60.
+    { expiresIn: +process.env.JWT_ACCESS_TOKEN_EXPIRES_IN! * 60 }
   );
 
   // Refresh token — opaque key, stored as SHA-256 hash in DB
@@ -55,7 +59,10 @@ const setJWT = async (userID: string) => {
   const refreshToken = jwt.sign(
     { id: currentUser._id.toString(), token: rawKey },
     process.env.JWT_REFRESH_TOKEN_SECRET!,
-    { expiresIn: +process.env.JWT_REFRESH_TOKEN_EXPIRES_IN! * 24 * 60 * 60 * 1000 }
+    // Same unit bug as above: days -> seconds is * 24 * 60 * 60. The extra
+    // * 1000 made the refresh token last roughly 822 years, so it never expired
+    // on its own and revocation depended entirely on the DB hash list.
+    { expiresIn: +process.env.JWT_REFRESH_TOKEN_EXPIRES_IN! * 24 * 60 * 60 }
   );
 
   return { accessToken, refreshToken };

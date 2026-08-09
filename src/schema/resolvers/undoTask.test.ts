@@ -2,7 +2,15 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 
 // Mock the data layer so the resolver runs without Mongo.
 vi.mock("../../models/MiniGoal.js", () => ({
-  default: { findById: vi.fn(), findByIdAndUpdate: vi.fn(async () => ({})), find: vi.fn(), updateOne: vi.fn(async () => ({})) },
+  default: {
+    findById: vi.fn(),
+    findByIdAndUpdate: vi.fn(async () => ({})),
+    find: vi.fn(),
+    // Mirror a real conditional update: the release in uncompleteTask branches on
+    // `modifiedCount`, so a bare `{}` would let these tests pass without ever
+    // exercising the guard.
+    updateOne: vi.fn(async () => ({ modifiedCount: 1 })),
+  },
 }));
 vi.mock("../../models/Shard.js", () => ({
   default: { findById: vi.fn(), findByIdAndUpdate: vi.fn(async () => ({})) },

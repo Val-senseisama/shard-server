@@ -1,5 +1,3 @@
-import { Queue, Worker, Job } from 'bullmq';
-import Redis from 'ioredis';
 import { sendNotificationToUsers } from './FirebaseMessaging.js';
 import SendMail from './SendMail.js';
 import { logError } from './Helpers.js';
@@ -7,89 +5,76 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-export const connection = process.env.REDIS_URL
-  ? new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null })
-  : new Redis({
-      host: process.env.REDIS_HOST || 'localhost',
-      port: parseInt(process.env.REDIS_PORT || '6379'),
-      maxRetriesPerRequest: null,
-    });
-
-export const chatQueue = new Queue('chat-jobs', {
-  connection,
-  defaultJobOptions: {
-    attempts: 3,
-    backoff: { type: 'exponential', delay: 1000 },
-  },
-});
-
-
-// Track Redis connection state for graceful degradation
-let isRedisConnected = process.env.ENABLE_REDIS_QUEUE === 'true';
-
-chatQueue.on('error', (err) => {
-  if (isRedisConnected) {
-    console.warn(`Redis Queue Connection Failed. Background jobs degrading to inline processing. Error: ${err.message}`);
-    isRedisConnected = false;
-  }
-});
-
-// Worker processes incoming chat jobs
-const chatWorker = new Worker('chat-jobs', async (job: Job) => {
-  if (job.name === 'sendPushNotification') {
-    const { recipientIds, payload, type } = job.data;
-    await sendNotificationToUsers(recipientIds, payload, type as "messages" | "shardInvites" | "shardUpdates" | "questDeadlines" | "friendRequests" | "achievements");
-  } else if (job.name === 'sendEmail') {
-    const { toEmail, subject, message } = job.data;
-    await SendMail({ recipients: toEmail, subject, message });
-  }
-}, { connection });
-
-chatWorker.on('failed', (job, err) => {
-  logError(`QueueJobFailed:${job?.name}`, err);
-});
+/**
+ * Outbound side-effects: push notifications and transactional email.
+ *
+ * These used to go through a BullMQ queue on Redis. That was removed, because on
+ * this deployment the queue made delivery *less* reliable rather than more:
+ *
+ *  - BullMQ requires `maxmemory-policy noeviction`. The Redis Cloud free plan
+ *    runs `volatile-lru` and won't let you change it, so the broker may evict
+ *    queued jobs under memory pressure and BullMQ drops them with no error.
+ *  - The only things queued were the signup-verification, password-reset and
+ *    admin-OTP emails. Those are the worst possible jobs to lose silently: the
+ *    user is left unable to verify their account or get back into it, and
+ *    nothing anywhere reports a failure.
+ *  - A queue buys throughput smoothing and cross-process retry. At one instance
+ *    and this volume there is nothing to smooth, and the retry was the part that
+ *    couldn't be trusted anyway.
+ *
+ * So both paths now run inline — which was already the fallback behaviour when
+ * Redis was unreachable. The cost is that the three auth mutations await their
+ * email (a few hundred ms) instead of returning immediately. That is the right
+ * trade: the user is waiting on that email regardless, and a slightly slower
+ * signup that reliably sends beats a fast one that silently doesn't.
+ *
+ * If you ever genuinely need a queue here, put it on a Redis with `noeviction`
+ * and reintroduce it deliberately — don't just re-add BullMQ.
+ */
 
 /**
- * Enqueues a push notification securely.
- * Will silently degrade to inline execution if Redis is unavailable.
+ * Send a push notification to a set of users.
+ *
+ * NOTE: currently unused — Helpers/Notify.ts is the single funnel for user-facing
+ * notifications and calls FirebaseMessaging directly, so that budgeting and quiet
+ * hours can't be bypassed. Kept because it is the correct low-level primitive;
+ * prefer `notify()` for anything a user sees.
  */
-export const enqueuePushNotification = async (recipientIds: string[], payload: any, type: string) => {
-  if (isRedisConnected) {
-    try {
-      await chatQueue.add('sendPushNotification', { recipientIds, payload, type });
-      return;
-    } catch (err) {
-      console.warn('Failed to enqueue job, automatically falling back to inline execution.', err);
-      isRedisConnected = false;
-    }
-  }
-  
-  // Graceful degradation: Process inline right now to prevent data loss
+export const enqueuePushNotification = async (
+  recipientIds: string[],
+  payload: any,
+  type: string
+) => {
   try {
-    await sendNotificationToUsers(recipientIds, payload, type as "messages" | "shardInvites" | "shardUpdates" | "questDeadlines" | "friendRequests" | "achievements");
+    await sendNotificationToUsers(
+      recipientIds,
+      payload,
+      type as "messages" | "shardInvites" | "shardUpdates" | "questDeadlines" | "friendRequests" | "achievements"
+    );
   } catch (err) {
-    logError('enqueuePushNotification:inline', err);
+    logError('enqueuePushNotification', err);
   }
 };
 
 /**
- * Enqueues an email securely.
- * Will silently degrade to inline execution if Redis is unavailable.
+ * Send a transactional email.
+ *
+ * Deliberately swallows its error rather than throwing: every caller is in the
+ * middle of an auth mutation, and a mail-provider hiccup should not fail a signup
+ * that has already written a user. The failure is logged for follow-up.
  */
 export const enqueueEmail = async (toEmail: string, subject: string, message: string) => {
-  if (isRedisConnected) {
-    try {
-      await chatQueue.add('sendEmail', { toEmail, subject, message });
-      return;
-    } catch (err) {
-      console.warn('Failed to enqueue email job, falling back to inline.', err);
-    }
-  }
-
-  // Graceful degradation: Process inline
   try {
     await SendMail({ recipients: toEmail, subject, message });
   } catch (err) {
-    logError('enqueueEmail:inline', err);
+    logError('enqueueEmail', err);
   }
 };
+
+/**
+ * Retained so the shutdown sequence in index.ts keeps a stable shape. There is no
+ * longer a queue or worker to close, so this is a no-op.
+ */
+export async function closeChatQueue(): Promise<void> {
+  // no-op — nothing to drain since the BullMQ queue was removed
+}

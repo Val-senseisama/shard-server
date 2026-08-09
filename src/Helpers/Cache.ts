@@ -199,4 +199,17 @@ export const cacheInvalidate = {
   },
 };
 
+/**
+ * Close the cache connection for shutdown. `quit()` finishes in-flight commands
+ * before disconnecting, unlike `disconnect()`.
+ */
+export async function closeCache(): Promise<void> {
+  if (!redis) return;
+  try {
+    await redis.quit();
+  } catch {
+    // Already closed, or never connected (lazyConnect) — nothing to do.
+  }
+}
+
 export default redis;

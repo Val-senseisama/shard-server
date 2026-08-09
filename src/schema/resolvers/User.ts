@@ -8,7 +8,8 @@ import {
   ThrowError,
 } from "../../Helpers/Helpers.js";
 import SendMail from "../../Helpers/SendMail.js";
-import setJWT from "../../Helpers/setJWT.js";
+import setJWT, { hashRefreshToken } from "../../Helpers/setJWT.js";
+import jwt from "jsonwebtoken";
 import { hashPassword, comparePassword, validatePassword } from "../../Helpers/PasswordHash.js";
 import { User } from "../../models/User.js";
 import EmailQueue from "../../models/EmailQueue.js";
@@ -389,14 +390,35 @@ export default {
     async logout(_, __, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      // Remove the refresh token from user's array
-      // This would require tracking which specific token to remove
-      // For now, we'll just log the logout
+      // Actually revoke the session. This previously only wrote an audit row,
+      // so the refresh token stayed valid in `refreshTokens[]` and could keep
+      // minting access tokens indefinitely — "log out" ended nothing, which
+      // matters most on exactly the shared or stolen device you'd use it on.
+      const presented = context.req?.headers?.["x-refresh-token"];
+      let revoked = false;
+
+      if (presented) {
+        try {
+          const decoded: any = jwt.verify(presented, process.env.JWT_REFRESH_TOKEN_SECRET!);
+          if (decoded?.token) {
+            const [pullErr] = await catchError(
+              User.findByIdAndUpdate(context.id, {
+                $pull: { refreshTokens: hashRefreshToken(decoded.token) },
+              })
+            );
+            if (pullErr) logError("logout:revoke", pullErr);
+            else revoked = true;
+          }
+        } catch {
+          // Expired or malformed token — nothing to revoke, still report success
+          // so the client clears local state either way.
+        }
+      }
 
       SaveAuditTrail({
         userId: context.id,
         task: "Logged out",
-        details: "User logged out",
+        details: revoked ? "User logged out (session revoked)" : "User logged out (no active session token)",
       });
 
       return {

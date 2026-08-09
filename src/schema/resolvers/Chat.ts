@@ -26,6 +26,17 @@ export function setSocketIO(ioInstance: any) {
 }
 
 /**
+ * Read the injected Socket.IO handle.
+ *
+ * Exported as a getter rather than the binding itself: `io` is assigned after the
+ * server boots, so any module that imported the value directly would capture
+ * `null` permanently. QuestAI.ts uses this to broadcast coach replies.
+ */
+export function getSocketIO(): any {
+  return io;
+}
+
+/**
  * Resolve a chat by either its own _id OR by the shard's chatId.
  * The mobile client passes the shard ID in the URL, not the chat document ID.
  */
@@ -623,23 +634,63 @@ export default {
       const [chatError, chat] = await catchError(Chat.findById(chatId).lean());
       if (!chat) ThrowError("Chat not found");
 
-      let finalTaskId = taskId;
+      // This mutation used to run with no authorisation at all: any authenticated
+      // user could post an assignment into any chat. It now enforces the same
+      // three rules as Shard.assignMiniGoal, which is the canonical path.
 
-      if (!finalTaskId && chat.shardId) {
-        const MiniGoal = (await import("../../models/MiniGoal.js")).default;
-        const [goalError, goal] = await catchError(
-          MiniGoal.findOne({ shardId: chat.shardId, completed: false }).sort({ createdAt: 1 })
+      // 1. Caller must actually be in the chat.
+      const inChat = (chat.participants || []).some(
+        (p: any) => p.toString() === context.id
+      );
+      if (!inChat) {
+        return { success: false, message: "You are not a participant in this chat." };
+      }
+
+      // 2. Assignment is a quest-level action, so it needs a quest behind it,
+      //    and only the owner or an accountability partner may assign.
+      if (!chat.shardId) {
+        return { success: false, message: "Tasks can only be assigned in a quest chat." };
+      }
+
+      const [shardErr, shard] = await catchError(Shard.findById(chat.shardId).lean());
+      if (shardErr || !shard) {
+        return { success: false, message: "Quest not found." };
+      }
+
+      const canAssign =
+        shard.owner.toString() === context.id ||
+        (shard.participants || []).some(
+          (p: any) => p.user.toString() === context.id && p.role === "accountability_partner"
         );
-        if (goal) {
-          goal.tasks.push({
-            title: "Chat Assigned Task",
-            completed: false,
-            assignedTo: assigneeId,
-            deleted: false,
-          } as any);
-          await goal.save();
-          finalTaskId = "dynamic-" + Date.now();
-        }
+      if (!canAssign) {
+        return {
+          success: false,
+          message: "Only owners and accountability partners can assign tasks.",
+        };
+      }
+
+      // 3. Assignee must belong to the quest.
+      const assigneeBelongs =
+        shard.owner.toString() === assigneeId ||
+        (shard.participants || []).some((p: any) => p.user.toString() === assigneeId);
+      if (!assigneeBelongs) {
+        return {
+          success: false,
+          message: "User must be a participant or owner to be assigned.",
+        };
+      }
+
+      // The previous fallback, when no taskId was supplied, appended a task
+      // literally titled "Chat Assigned Task" to whichever mini-goal happened to
+      // be oldest and incomplete, then returned a fabricated `dynamic-<ts>` id
+      // that pointed at nothing. That silently corrupted quest plans, so it is
+      // gone: assignment now requires a real task reference.
+      const finalTaskId = taskId;
+      if (!finalTaskId) {
+        return {
+          success: false,
+          message: "Select a task to assign.",
+        };
       }
 
       const [assigneeErr, assignee] = await catchError(

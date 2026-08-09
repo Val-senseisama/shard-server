@@ -3,6 +3,7 @@ import AnalyticsEvent from "../../models/AnalyticsEvent.js";
 import { User } from "../../models/User.js";
 import { logEvent } from "../../Helpers/Telemetry.js";
 import { activationCohort, ACTIVATION_WINDOW_DAYS } from "../../Helpers/Activation.js";
+import { assertAdmin } from "../../Helpers/Authz.js";
 
 const rate = (num: number, den: number) => (den > 0 ? Number((num / den).toFixed(4)) : 0);
 
@@ -13,7 +14,7 @@ export default {
      */
     async getFunnelStats(_: any, { days = 30 }: { days?: number }, context: any) {
       if (!context.id) ThrowError("Please login to continue.");
-      if (context.role !== "admin") ThrowError("Admin access required.");
+      await assertAdmin(context);
 
       const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 

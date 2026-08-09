@@ -1189,17 +1189,24 @@ export default {
       let targetLabel = minigoal.title;
 
       if (typeof taskIndex === "number") {
-        // Task-level assignment
-        const [mgFetchErr, mgDoc] = await catchError(MiniGoal.findById(miniGoalId));
+        // Task-level assignment. Written with a positional $set rather than
+        // mutate-and-save(): saving the whole document rewrites the entire
+        // `tasks` array, so an assignment landing at the same time as a
+        // completion elsewhere in the mini-goal would silently discard it.
+        const [mgFetchErr, mgDoc] = await catchError(
+          MiniGoal.findById(miniGoalId).select("tasks").lean()
+        );
         if (mgFetchErr || !mgDoc) return { success: false, message: "Mini-goal not found." };
 
-        if (!mgDoc.tasks[taskIndex]) {
+        if (!mgDoc.tasks?.[taskIndex]) {
           return { success: false, message: "Task not found at that index." };
         }
 
         targetLabel = mgDoc.tasks[taskIndex].title;
-        mgDoc.tasks[taskIndex].assignedTo = userId;
-        await mgDoc.save();
+        await MiniGoal.updateOne(
+          { _id: miniGoalId },
+          { $set: { [`tasks.${taskIndex}.assignedTo`]: userId } }
+        );
       } else {
         // Mini-goal level assignment
         await MiniGoal.findByIdAndUpdate(miniGoalId, { assignedTo: userId });
@@ -1907,9 +1914,14 @@ export default {
     },
 
     getSignedUploadUrl: async (_, __, context) => {
-      // No auth required for signed upload parameters
-      const params = getCloudinarySignedUpload();
-      console.log("params", params);
+      // A signed upload parameter set is a write credential for our Cloudinary
+      // account. Handing it out unauthenticated made the account free file
+      // hosting for anyone who found the endpoint.
+      if (!context.id) ThrowError("Please login to continue.");
+
+      // Scope every upload to the caller's own folder so one user's signature
+      // can't be used to write over another's assets.
+      const params = getCloudinarySignedUpload(`shard-server/users/${context.id}`);
 
       return {
         success: true,
@@ -1971,6 +1983,25 @@ export default {
       );
 
       if (error || !shardData) {
+        return {
+          success: false,
+          message: "Quest not found",
+          shard: null,
+        };
+      }
+
+      // Only the owner and participants may read a quest. Without this, any
+      // authenticated user could read any quest by id — including private ones —
+      // along with every mini-goal and task. `owner` is populated above, so the
+      // id lives on `owner._id`. Same rule as getShardSchedule.
+      const ownerId = (shardData.owner as any)?._id?.toString() ?? shardData.owner?.toString();
+      const isOwner = ownerId === context.id;
+      const isParticipant = (shardData.participants || []).some(
+        (p: any) => p.user?.toString() === context.id
+      );
+
+      if (!isOwner && !isParticipant) {
+        // Same shape as "not found" so this can't be used to probe which ids exist.
         return {
           success: false,
           message: "Quest not found",
@@ -2168,6 +2199,118 @@ export default {
     },
 
     // Get user's general schedule across all shards
+    /**
+     * Every task assigned to the caller, across every quest they're in.
+     *
+     * Assignment already worked end to end — `assignMiniGoal` sets the assignee,
+     * posts a card into the quest chat and fires a `task_assigned` push — but the
+     * assignee had no way to see the resulting list. A notification you dismiss is
+     * the only place the work existed, which makes assignment feel unreliable and
+     * is the difference between a collaborator and a spectator.
+     *
+     * Covers both assignment levels: a task assigned individually, and every task
+     * under a mini-goal assigned as a whole.
+     */
+    async getMyAssignedTasks(_, { includeCompleted }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+
+      try {
+        // Only quests the caller still belongs to. Assignment doesn't survive
+        // being removed from a quest, and open states only — a stalled quest's
+        // tasks are exactly the ones worth surfacing, but a finished one's aren't.
+        const [shardError, shards] = await catchError(
+          Shard.find({
+            $or: [{ owner: context.id }, { "participants.user": context.id }],
+            status: { $in: OPEN_STATUSES },
+          })
+            .select("title")
+            .lean()
+        );
+
+        if (shardError) {
+          logError("getMyAssignedTasks:shards", shardError);
+          return { success: false, message: "Failed to fetch assigned tasks.", tasks: [] };
+        }
+
+        const shardIds = (shards || []).map((s: any) => s._id);
+        if (shardIds.length === 0) {
+          return { success: true, tasks: [] };
+        }
+
+        const shardMap = new Map(
+          (shards || []).map((s: any) => [s._id.toString(), s])
+        );
+
+        // NOTE the two different types. `MiniGoal.assignedTo` is an ObjectId while
+        // `tasks[].assignedTo` is a String (see models/MiniGoal.ts). Mongoose casts
+        // each correctly on its own path, so querying both in one $or is safe —
+        // but don't "tidy" this into a single shared value without checking, since
+        // a string/ObjectId mismatch is exactly what silently zeroed the
+        // achievement stats.
+        const [mgError, miniGoals] = await catchError(
+          MiniGoal.find({
+            shardId: { $in: shardIds },
+            $or: [{ "tasks.assignedTo": context.id }, { assignedTo: context.id }],
+          }).lean()
+        );
+
+        if (mgError) {
+          logError("getMyAssignedTasks:miniGoals", mgError);
+          return { success: false, message: "Failed to fetch assigned tasks.", tasks: [] };
+        }
+
+        const tasks: any[] = [];
+
+        for (const mg of (miniGoals as any[]) || []) {
+          const shard = shardMap.get(mg.shardId.toString());
+          // A mini-goal assigned as a whole makes every task under it the
+          // assignee's, without each one being individually stamped.
+          const wholeGoalIsMine = mg.assignedTo?.toString() === context.id;
+
+          (mg.tasks || []).forEach((task: any, taskIndex: number) => {
+            if (task.deleted) return;
+            if (!includeCompleted && task.completed) return;
+
+            const mine = wholeGoalIsMine || task.assignedTo?.toString() === context.id;
+            if (!mine) return;
+
+            tasks.push({
+              // Tasks are subdocuments with `_id: false`, so identity is the
+              // composite the rest of the schedule API already uses.
+              id: `${mg._id.toString()}-${taskIndex}`,
+              title: task.title,
+              dueDate: task.dueDate ? new Date(task.dueDate).getTime().toString() : null,
+              completed: !!task.completed,
+              completedAt: task.completedAt
+                ? new Date(task.completedAt).getTime().toString()
+                : null,
+              xpReward: task.xpReward ?? null,
+              overdue: !!task.overdue,
+              taskIndex,
+              miniGoalId: mg._id.toString(),
+              miniGoalTitle: mg.title,
+              shardId: mg.shardId.toString(),
+              shardTitle: shard?.title ?? null,
+            });
+          });
+        }
+
+        // Soonest deadline first; undated work sorts last rather than blocking the
+        // top of a list the user is meant to act on.
+        tasks.sort((a, b) => {
+          if (!a.dueDate && !b.dueDate) return 0;
+          if (!a.dueDate) return 1;
+          if (!b.dueDate) return -1;
+          return Number(a.dueDate) - Number(b.dueDate);
+        });
+
+        return { success: true, tasks };
+      } catch (error) {
+        logError("getMyAssignedTasks", error, { userId: context.id });
+        return { success: false, message: "Failed to fetch assigned tasks.", tasks: [] };
+      }
+    },
+
     async getMySchedule(_, { startDate, endDate }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 

@@ -1,13 +1,11 @@
 import { describe, it, expect, vi } from "vitest";
 
-// CronJobs boots BullMQ + Redis at module load — stub the infra so importing the
-// pure filter doesn't open any connection.
-vi.mock("bullmq", () => ({
-  Queue: class { add() {} },
-  Worker: class { on() {} },
-  Job: class {},
+// CronJobs registers node-cron schedules at init (not at module load), so nothing
+// needs stubbing to import the pure filter. The BullMQ/Redis stubs that used to
+// live here went away with the queue — see Helpers/Queue.ts for why.
+vi.mock("node-cron", () => ({
+  default: { schedule: vi.fn(() => ({ stop: vi.fn() })) },
 }));
-vi.mock("./Queue.js", () => ({ connection: {} }));
 
 import { trialEndingReminderFilter } from "./CronJobs.js";
 

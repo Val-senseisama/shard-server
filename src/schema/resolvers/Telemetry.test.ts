@@ -52,8 +52,26 @@ describe("trackEvent — client telemetry sink", () => {
 
 describe("getFunnelStats — admin-only funnel rollup", () => {
   it("blocks a non-admin", async () => {
+    vi.mocked(User.findById).mockReturnValue(asUser({ role: "user", isActive: true }));
     await expect(
       TelemetryResolvers.Query.getFunnelStats({}, {}, { id: "u1", role: "user" })
+    ).rejects.toThrow();
+  });
+
+  // Admin-ness is now read from the database rather than the access-token claim,
+  // so a revoked admin loses access immediately instead of keeping it until the
+  // token expires. See Helpers/Authz.ts.
+  it("blocks a demoted admin whose token still carries role: admin", async () => {
+    vi.mocked(User.findById).mockReturnValue(asUser({ role: "user", isActive: true }));
+    await expect(
+      TelemetryResolvers.Query.getFunnelStats({}, {}, { id: "admin1", role: "admin" })
+    ).rejects.toThrow();
+  });
+
+  it("blocks a deactivated admin", async () => {
+    vi.mocked(User.findById).mockReturnValue(asUser({ role: "admin", isActive: false }));
+    await expect(
+      TelemetryResolvers.Query.getFunnelStats({}, {}, { id: "admin1", role: "admin" })
     ).rejects.toThrow();
   });
 
@@ -75,6 +93,7 @@ describe("getFunnelStats — admin-only funnel rollup", () => {
         { _id: "shard_limit", count: 6 },
       ] as any);
 
+    vi.mocked(User.findById).mockReturnValue(asUser({ role: "admin", isActive: true }));
     const res: any = await TelemetryResolvers.Query.getFunnelStats({}, { days: 7 }, { id: "admin1", role: "admin" });
     expect(res.success).toBe(true);
     expect(res.days).toBe(7);
@@ -94,6 +113,7 @@ describe("getFunnelStats — admin-only funnel rollup", () => {
   });
 
   it("returns zeroed rates when there are no events (no divide-by-zero)", async () => {
+    vi.mocked(User.findById).mockReturnValue(asUser({ role: "admin", isActive: true }));
     vi.mocked(AnalyticsEvent.aggregate).mockResolvedValueOnce([] as any).mockResolvedValueOnce([] as any);
     const res: any = await TelemetryResolvers.Query.getFunnelStats({}, {}, { id: "admin1", role: "admin" });
     expect(res.activationRate).toBe(0);

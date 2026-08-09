@@ -7,6 +7,7 @@ import {
 import Report from "../../models/Report.js";
 import { User } from "../../models/User.js";
 import { cache, cacheInvalidate } from "../../Helpers/Cache.js";
+import { assertAdmin } from "../../Helpers/Authz.js";
 
 export default {
   Mutation: {
@@ -89,9 +90,7 @@ export default {
     // Update report status (Admin only)
     async updateReportStatus(_, { reportId, status, resolution }, context) {
       if (!context.id) ThrowError("Please login to continue.");
-      if (context.role !== "admin") {
-        ThrowError("Only admins can update report status.");
-      }
+      await assertAdmin(context);
 
       const [error, report] = await catchError(
         Report.findByIdAndUpdate(
@@ -162,9 +161,7 @@ export default {
     // Get pending reports (Admin only)
     async getPendingReports(_, __, context) {
       if (!context.id) ThrowError("Please login to continue.");
-      if (context.role !== "admin") {
-        ThrowError("Only admins can view pending reports.");
-      }
+      await assertAdmin(context);
 
       const [error, reports] = await catchError(
         Report.find({ status: "pending" })

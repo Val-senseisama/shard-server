@@ -6,6 +6,7 @@ import {
 } from "../../Helpers/Helpers.js";
 import SupportFlag from "../../models/SupportFlag.js";
 import { cache, cacheInvalidate } from "../../Helpers/Cache.js";
+import { assertAdmin, isAdmin } from "../../Helpers/Authz.js";
 
 export default {
   Mutation: {
@@ -56,7 +57,7 @@ export default {
     async updateSupportFlag(_, { flagId, status, assignedTo, resolution }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      if (context.role !== "admin") {
+      if (!(await isAdmin(context))) {
         const [myFlagError, myFlag] = await catchError(
           SupportFlag.findById(flagId).lean()
         );
@@ -148,9 +149,7 @@ export default {
     async getAllSupportFlags(_, __, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      if (context.role !== "admin") {
-        ThrowError("Only admins can view all support flags.");
-      }
+      await assertAdmin(context);
 
       const [error, flags] = await catchError(
         SupportFlag.find()

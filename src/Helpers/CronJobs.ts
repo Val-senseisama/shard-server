@@ -1,5 +1,4 @@
-import { Queue, Worker, Job } from 'bullmq';
-import { connection } from './Queue.js';
+import cron, { type ScheduledTask } from 'node-cron';
 import MiniGoal from '../models/MiniGoal.js';
 import Shard from '../models/Shard.js';
 import { User } from '../models/User.js';
@@ -23,15 +22,6 @@ import {
   COACH_TEMPLATES,
 } from './AIHelper.js';
 
-const shardQueue = new Queue('shard-jobs', {
-  connection,
-  defaultJobOptions: {
-    attempts: 2,
-    backoff: { type: 'exponential', delay: 5000 },
-    removeOnComplete: { count: 10 },
-    removeOnFail: { count: 50 },
-  },
-});
 
 /**
  * Scheduling model.
@@ -58,97 +48,112 @@ const LOCAL_ROLLOVER_HOUR = 1;  // just after the user's midnight
  */
 const JOB_CONCURRENCY = 10;
 
-const SCHEDULED_JOBS = [
+/**
+ * The schedule, and the function each entry runs.
+ *
+ * Driven by node-cron, in-process — NOT by a BullMQ repeatable queue.
+ *
+ * The queue was the wrong tool here for two reasons that both come from this
+ * being a single-instance deployment on a free Redis tier:
+ *
+ *  1. BullMQ needs `maxmemory-policy noeviction`. The Redis Cloud free plan runs
+ *     `volatile-lru` and will not let you change it, so under memory pressure the
+ *     broker can evict job data and BullMQ loses those jobs **with no error** —
+ *     the queue simply goes quiet. Every reminder, streak rollover and campaign
+ *     rides on this, so the failure mode was "retention silently stops working
+ *     and nothing in the logs says so".
+ *  2. The only thing the queue bought in exchange was distributed locking across
+ *     replicas, and there is exactly one replica (Socket.IO has no Redis adapter,
+ *     so the deploy is pinned to a single instance regardless).
+ *
+ * node-cron was already a dependency and unused. In-process scheduling means the
+ * retention engine keeps running even when Redis is down — the cache degrades on
+ * its own, and that path is already handled.
+ *
+ * Trade-off accepted: jobs do not survive a restart mid-run, and a deploy during
+ * a job loses that run until its next tick. For hourly/daily sweeps that are all
+ * idempotent and re-derive their own state, that is cheaper than the alternative.
+ */
+type ScheduledJob = { name: string; pattern: string; run: () => Promise<unknown> };
+
+const SCHEDULED_JOBS: ScheduledJob[] = [
   // Hourly, timezone-bucketed — these fan out to users at their local hour.
-  { name: 'local-morning',            pattern: '5 * * * *'   },
-  { name: 'local-evening',            pattern: '10 * * * *'  },
-  { name: 'streak-rollover',          pattern: '15 * * * *'  },
+  { name: 'local-morning',            pattern: '5 * * * *',   run: () => runLocalMorning()          },
+  { name: 'local-evening',            pattern: '10 * * * *',  run: () => runLocalEvening()          },
+  { name: 'streak-rollover',          pattern: '15 * * * *',  run: () => runStreakRollover()        },
   // Infrastructure — no user-visible timing, fixed UTC is fine.
-  { name: 'notification-dispatcher',  pattern: '*/5 * * * *' },
-  { name: 'shard-lifecycle-sweep',    pattern: '0 3 * * *'   },
-  { name: 'deleted-task-purge',       pattern: '0 4 * * *'   },
-  { name: 'monthly-credit-refill',    pattern: '0 0 1 * *'   },
-  { name: 'weekly-freeze-grant',      pattern: '0 2 * * 1'   },
-  { name: 'trial-ending-reminders',   pattern: '0 12 * * *'  },
+  { name: 'notification-dispatcher',  pattern: '*/5 * * * *', run: () => runNotificationDispatcher() },
+  { name: 'shard-lifecycle-sweep',    pattern: '0 3 * * *',   run: () => runShardLifecycleSweep()   },
+  { name: 'deleted-task-purge',       pattern: '0 4 * * *',   run: () => runDeletedTaskPurge()      },
+  { name: 'monthly-credit-refill',    pattern: '0 0 1 * *',   run: () => runMonthlyCreditRefill()   },
+  { name: 'weekly-freeze-grant',      pattern: '0 2 * * 1',   run: () => runWeeklyFreezeGrant()     },
+  { name: 'trial-ending-reminders',   pattern: '0 12 * * *',  run: () => runTrialEndingReminders()  },
 ];
 
-export async function initScheduledJobs() {
-  // BullMQ requires `noeviction`: under any `volatile-*`/`allkeys-*` policy Redis
-  // may evict job data under memory pressure, and BullMQ loses those jobs with no
-  // error — the queue simply goes quiet.
-  //
-  // This used to be `.catch(() => {})`. Swallowing it is the wrong call now that
-  // every retention touchpoint runs through this queue: many managed Redis
-  // providers refuse CONFIG SET, so the failure is plausible, and a silent one
-  // means reminders, streak rollovers and campaigns can stop firing with nothing
-  // in the logs to explain it. Verify and complain loudly instead.
+const tasks: ScheduledTask[] = [];
+
+/**
+ * Jobs currently executing, so a slow run can't overlap its own next tick.
+ *
+ * BullMQ enforced this via job concurrency; node-cron fires on the clock
+ * regardless. `notification-dispatcher` runs every 5 minutes and the local-hour
+ * jobs fan out across every timezone bucket, so an overrun is realistic — and two
+ * copies of a sweep racing would double-send notifications.
+ */
+const running = new Set<string>();
+
+async function runGuarded(job: ScheduledJob) {
+  if (running.has(job.name)) {
+    console.warn(`⏭️  [Scheduler] ${job.name} still running — skipping this tick`);
+    return;
+  }
+  running.add(job.name);
+  const started = Date.now();
   try {
-    await connection.config('SET', 'maxmemory-policy', 'noeviction');
+    await job.run();
+    console.log(`✅ [Scheduler] ${job.name} (${Date.now() - started}ms)`);
   } catch (err) {
-    logError('scheduler:setEvictionPolicy', err);
+    logError(`ScheduledJobFailed:${job.name}`, err);
+  } finally {
+    running.delete(job.name);
   }
-
-  try {
-    const policy = await connection.config('GET', 'maxmemory-policy');
-    // ioredis returns CONFIG GET as a flat [key, value] array.
-    const value = Array.isArray(policy) ? policy[1] : undefined;
-    if (value && value !== 'noeviction') {
-      console.error(
-        `🚨 [Scheduler] Redis maxmemory-policy is "${value}", not "noeviction". ` +
-          `BullMQ can silently drop scheduled jobs under memory pressure — every ` +
-          `reminder, streak rollover and campaign is at risk. Set it on the Redis ` +
-          `instance directly.`
-      );
-    }
-  } catch (err) {
-    logError('scheduler:checkEvictionPolicy', err);
-  }
-
-  // Drop repeatables that no longer exist, otherwise renamed/retired jobs keep
-  // firing forever from whatever was registered on a previous deploy.
-  const known = new Set(SCHEDULED_JOBS.map((j) => j.name));
-  for (const repeatable of await shardQueue.getRepeatableJobs()) {
-    if (!known.has(repeatable.name)) {
-      await shardQueue.removeRepeatableByKey(repeatable.key).catch(() => {});
-      console.log(`🧹 [Scheduler] Removed retired repeatable: ${repeatable.name}`);
-    }
-  }
-
-  for (const { name, pattern } of SCHEDULED_JOBS) {
-    await shardQueue.add(name, {}, { repeat: { pattern } });
-  }
-  console.log('✅ [Scheduler] Repeatable jobs registered');
 }
 
+export async function initScheduledJobs() {
+  for (const job of SCHEDULED_JOBS) {
+    // All patterns are written in UTC. Containers usually run UTC anyway, but
+    // relying on that would make the whole schedule silently shift if the host
+    // ever disagreed — and these jobs decide *what time it is* for every user.
+    const task = cron.schedule(job.pattern, () => void runGuarded(job), {
+      timezone: 'UTC',
+    });
+    tasks.push(task);
+  }
+  console.log(`✅ [Scheduler] ${SCHEDULED_JOBS.length} jobs scheduled (node-cron, UTC)`);
+}
+
+/**
+ * One-off follow-up after a quest completes. Runs inline rather than through a
+ * queue — it is a single AI call plus a notification, already invoked
+ * fire-and-forget, and it must not be able to take a request down with it.
+ */
 export async function enqueueReflectionMission(data: {
   userId: string;
   shardId: string;
   shardTitle: string;
   completionRate: number;
 }) {
-  await shardQueue.add('reflection-mission', data);
+  runReflectionMission(data).catch((err) => logError('ScheduledJobFailed:reflection-mission', err));
 }
 
-// ─── Worker ───────────────────────────────────────────────────────────────────
-
-const worker = new Worker('shard-jobs', async (job: Job) => {
-  switch (job.name) {
-    case 'local-morning':            return runLocalMorning();
-    case 'local-evening':            return runLocalEvening();
-    case 'streak-rollover':          return runStreakRollover();
-    case 'notification-dispatcher':  return runNotificationDispatcher();
-    case 'shard-lifecycle-sweep':    return runShardLifecycleSweep();
-    case 'deleted-task-purge':       return runDeletedTaskPurge();
-    case 'monthly-credit-refill':    return runMonthlyCreditRefill();
-    case 'weekly-freeze-grant':      return runWeeklyFreezeGrant();
-    case 'trial-ending-reminders':   return runTrialEndingReminders();
-    case 'reflection-mission':       return runReflectionMission(job.data);
-  }
-}, { connection });
-
-worker.on('failed', (job, err) => {
-  logError(`ScheduledJobFailed:${job?.name}`, err);
-});
+/**
+ * Stop the schedule for shutdown. Cron timers would otherwise keep the event loop
+ * alive and a job could fire mid-drain, after Mongo has been closed.
+ */
+export async function closeScheduledJobs(): Promise<void> {
+  for (const task of tasks) task.stop();
+  tasks.length = 0;
+}
 
 // ─── Timezone bucketing ───────────────────────────────────────────────────────
 

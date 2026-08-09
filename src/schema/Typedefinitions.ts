@@ -15,6 +15,10 @@ export default `#graphql
     getShard(id: ID!): ShardResponse!
     getShardSchedule(shardId: ID!, startDate: String, endDate: String): ScheduleResponse!
     getMySchedule(startDate: String, endDate: String): MyScheduleResponse!
+    """Tasks assigned to the caller across every quest they're in. Covers both a
+    task assigned individually and every task under a mini-goal assigned as a
+    whole. Open quests only; completed tasks excluded unless asked for."""
+    getMyAssignedTasks(includeCompleted: Boolean): AssignedTasksResponse!
     getShardAnalytics(shardId: ID!): ShardAnalyticsResponse!
     getAIUsage: AIUsageResponse!
     
@@ -572,6 +576,12 @@ export default `#graphql
     miniGoalTitle: String
     shardId: ID
     shardTitle: String
+  }
+
+  type AssignedTasksResponse {
+    success: Boolean!
+    message: String
+    tasks: [ScheduledTask!]!
   }
 
   type ShardAnalyticsResponse {
@@ -1567,7 +1577,18 @@ export default `#graphql
     messages: [QuestAIMessage!]!
   }
   extend type Mutation {
-    chatWithQuestAI(shardId: ID!, message: String!): QuestAIResponse!
+    """
+    Ask the AI Quest Coach. Pro-gated on the asker.
+
+    Optionally scope the question to one mini-goal (miniGoalId) or one task
+    within it (taskIndex), which focuses the model on that step instead of the
+    whole quest.
+
+    On a collaborative quest the exchange is posted into the quest GROUP CHAT and
+    broadcast to every participant, so the coaching is visible to the people held
+    accountable by it. A solo quest keeps a private coach thread.
+    """
+    chatWithQuestAI(shardId: ID!, message: String!, miniGoalId: ID, taskIndex: Int): QuestAIResponse!
     applyQuestAISuggestion(messageId: ID!): QuestAIApplyResponse!
     dismissQuestAISuggestion(messageId: ID!): QuestAIApplyResponse!
   }

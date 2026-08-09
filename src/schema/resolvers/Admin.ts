@@ -20,12 +20,11 @@ import { enqueueEmail } from "../../Helpers/Queue.js";
 import { ACHIEVEMENTS, ACHIEVEMENT_MAP } from "../../data/achievements.js";
 import Offering from "../../models/Offering.js";
 import ErrorLog from "../../models/ErrorLog.js";
+import { assertAdmin } from "../../Helpers/Authz.js";
 
 // ─── Guard ────────────────────────────────────────────────────────────────────
-function requireAdmin(context: any) {
-  if (!context.id) ThrowError("Please login to continue.");
-  if (context.role !== "admin") ThrowError("Admin access required.");
-}
+// Verified against the DB rather than the JWT `role` claim — see Helpers/Authz.ts.
+const requireAdmin = assertAdmin;
 
 // ─── Pagination helper ────────────────────────────────────────────────────────
 function paginate(page = 1, limit = 20) {
@@ -173,7 +172,7 @@ export default {
      * Update a user's account — role, status, RPG stats, force logout.
      */
     async adminUpdateUser(_, { userId, input }, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
 
       const allowed = [
         "isActive",
@@ -241,7 +240,7 @@ export default {
      * Grant or revoke a user's subscription.
      */
     async adminUpdateSubscription(_, { userId, tier, endDate }, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
 
       const validTiers = ["free", "pro"];
       if (!validTiers.includes(tier)) {
@@ -314,7 +313,7 @@ export default {
      * Manually grant an achievement to a user.
      */
     async adminGrantAchievement(_, { userId, achievementId }, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
 
       const achievement = ACHIEVEMENT_MAP.get(achievementId);
       if (!achievement) {
@@ -355,7 +354,7 @@ export default {
      * Manually revoke an achievement from a user.
      */
     async adminRevokeAchievement(_, { userId, achievementId }, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
 
       const [userErr, user] = await catchError(User.findById(userId));
       if (userErr || !user) {
@@ -391,7 +390,7 @@ export default {
      * Update an offering's metadata.
      */
     async adminUpdateOffering(_, { identifier, description }, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
 
       const [error, offering] = await catchError(
         Offering.findOneAndUpdate(
@@ -418,7 +417,7 @@ export default {
      * Update a specific package within an offering.
      */
     async adminUpdatePackage(_, { offeringIdentifier, packageIdentifier, input }, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
 
       const offering = await Offering.findOne({ identifier: offeringIdentifier });
       if (!offering) {
@@ -456,7 +455,7 @@ export default {
      * No loops; each count is a single indexed DB call.
      */
     async adminDashboard(_, __, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
 
       const cacheKey = "admin:dashboard";
 
@@ -518,7 +517,7 @@ export default {
      * Single query using an indexed regex on username or email.
      */
     async adminListUsers(_, { search, page, limit }, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
 
       const { skip, limit: safeLimit } = paginate(page, limit);
 
@@ -573,7 +572,7 @@ export default {
      * Full user profile for admin drilldown — single query.
      */
     async adminGetUser(_, { userId }, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
 
       const [error, user] = await catchError(
         User.findById(userId)
@@ -623,7 +622,7 @@ export default {
      * Single DB query — no loops.
      */
     async adminGetReports(_, { status, page, limit }, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
 
       const { skip, limit: safeLimit } = paginate(page, limit);
       const filter: any = {};
@@ -686,7 +685,7 @@ export default {
      * Single DB query — no loops.
      */
     async adminGetSupportFlags(_, { status, priority, page, limit }, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
 
       const { skip, limit: safeLimit } = paginate(page, limit);
       const filter: any = {};
@@ -741,7 +740,7 @@ export default {
      * Optionally filter by userId or search by username/email.
      */
     async adminGetAuditTrail(_, { userId, search, page, limit }, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
 
       const { skip, limit: safeLimit } = paginate(page, limit);
       
@@ -823,7 +822,7 @@ export default {
      * Searchable, paginated error logs.
      */
     async adminGetErrorLogs(_, { severity, search, page, limit }, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
 
       const { skip, limit: safeLimit } = paginate(page, limit);
       
@@ -911,7 +910,7 @@ export default {
      * Paginated shard overview — single query with owner populated.
      */
     async adminGetShardOverview(_, { status, page, limit }, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
 
       const { skip, limit: safeLimit } = paginate(page, limit);
       const filter: any = {};
@@ -956,8 +955,8 @@ export default {
       };
     },
 
-    adminListAchievementDefinitions(_, __, context) {
-      requireAdmin(context);
+    async adminListAchievementDefinitions(_, __, context) {
+      await requireAdmin(context);
       return ACHIEVEMENTS;
     },
 
@@ -965,7 +964,7 @@ export default {
      * Get revenue stats for the admin dashboard.
      */
     async adminGetRevenueStats(_, __, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
 
       const [statsErr, stats] = await catchError(
         SubscriptionHistory.aggregate([
@@ -1033,7 +1032,7 @@ export default {
      * List all subscription history records.
      */
     async adminListSubscriptions(_, { page = 1, limit = 20 }, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
       const { skip, limit: safeLimit } = paginate(page, limit);
 
       const [countErr, total] = await catchError(SubscriptionHistory.countDocuments({}));
@@ -1067,7 +1066,7 @@ export default {
      * List project offerings (plans).
      */
     async adminListOfferings(_, __, context) {
-      requireAdmin(context);
+      await requireAdmin(context);
       
       const offerings = await Offering.find({}).lean();
       return offerings;

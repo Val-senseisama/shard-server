@@ -37,6 +37,17 @@ export default async (req: any, res: any) => {
     // if the access token is still valid and we are not trying to forcefully refresh
     const decodedAccessToken: any = validateAccessToken(accessToken);
 
+    // Fast path: trust a valid access token without a DB read, so ordinary
+    // requests don't pay for one.
+    //
+    // Two consequences, both deliberate:
+    //  - `role` here is a token claim minted at login and never revalidated.
+    //    DO NOT gate privileged operations on it. Use assertAdmin/isAdmin from
+    //    Helpers/Authz.ts, which check the database.
+    //  - Deactivating a user takes effect within the access-token TTL
+    //    (JWT_ACCESS_TOKEN_EXPIRES_IN, 15 min) rather than instantly. To revoke
+    //    immediately, clear `refreshTokens` (adminUpdateUser's forceLogout) —
+    //    that kills renewal, and the current token dies at expiry.
     if (decodedAccessToken && decodedAccessToken.id && decodedAccessToken.role !== "staff") {
       return {
         user: decodedAccessToken,
