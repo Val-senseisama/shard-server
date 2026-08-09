@@ -14,7 +14,9 @@
     "sync:offerings": "node --loader ts-node/esm src/sync-offerings.ts",
     "ensure:indexes": "node --loader ts-node/esm src/ensure-indexes.ts",
     "ensure:indexes:dry": "node --loader ts-node/esm src/ensure-indexes.ts --dry-run",
-    "smoke": "node --loader ts-node/esm src/smoke.ts"
+    "smoke": "node --loader ts-node/esm src/smoke.ts",
+    "backfill:achievements": "node --loader ts-node/esm src/backfill-achievements.ts",
+    "backfill:achievements:dry": "node --loader ts-node/esm src/backfill-achievements.ts --dry-run"
   },
   "type": "module",
   "engines": {

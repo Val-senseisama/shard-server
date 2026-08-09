@@ -21,14 +21,54 @@ Running log for the 5-day push to production. Updated as blocks land.
 | H | Smoke test + deploy runbook | ✅ Done (`npm run smoke`) |
 | I | Task assignment gaps + task-scoped AI in group chat | ✅ Done |
 
-Baseline: 124 tests passing. Now: **173**, typecheck clean, production build green.
+Baseline: 124 tests passing. Now: **176**, typecheck clean, production build green.
 
-New test files: `authz.test.ts` (6), `achievements.test.ts` (7), `taskAtomicity.test.ts` (6),
+New test files: `authz.test.ts` (6), `achievements.test.ts` (10), `taskAtomicity.test.ts` (6),
 `scheduler.test.ts` (5), `assignedTasks.test.ts` (8), `questAiGroup.test.ts` (10), plus
 additions to `Telemetry.test.ts` and `questai.test.ts`.
 
 Verified by actually running the built server, not just the suite: boots, `/healthz` 200,
 SIGTERM drains in 1s and exits 0, `npm run smoke` 10/10.
+
+---
+
+## Deploy runbook
+
+Ordered. Steps 1–2 are prerequisites; 3–6 happen around the deploy itself.
+
+```bash
+# 1. Cloudinary — dashboard, not code.
+#    Disable any UNSIGNED upload preset. If one exists, the auth fix on
+#    getSignedUploadUrl is bypassable entirely and nothing in this repo can stop it.
+
+# 2. Railway — pin to a SINGLE instance.
+#    Socket.IO has no Redis adapter; two replicas silently half-break chat and presence.
+
+# 3. Preview the index changes, then apply. 18 declared indexes have never been
+#    built — including ones the hourly cron and the notification budget rely on.
+npm run ensure:indexes:dry     # read the diff; syncIndexes DROPS undeclared indexes
+npm run ensure:indexes
+
+# 4. Deploy.
+
+# 5. Verify against the live URL. Exits non-zero if anything regressed.
+npm run smoke -- https://your-api
+
+# 6. Grant the achievements people already earned but never received.
+npm run backfill:achievements:dry   # real evaluation, writes nothing
+npm run backfill:achievements       # silent grants
+```
+
+Optional env: `GRAPHQL_INTROSPECTION=true` to keep Sandbox/Explorer working against
+production, `CLIENT_LOG_SECRET` once the mobile client sends the header,
+`COACH_DAILY_MESSAGE_CAP` to change the AI coach ceiling from its default of 50.
+
+**Expect a login spike.** The JWT expiry fix invalidates existing sessions — old
+(10-day) tokens still verify, but everyone re-authenticates within 15 minutes of their
+next refresh. Not an incident.
+
+**Rollback:** tag the current commit before deploying. The only non-reversible step is
+the achievement backfill, and leaving those grants in place is harmless.
 
 ---
 
@@ -118,9 +158,18 @@ both `$lookup` stages and the ObjectId-casting hazard. `collaborationsJoined` no
 shards owned by *someone else* (the previous filter included a `"viewer"` role that does not
 exist in the schema enum).
 
-**Backfill required after deploy:** existing users earned these and never received them. Run
-`checkAchievements` for every active user; their pending-achievements queue surfaces on next
-app open.
+**Backfill shipped:** `npm run backfill:achievements` (and `:dry`). Batched by `_id` cursor so
+it's resumable and can't skip a user, paced to stay out of the way of live traffic, and safe to
+re-run — `checkAchievements` only considers achievements a user doesn't already hold.
+
+Grants are **silent** (new `{ silent: true }` option): they populate `pendingAchievements` so
+the celebration appears in-app on next open, instead of firing one push per unlock for things
+earned weeks ago. That is how people end up disabling notifications for good.
+
+**Dry run against the real database confirmed the fix was worth it: 9 of 17 active users (53%)
+were owed achievements — 22 in total.** The names map exactly onto the three broken stats:
+*Not Alone / Squad Up / Team Player* (`friendCount`), *First Win / Getting Things Done*
+(`tasksCompleted`), *Quest Complete* (`miniGoalsCompleted`).
 
 ---
 

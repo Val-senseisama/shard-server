@@ -96,7 +96,7 @@ export async function awardXP(userId: string, amount: number, reason: string) {
  * Build live UserStats for a given userId — used by checkAchievements.
  * Runs all DB counts in parallel for speed.
  */
-async function buildUserStats(userId: string): Promise<UserStats | null> {
+export async function buildUserStats(userId: string): Promise<UserStats | null> {
   const user = await User.findById(userId)
     .select("xp level currentStreak longestStreak")
     .lean();
@@ -172,7 +172,24 @@ async function buildUserStats(userId: string): Promise<UserStats | null> {
  * Returns the ids of newly unlocked achievements.
  * Sends an in-app notification for each unlock.
  */
-export async function checkAchievements(userId: string): Promise<string[]> {
+export interface CheckAchievementsOptions {
+  /**
+   * Grant without sending a push.
+   *
+   * For backfills. When a fix makes previously-unreachable achievements
+   * reachable, every affected user unlocks a pile of them at once — and pushing
+   * "🏆 Achievement unlocked" eight times for things they earned weeks ago is how
+   * people turn notifications off for good. Silent grants still populate
+   * `pendingAchievements`, so the user sees the celebration in-app on their next
+   * open, in context. Default false: the live path always notifies.
+   */
+  silent?: boolean;
+}
+
+export async function checkAchievements(
+  userId: string,
+  options: CheckAchievementsOptions = {}
+): Promise<string[]> {
   const user = await User.findById(userId).select("achievements").lean();
   if (!user) return [];
 
@@ -209,22 +226,24 @@ export async function checkAchievements(userId: string): Promise<string[]> {
   // an in-app row, so the moment a user earned something they weren't told
   // unless they happened to be looking. Deduped per achievement id, so an
   // unlock can't be announced twice.
-  for (const id of newlyUnlocked) {
-    const a = ACHIEVEMENT_MAP.get(id)!;
-    notify({
-      userId,
-      kind: "achievement",
-      title: `${a.icon} Achievement unlocked`,
-      body: `${a.name} — ${a.description}`,
-      data: { screen: "/achievements" },
-      dedupeKey: `achievement:${id}`,
-      emailData: { achievementName: a.name },
-    }).catch(() => {});
+  if (!options.silent) {
+    for (const id of newlyUnlocked) {
+      const a = ACHIEVEMENT_MAP.get(id)!;
+      notify({
+        userId,
+        kind: "achievement",
+        title: `${a.icon} Achievement unlocked`,
+        body: `${a.name} — ${a.description}`,
+        data: { screen: "/achievements" },
+        dedupeKey: `achievement:${id}`,
+        emailData: { achievementName: a.name },
+      }).catch(() => {});
+    }
   }
 
   SaveAuditTrail({
     userId,
-    task: "Achievements Unlocked",
+    task: options.silent ? "Achievements Backfilled" : "Achievements Unlocked",
     details: newlyUnlocked.join(", "),
   });
 

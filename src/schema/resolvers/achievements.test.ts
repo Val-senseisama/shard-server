@@ -43,6 +43,7 @@ import { User } from "../../models/User.js";
 import Shard from "../../models/Shard.js";
 import MiniGoal from "../../models/MiniGoal.js";
 import Friendship from "../../models/Friendship.js";
+import { notify } from "../../Helpers/Notify.js";
 import { checkAchievements } from "./XP.js";
 
 const USER = "507f1f77bcf86cd799439011";
@@ -150,5 +151,39 @@ describe("checkAchievements — collaborationsJoined", () => {
     const unlocked = await checkAchievements(USER);
 
     expect(unlocked).not.toContain("collab_1");
+  });
+});
+
+describe("checkAchievements — silent grants for backfill", () => {
+  beforeEach(() => {
+    vi.mocked(Friendship.countDocuments).mockResolvedValue(1 as any);
+  });
+
+  it("notifies by default, so the live path still celebrates", async () => {
+    const unlocked = await checkAchievements(USER);
+
+    expect(unlocked.length).toBeGreaterThan(0);
+    expect(notify).toHaveBeenCalled();
+  });
+
+  it("grants without pushing when silent", async () => {
+    const unlocked = await checkAchievements(USER, { silent: true });
+
+    // Still granted...
+    expect(unlocked).toContain("friends_1");
+    expect(User.findByIdAndUpdate).toHaveBeenCalled();
+    // ...but no push. A backfill that fires one notification per unlock blasts a
+    // user with a pile of alerts for things they earned weeks ago, which is how
+    // people turn notifications off for good.
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("still queues silent grants for in-app display", async () => {
+    await checkAchievements(USER, { silent: true });
+
+    const [, update] = vi.mocked(User.findByIdAndUpdate).mock.calls[0] as any;
+    // pendingAchievements is what surfaces the celebration on next app open —
+    // silent must not mean invisible.
+    expect(update.$push.pendingAchievements.$each).toContain("friends_1");
   });
 });
