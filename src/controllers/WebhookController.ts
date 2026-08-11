@@ -32,12 +32,6 @@ export const handleRevenueCatWebhook = async (req: Request, res: Response) => {
     const user = await User.findById(app_user_id);
     if (!user) return res.status(404).send("User not found");
 
-    // Idempotency: deduplicate by transaction_id
-    if (transaction_id) {
-      const existing = await SubscriptionHistory.findOne({ paymentId: transaction_id });
-      if (existing) return res.status(200).send("OK (Duplicate)");
-    }
-
     let action: "PURCHASE" | "RENEWAL" | "CANCELLATION" | "EXPIRY" | "UPGRADE" = "PURCHASE";
     let tier: "free" | "pro" | "enterprise" = "pro";
 
@@ -54,6 +48,26 @@ export const handleRevenueCatWebhook = async (req: Request, res: Response) => {
         action = "EXPIRY"; tier = "free"; break;
       default:
         return res.status(200).send("Event type not handled");
+    }
+
+    // Idempotency: same transaction AND same event.
+    //
+    // This used to key on transaction_id alone, which silently broke every
+    // downgrade. RevenueCat sends CANCELLATION and EXPIRATION carrying the SAME
+    // transaction_id as the purchase or renewal they refer to, so once a
+    // PURCHASE row existed, every later event for that transaction was
+    // classified as a duplicate and dropped before it could run — meaning
+    // EXPIRATION never fired and a cancelled subscriber kept Pro forever.
+    //
+    // One transaction legitimately produces PURCHASE → CANCELLATION → EXPIRY,
+    // so the action has to be part of the key. A genuine redelivery still
+    // matches on both fields and is still rejected.
+    if (transaction_id) {
+      const existing = await SubscriptionHistory.findOne({
+        paymentId: transaction_id,
+        action,
+      });
+      if (existing) return res.status(200).send("OK (Duplicate)");
     }
 
     // For grants (purchase/renewal), verify the event concerns OUR entitlement
