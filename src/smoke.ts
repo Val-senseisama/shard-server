@@ -80,7 +80,18 @@ async function main() {
   // why they are worth asserting on every deploy rather than trusting once.
 
   await check("upload credentials require auth", async () => {
-    const { body } = await gql("{ getSignedUploadUrl { success params } }");
+    // `params` is an object type, so it MUST carry a selection set. Asking for it
+    // as a bare field makes the query fail GraphQL validation before it ever
+    // reaches the resolver — which made this check pass vacuously, exactly as it
+    // would if the resolver had no auth at all. Select the subfields.
+    const { body } = await gql(
+      "{ getSignedUploadUrl { success params { signature folder } } }"
+    );
+    const validationFailed = (body?.errors ?? []).some(
+      (e: any) => e?.extensions?.code === "GRAPHQL_VALIDATION_FAILED"
+    );
+    assert(!validationFailed, "query is malformed, so this asserts nothing");
+
     const errored = Array.isArray(body?.errors) && body.errors.length > 0;
     const noParams = !body?.data?.getSignedUploadUrl?.params;
     assert(errored || noParams, "unauthenticated caller received Cloudinary upload params");
