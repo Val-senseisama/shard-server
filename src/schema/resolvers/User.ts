@@ -852,7 +852,7 @@ console.log("newUser", newUser);
         async () => {
           const [error, userData] = await catchError(
             User.findById(context.id)
-              .select("email username bio profilePic role emailVerified xp level achievements pendingAchievements strength intelligence charisma endurance creativity authProvider subscriptionTier trialStartedAt trialEndsAt firstQuestCompletedAt referralCode referralCount preferences currentStreak longestStreak birthdate timezone aiCredits")
+              .select("email username bio profilePic role emailVerified xp level achievements pendingAchievements strength intelligence charisma endurance creativity authProvider subscriptionTier subscriptionExpiresAt trialStartedAt trialEndsAt firstQuestCompletedAt referralCode referralCount preferences currentStreak longestStreak birthdate timezone aiCredits")
               .lean()
           );
 
@@ -887,6 +887,9 @@ console.log("newUser", newUser);
           authProvider: user.authProvider,
           pendingAchievements: user.pendingAchievements || [],
           subscriptionTier: user.subscriptionTier,
+          subscriptionExpiresAt: (user as any).subscriptionExpiresAt
+            ? new Date((user as any).subscriptionExpiresAt).toISOString()
+            : null,
           // The EFFECTIVE end, which may be earlier than the stored outer bound
           // because finishing a first quest ends the trial. The client shows the
           // deadline the gating actually uses, not the raw field.

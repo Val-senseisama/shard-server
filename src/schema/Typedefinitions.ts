@@ -253,6 +253,9 @@ export default `#graphql
     isNewUser: Boolean
     preferences: UserPreferences
     subscriptionTier: String
+    """When the current paid period ends — the renewal date while active, or the
+    cut-off once cancelled. Null for free users. Display only."""
+    subscriptionExpiresAt: String
     trialEndsAt: String
     """Whole days of Pro trial left. The trial ends at the first finished quest
     (floored at 7 days, capped at 30), not on a flat countdown."""

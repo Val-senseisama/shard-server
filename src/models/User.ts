@@ -88,6 +88,16 @@ export interface IUser extends Document {
   streakNudgeSentAt?: Date;
 
   subscriptionTier: 'free' | 'pro' | 'enterprise';
+  /**
+   * When the current paid period ends — the renewal date while the sub is
+   * active, or the cut-off date once it has been cancelled but not yet expired.
+   * Written only by the RevenueCat webhook from `expiration_at_ms`.
+   *
+   * This is display data, never an entitlement check: Pro is granted and
+   * revoked by webhook events (see Helpers/Entitlements.ts), so a stale date
+   * here can't hand anyone access they haven't paid for.
+   */
+  subscriptionExpiresAt?: Date;
 
   birthdate?: Date;
   timezone?: string;
@@ -178,6 +188,10 @@ const UserSchema: Schema<IUser> = new Schema(
       type: String,
       enum: ['free', 'pro', 'enterprise'],
       default: 'free'
+    },
+    subscriptionExpiresAt: {
+      type: Date,
+      default: null
     },
     role: {
       type: String,
