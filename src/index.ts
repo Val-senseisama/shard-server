@@ -129,6 +129,8 @@ const graphqlLimiter = rateLimit({
 // listening but cannot reach its database serves errors, and 200-on-listening
 // would keep it in the load balancer doing that.
 app.get("/healthz", (_req, res) => {
+  console.log("Health called");
+  
   const dbReady = mongoose.connection.readyState === 1;
   res.status(dbReady ? 200 : 503).json({
     status: dbReady ? "ok" : "degraded",
