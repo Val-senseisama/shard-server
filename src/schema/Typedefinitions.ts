@@ -173,9 +173,12 @@ export default `#graphql
     generateSideQuest(category: String): SideQuestResponse!
     completeSideQuest(sideQuestId: ID!): CompleteSideQuestResponse!
     
-    # Analytics mutations
-    trackActivity(activity: ActivityInput!): MessageResponse!
-    
+    # Analytics are recorded server-side on the completion path in
+    # XP.completeTask — there is deliberately no client-facing mutation for it.
+    # The old trackActivity mutation was removed: nothing ever called it, so
+    # productivityHistory was never written, and a client-reported metric would
+    # be both lossy (app killed before the second round trip) and forgeable.
+
     # Notification mutations
     markNotificationRead(notificationId: ID!): MessageResponse!
     markAllNotificationsRead: MessageResponse!
@@ -1030,13 +1033,6 @@ export default `#graphql
   }
 
   # Analytics types
-  input ActivityInput {
-    tasksCompleted: Int
-    xpEarned: Int
-    shardsActive: Int
-    hoursLogged: Int
-  }
-
   type DailyData {
     date: String!
     tasksCompleted: Int!

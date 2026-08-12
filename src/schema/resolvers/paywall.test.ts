@@ -2,9 +2,16 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 
 // ── Mock the data + heavy-infra layer so resolvers run without Mongo/Redis/Groq ──
 vi.mock("../../models/User.js", () => ({ User: { findById: vi.fn() } }));
-vi.mock("../../models/Shard.js", () => ({ default: { countDocuments: vi.fn() } }));
-vi.mock("../../models/MiniGoal.js", () => ({ default: {} }));
-vi.mock("../../models/Analytics.js", () => ({ default: { findOne: vi.fn() } }));
+// `find` on Shard/MiniGoal and `findOneAndUpdate` on Analytics are reached by
+// computeAnalyticsSignals, which getProductivityData now runs to derive
+// averageCompletionRate and struggleAreas (both were previously hardcoded).
+vi.mock("../../models/Shard.js", () => ({
+  default: { countDocuments: vi.fn(), find: vi.fn() },
+}));
+vi.mock("../../models/MiniGoal.js", () => ({ default: { find: vi.fn() } }));
+vi.mock("../../models/Analytics.js", () => ({
+  default: { findOne: vi.fn(), findOneAndUpdate: vi.fn() },
+}));
 vi.mock("../../models/SideQuest.js", () => ({ default: { findOne: vi.fn(), create: vi.fn() } }));
 vi.mock("./XP.js", () => ({ awardXP: vi.fn(), checkAchievements: vi.fn() }));
 vi.mock("../../Helpers/AIHelper.js", () => ({
@@ -44,7 +51,11 @@ describe("getProductivityData — advanced analytics is Pro-only", () => {
 
   it("allows a Pro user through", async () => {
     vi.mocked(User.findById).mockReturnValue(asUser({ subscriptionTier: "pro" }));
-    vi.mocked(Analytics.findOne).mockReturnValue({ select: () => ({ lean: () => Promise.resolve(null) }) } as any);
+    // No shards → computeAnalyticsSignals short-circuits before MiniGoal.
+    vi.mocked(Shard.find).mockReturnValue({ lean: () => Promise.resolve([]) } as any);
+    vi.mocked(Analytics.findOneAndUpdate).mockReturnValue({
+      select: () => ({ lean: () => Promise.resolve(null) }),
+    } as any);
     const res: any = await AnalyticsResolvers.Query.getProductivityData({}, {}, ctx());
     expect(res.success).toBe(true);
     expect(res.needsUpgrade).toBeUndefined();

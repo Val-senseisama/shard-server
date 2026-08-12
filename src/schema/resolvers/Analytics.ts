@@ -12,6 +12,134 @@ import { tierOf } from "../../Helpers/Entitlements.js";
 import { User } from "../../models/User.js";
 import { dateKeyInZone } from "../../Helpers/Timezone.js";
 
+/** Map a 0–1 ratio onto the schema's 1–10 severity, only above a floor. */
+function severityFrom(ratio: number): number {
+  return Math.max(1, Math.min(10, Math.round(ratio * 10)));
+}
+
+/**
+ * Derive `averageCompletionRate` and `struggleAreas` from the user's actual
+ * task data.
+ *
+ * Both fields existed on the Analytics model and were returned by
+ * `getProductivityData`, but nothing ever wrote them — they were hardcoded to
+ * `0` and `[]` at every write site, so the insights screen and the AI prompt
+ * that consumes them were both running on empty input.
+ *
+ * The definitions are chosen to be computable from data we already store, and
+ * to describe behaviour the user can actually act on:
+ *
+ *  - **completion rate** — completed ÷ total over non-deleted tasks, matching
+ *    the floor-to-integer convention `getUserStats` already uses, but at task
+ *    rather than mini-goal granularity because that is what "productivity"
+ *    means here.
+ *  - **overdue** — share of still-open tasks whose due date has passed.
+ *  - **consistency** — share of the last 14 days with no completed task.
+ *  - **follow_through** — share of active shards with no completion in 14 days,
+ *    i.e. things started and quietly abandoned.
+ *
+ * A category is only reported once it clears a floor, so a healthy user gets an
+ * empty list rather than three shrugging non-problems. Severity is 1–10 to
+ * match `StruggleAreaSchema`.
+ */
+async function computeAnalyticsSignals(userId: string): Promise<{
+  averageCompletionRate: number;
+  struggleAreas: { category: string; severity: number; lastUpdated: Date }[];
+}> {
+  const now = new Date();
+  const fourteenDaysAgo = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+
+  const [shardsErr, shards] = await catchError(
+    Shard.find({ owner: userId }, "_id status").lean()
+  );
+  if (shardsErr || !shards?.length) {
+    return { averageCompletionRate: 0, struggleAreas: [] };
+  }
+
+  const shardIds = shards.map((s: any) => s._id);
+  const activeShardIds = shards
+    .filter((s: any) => s.status === "active")
+    .map((s: any) => String(s._id));
+
+  const [mgErr, miniGoals] = await catchError(
+    MiniGoal.find({ shardId: { $in: shardIds } }, "shardId tasks").lean()
+  );
+  if (mgErr || !miniGoals?.length) {
+    return { averageCompletionRate: 0, struggleAreas: [] };
+  }
+
+  let total = 0;
+  let completed = 0;
+  let openOverdue = 0;
+  let open = 0;
+  const completionDayKeys = new Set<string>();
+  const shardsWithRecentActivity = new Set<string>();
+
+  for (const mg of miniGoals as any[]) {
+    for (const t of mg.tasks || []) {
+      if (t.deleted) continue;
+      total++;
+
+      if (t.completed) {
+        completed++;
+        if (t.completedAt) {
+          const at = new Date(t.completedAt);
+          if (at >= fourteenDaysAgo) {
+            completionDayKeys.add(at.toISOString().slice(0, 10));
+            shardsWithRecentActivity.add(String(mg.shardId));
+          }
+        }
+        continue;
+      }
+
+      open++;
+      if (t.dueDate && new Date(t.dueDate) < now) openOverdue++;
+    }
+  }
+
+  if (total === 0) return { averageCompletionRate: 0, struggleAreas: [] };
+
+  const averageCompletionRate = Math.floor((completed / total) * 100);
+  const struggleAreas: { category: string; severity: number; lastUpdated: Date }[] = [];
+
+  // Overdue — only meaningful if there is open work to be late on.
+  if (open > 0) {
+    const overdueRatio = openOverdue / open;
+    if (overdueRatio >= 0.25) {
+      struggleAreas.push({
+        category: "overdue",
+        severity: severityFrom(overdueRatio),
+        lastUpdated: now,
+      });
+    }
+  }
+
+  // Consistency — silent days over the last fortnight.
+  const silentRatio = (14 - completionDayKeys.size) / 14;
+  if (silentRatio >= 0.5) {
+    struggleAreas.push({
+      category: "consistency",
+      severity: severityFrom(silentRatio),
+      lastUpdated: now,
+    });
+  }
+
+  // Follow-through — active shards that have gone quiet.
+  if (activeShardIds.length > 0) {
+    const stalled = activeShardIds.filter((id) => !shardsWithRecentActivity.has(id)).length;
+    const stalledRatio = stalled / activeShardIds.length;
+    if (stalledRatio >= 0.5) {
+      struggleAreas.push({
+        category: "follow_through",
+        severity: severityFrom(stalledRatio),
+        lastUpdated: now,
+      });
+    }
+  }
+
+  return { averageCompletionRate, struggleAreas };
+}
+
 /**
  * Update productivity metrics
  */
@@ -122,13 +250,34 @@ export default {
       const analytics = await cache.getOrSet(
         `analytics:${context.id}`,
         async () => {
+          // Recompute the derived signals on the way through. They live behind
+          // the same hourly cache as the read, so this costs two extra queries
+          // per user per hour at most, and it keeps the stored document honest
+          // for anything that reads it outside this resolver (the AI prompt in
+          // particular) rather than only the response we're about to send.
+          const signals = await computeAnalyticsSignals(context.id);
+
           const [error, data] = await catchError(
-            Analytics.findOne({ userId: context.id })
+            Analytics.findOneAndUpdate(
+              { userId: context.id },
+              {
+                $set: {
+                  averageCompletionRate: signals.averageCompletionRate,
+                  struggleAreas: signals.struggleAreas,
+                },
+              },
+              // `new` so we serve what we just wrote. No upsert: absent a
+              // document the user has never completed anything, and the
+              // "no data yet" branch below is the correct answer — creating an
+              // empty shell here would route them to a screen of zeroes.
+              { new: true }
+            )
               .select("productivityHistory struggleAreas averageCompletionRate preferredTimes")
               .lean()
           );
 
           if (error || !data) {
+            if (error) logError("getProductivityData:refreshSignals", error);
             return null;
           }
 
@@ -349,19 +498,9 @@ export default {
     },
   },
 
-  Mutation: {
-    // Track activity (called after completing tasks)
-    async trackActivity(_, { activity }, context) {
-      if (!context.id) ThrowError("Please login to continue.");
-
-      await updateProductivityMetrics(context.id, activity);
-
-      return {
-        success: true,
-        message: "Activity tracked successfully.",
-      };
-    },
-  },
+  // No Mutation block. Productivity is recorded server-side from
+  // XP.completeTask via `updateProductivityMetrics` below — see the note in
+  // Typedefinitions where `trackActivity` used to be declared.
 };
 
 // Export the helper function

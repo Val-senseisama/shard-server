@@ -619,11 +619,39 @@ export default {
     async updatePreferences(_, { input }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
+      // `{ preferences: input }` replaced the whole subdocument, so a partial
+      // update silently erased whatever it omitted: the workload screen only
+      // sends workloadLevel + workingDays, which wiped maxTasksPerDay and
+      // preferredTaskDuration on every save (they then fell back to 4 /
+      // 'medium' through the `||` defaults in the scheduler). Dotted `$set`
+      // paths touch only the keys actually supplied.
+      //
+      // `runValidators` matters here too: without it Mongoose skips the
+      // schema's 0–6 check on workingDays, which is how a Sunday encoded as 7
+      // was able to persist unchallenged.
+      // Clients shipped before the day-encoding fix send Sunday as 7. Coerce
+      // it here rather than only in the app, so the server is correct for
+      // every client version rather than only the newest — otherwise those
+      // older builds would now fail validation outright instead of merely
+      // saving a day the scheduler could never match.
+      const normalised: Record<string, unknown> = { ...input };
+      if (Array.isArray(normalised.workingDays)) {
+        normalised.workingDays = Array.from(
+          new Set((normalised.workingDays as number[]).map((d) => (d === 7 ? 0 : d)))
+        ).sort((a, b) => a - b);
+      }
+
+      const $set = Object.fromEntries(
+        Object.entries(normalised)
+          .filter(([, v]) => v !== undefined && v !== null)
+          .map(([k, v]) => [`preferences.${k}`, v])
+      );
+
       const [updateError, updatedUser] = await catchError(
         User.findByIdAndUpdate(
           context.id,
-          { preferences: input },
-          { new: true }
+          { $set },
+          { new: true, runValidators: true }
         ).lean()
       );
 

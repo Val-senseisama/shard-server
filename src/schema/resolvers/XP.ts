@@ -15,6 +15,7 @@ import { tierOf } from "../../Helpers/Entitlements.js";
 import { logEvent } from "../../Helpers/Telemetry.js";
 import { notify, notifyStreakProgress } from "../../Helpers/Notify.js";
 import { stampFirstMiniGoal } from "../../Helpers/Activation.js";
+import { updateProductivityMetrics } from "./Analytics.js";
 import {
   taskXPValue,
   miniGoalProgress,
@@ -401,6 +402,20 @@ export async function completeTask(userId: string, shardId: string, miniGoalId: 
 
   // Check for achievements
   const achievements = await checkAchievements(userId);
+
+  // Feed the productivity analytics. This is recorded here, server-side, on the
+  // authoritative completion path rather than from a client `trackActivity`
+  // call: the `trackActivity` mutation existed but nothing ever invoked it, so
+  // `productivityHistory` was never written and the (Pro-gated) insights screen
+  // could only ever render its "no data yet" branch. Client-driven analytics
+  // would also lose every completion where the app is killed before the second
+  // round trip, and would be trivially forgeable.
+  //
+  // Best-effort and non-blocking: analytics must never fail a completion the
+  // user has already been credited for.
+  updateProductivityMetrics(userId, { tasksCompleted: 1, xpEarned: baseXP }).catch((e) =>
+    logError("completeTask:updateProductivityMetrics", e)
+  );
 
   return {
     success: true,

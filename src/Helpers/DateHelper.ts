@@ -90,6 +90,18 @@ export function smartSchedule(
   deadline?: Date,
 ): ScheduledTask[] {
   const p: UserSchedulePrefs = { ...DEFAULT_PREFS, ...prefs };
+
+  // Day matching below is `workingDays.includes(d.getDay())`, and `getDay()`
+  // returns 0–6. Rows written by clients that encoded Sunday as 7 therefore
+  // hold a value that can never match, silently costing the user a working
+  // day. Normalising at the single entry point fixes every caller and every
+  // already-stored row without a migration. An empty result would spin
+  // `nextWorkingDay` through its 14-day scan for nothing, so fall back.
+  p.workingDays = Array.from(
+    new Set((p.workingDays ?? []).map((d) => (d === 7 ? 0 : d)).filter((d) => d >= 0 && d <= 6))
+  );
+  if (p.workingDays.length === 0) p.workingDays = DEFAULT_PREFS.workingDays;
+
   const maxPerDay = effectiveMaxTasks(p);
   const results: ScheduledTask[] = [];
 

@@ -78,7 +78,8 @@ const allMutations: Record<string, Function> = {
     ...XPResolvers.Mutation,
     ...ChallengeResolvers.Mutation,
     ...SideQuestResolvers.Mutation,
-    ...AnalyticsResolvers.Mutation,
+    // AnalyticsResolvers has no Mutation block — productivity is recorded
+    // server-side from XP.completeTask, not by a client mutation.
     ...NotificationResolvers.Mutation,
     ...ShareResolvers.Mutation,
     ...PushNotificationResolvers.Mutation,
