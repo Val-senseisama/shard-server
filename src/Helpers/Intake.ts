@@ -26,7 +26,7 @@ import "dotenv/config";
 import Groq from "groq-sdk";
 import { logError } from "./Helpers.js";
 
-const LIGHT_MODEL = "llama-3.1-8b-instant";
+import { LIGHT_MODEL } from "../config/models.js";
 
 /**
  * Built on first use, not at import.

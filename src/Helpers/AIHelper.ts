@@ -3,8 +3,7 @@ import Groq from "groq-sdk";
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-const HEAVY_MODEL = "llama-3.3-70b-versatile";  // full reasoning — quest breakdowns
-const LIGHT_MODEL = "llama-3.1-8b-instant";      // fast + cheap — nudges, summaries, tips
+import { HEAVY_MODEL, LIGHT_MODEL } from "../config/models.js";
 
 // Retry wrapper: retries on 429/5xx with exponential backoff
 async function withRetry<T>(fn: () => Promise<T>, attempts = 2): Promise<T> {
