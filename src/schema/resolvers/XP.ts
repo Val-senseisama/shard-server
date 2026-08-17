@@ -577,12 +577,26 @@ export default {
     },
 
     /**
-     * Restore a streak broken within the repair window.
+     * Restore a streak broken within the repair window. Pro only.
      *
      * The strongest retention save in the product and a natural paid moment: a
      * user who just lost a 23-day streak is the most motivated buyer you will
-     * ever have. Free users get one repair from a freeze token if they have one;
-     * Pro users can always repair.
+     * ever have.
+     *
+     * Freezes and repairs are deliberately DIFFERENT things, and this used to
+     * conflate them:
+     *
+     *   - A **freeze** is automatic forgiveness for one isolated missed day.
+     *     It stays free and is refilled weekly (CronJobs `weekly-freeze-grant`).
+     *     Nobody should have to pay because life happened on a Tuesday.
+     *   - A **repair** resurrects a streak that has actually broken — two or
+     *     more consecutive missed days, past what a freeze will cover.
+     *
+     * Letting a free user spend a freeze token on a repair meant the paid moment
+     * was purchasable with a currency we hand out every Monday, so the paywall
+     * only opened for users who had missed ~4 days in three weeks — i.e. exactly
+     * the users whose streak wasn't worth paying to save. The gate was real; the
+     * key was free.
      */
     async repairStreak(_, __, context) {
       if (!context.id) ThrowError("Please login to continue.");
@@ -595,34 +609,34 @@ export default {
       if (userErr || !user) return { success: false, message: "User not found." };
 
       const isPro = tierOf(user as any) === "pro";
-      const freezes = (user as any).streakFreezeTokens ?? 0;
 
-      if (!isPro && freezes <= 0) {
+      if (!isPro) {
         return {
           success: false,
+          // `needsUpgrade` is what the client keys off to open the paywall —
+          // without it this is a dead-end error message.
+          needsUpgrade: true,
           message:
-            "You're out of streak freezes. Shard Pro includes unlimited streak repairs.",
+            "Repairing a broken streak is a Pro feature. Your free streak freezes cover single missed days automatically.",
         };
       }
 
       const result = await repairStreak(context.id);
       if (!result.success) return result;
 
-      // Free repairs cost a freeze token; Pro repairs don't.
-      if (!isPro) {
-        await User.findByIdAndUpdate(context.id, { $inc: { streakFreezeTokens: -1 } });
-      }
-
+      // Freeze tokens are untouched: they're the free mechanic, and spending
+      // one here would charge a Pro user for something their subscription
+      // already covers.
       await cacheInvalidate.user(context.id);
       SaveAuditTrail({
         userId: context.id,
         task: "Streak Repaired",
-        details: `Restored ${result.restored} day streak (${isPro ? "pro" : "freeze token"})`,
+        details: `Restored ${result.restored} day streak (pro)`,
       });
       logEvent({
         name: "streak_repaired",
         userId: context.id,
-        tier: isPro ? "pro" : "free",
+        tier: "pro",
         props: { restored: result.restored ?? 0 },
       });
 

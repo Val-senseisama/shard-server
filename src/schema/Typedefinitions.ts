@@ -1241,6 +1241,13 @@ export default `#graphql
     message: String!
     """The streak length restored, when the repair succeeded."""
     restored: Int
+    """
+    Set when the repair was refused because the user is on the free plan.
+    Repair is Pro-only; free users keep automatic streak freezes for single
+    missed days. The client opens the paywall on this rather than showing a
+    dead-end error.
+    """
+    needsUpgrade: Boolean
   }
 
   type CompleteTaskResponse {
