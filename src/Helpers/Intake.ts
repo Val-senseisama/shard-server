@@ -23,24 +23,10 @@
  */
 
 import "dotenv/config";
-import Groq from "groq-sdk";
 import { logError } from "./Helpers.js";
-
 import { LIGHT_MODEL } from "../config/models.js";
-
-/**
- * Built on first use, not at import.
- *
- * The Groq constructor throws when GROQ_API_KEY is unset, and doing that at
- * module scope takes down every importer — the whole Shard resolver graph, and
- * with it any test that touches it. Lazily, a missing key becomes what it should
- * be: this one call failing, and the caller serving fallback questions.
- */
-let groqClient: Groq | null = null;
-function getGroq(): Groq {
-  if (!groqClient) groqClient = new Groq({ apiKey: process.env.GROQ_API_KEY });
-  return groqClient;
-}
+import { createChatCompletion } from "./LLM.js";
+import { safeParseJSON } from "./AIHelper.js";
 
 /** The five things worth knowing before planning. Nothing else is askable. */
 export const INTAKE_SLOTS = ["done", "why", "aids", "rhythm", "blockers"] as const;
@@ -183,7 +169,7 @@ export async function proposeIntakeQuestions(
   deadline?: string
 ): Promise<IntakeQuestion[]> {
   try {
-    const completion = await getGroq().chat.completions.create({
+    const completion = await createChatCompletion({
       model: LIGHT_MODEL,
       messages: [
         { role: "system", content: INTAKE_PROMPT },
@@ -201,10 +187,10 @@ export async function proposeIntakeQuestions(
     const content = completion.choices?.[0]?.message?.content;
     if (!content) return FALLBACK_QUESTIONS;
 
-    const match = content.match(/\{[\s\S]*\}/);
-    if (!match) return FALLBACK_QUESTIONS;
+    const parsed = safeParseJSON(content);
+    if (!parsed) return FALLBACK_QUESTIONS;
 
-    return validateIntakeQuestions(JSON.parse(match[0]));
+    return validateIntakeQuestions(parsed);
   } catch (error) {
     // Deliberately not rethrown: a failed interview must degrade to the fallback
     // questions, which is still better than the no-questions flow it replaces.

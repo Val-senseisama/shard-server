@@ -1,14 +1,18 @@
 import { describe, it, expect, vi } from "vitest";
 
 vi.mock("./Helpers.js", () => ({ logError: vi.fn() }));
-vi.mock("groq-sdk", () => ({ default: class { chat = { completions: { create: vi.fn() } }; } }));
+vi.mock("./LLM.js", () => ({
+  createChatCompletion: vi.fn(),
+}));
 
 import {
   validateIntakeQuestions,
   formatBriefForPrompt,
+  proposeIntakeQuestions,
   FALLBACK_QUESTIONS,
   MAX_QUESTIONS,
 } from "./Intake.js";
+import { createChatCompletion } from "./LLM.js";
 
 const q = (slot: string, prompt = "A perfectly reasonable question?") => ({ slot, prompt });
 const slots = (list: { slot: string }[]) => list.map((x) => x.slot);
@@ -159,3 +163,35 @@ describe("brief rendering for the architect prompt", () => {
     expect(out).not.toContain("undefined");
   });
 });
+
+describe("proposeIntakeQuestions", () => {
+  it("returns validated questions from AI completion", async () => {
+    vi.mocked(createChatCompletion).mockResolvedValueOnce({
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({
+              questions: [
+                { slot: "done", prompt: "What is your target mileage?" },
+                { slot: "rhythm", prompt: "Which days do you run?" },
+              ],
+            }),
+          },
+        },
+      ],
+    });
+
+    const result = await proposeIntakeQuestions("Run a half marathon");
+    expect(result).toHaveLength(2);
+    expect(result[0].slot).toBe("done");
+    expect(result[1].slot).toBe("rhythm");
+  });
+
+  it("returns fallback questions when AI call fails", async () => {
+    vi.mocked(createChatCompletion).mockRejectedValueOnce(new Error("AI connection failure"));
+
+    const result = await proposeIntakeQuestions("Learn French");
+    expect(result).toEqual(FALLBACK_QUESTIONS);
+  });
+});
+

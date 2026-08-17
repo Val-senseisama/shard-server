@@ -1,28 +1,59 @@
 import "dotenv/config";
-import Groq from "groq-sdk";
-
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-
 import { HEAVY_MODEL, LIGHT_MODEL } from "../config/models.js";
-
-// Retry wrapper: retries on 429/5xx with exponential backoff
-async function withRetry<T>(fn: () => Promise<T>, attempts = 2): Promise<T> {
-  let lastError: any;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await fn();
-    } catch (err: any) {
-      lastError = err;
-      const isRetryable = err?.status === 429 || (err?.status >= 500 && err?.status < 600);
-      if (!isRetryable || i === attempts - 1) throw err;
-      await new Promise((r) => setTimeout(r, 1000 * 2 ** i));
-    }
-  }
-  throw lastError;
-}
+import { createChatCompletion } from "./LLM.js";
 
 import { User } from "../models/User.js";
 import { formatBriefForPrompt } from "./Intake.js";
+
+/**
+ * Safely extracts and parses JSON from model responses.
+ * Handles markdown code fences (```json ... ```), trailing commas, and whitespace.
+ */
+export function safeParseJSON<T = any>(raw: string | undefined | null): T | null;
+export function safeParseJSON<T = any>(raw: string | undefined | null, fallback: T): T;
+export function safeParseJSON<T = any>(raw: string | undefined | null, fallback: T | null = null): T | null {
+  if (!raw || typeof raw !== "string") return fallback;
+
+  let cleaned = raw.trim();
+
+  // Strip markdown code fences if present (e.g. ```json\n{...}\n```)
+  const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenceMatch && fenceMatch[1]) {
+    cleaned = fenceMatch[1].trim();
+  }
+
+  // Find outermost JSON structure: { ... } or [ ... ]
+  const firstBrace = cleaned.indexOf("{");
+  const firstBracket = cleaned.indexOf("[");
+
+  let candidate = cleaned;
+  if (firstBrace !== -1 && (firstBracket === -1 || firstBrace < firstBracket)) {
+    const lastBrace = cleaned.lastIndexOf("}");
+    if (lastBrace !== -1 && lastBrace > firstBrace) {
+      candidate = cleaned.slice(firstBrace, lastBrace + 1);
+    }
+  } else if (firstBracket !== -1) {
+    const lastBracket = cleaned.lastIndexOf("]");
+    if (lastBracket !== -1 && lastBracket > firstBracket) {
+      candidate = cleaned.slice(firstBracket, lastBracket + 1);
+    }
+  }
+
+  // Attempt standard JSON parse
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    // Attempt cleanup of trailing commas before closing braces/brackets and smart quotes
+    try {
+      const sanitized = candidate
+        .replace(/,\s*([}\]])/g, "$1")
+        .replace(/[\u201C\u201D]/g, '"');
+      return JSON.parse(sanitized);
+    } catch {
+      return fallback;
+    }
+  }
+}
 
 /** The intake answers, as they arrive from the client. Every field optional. */
 export interface QuestBriefInput {
@@ -237,7 +268,7 @@ export async function breakDownGoalWithAI(
   const userPrompt = `Goal: ${goal}${deadline ? `\nDeadline: ${deadline}` : ''}${userProfile}${formatBriefForPrompt(brief)}\n\nPlease break this down into a structured quest.`;
 
   try {
-    const completion = await withRetry(() => groq.chat.completions.create({
+    const completion = await createChatCompletion({
       model: HEAVY_MODEL,
       messages: [
         { role: "system", content: QUEST_ARCHITECT_PROMPT },
@@ -246,7 +277,7 @@ export async function breakDownGoalWithAI(
       temperature: 0.7,
       max_completion_tokens: 8192,
       top_p: 1,
-    }));
+    });
 
     const content = completion.choices?.[0]?.message?.content;
 
@@ -254,13 +285,11 @@ export async function breakDownGoalWithAI(
       throw new Error("No content returned from AI");
     }
 
-    // Extract JSON from the response (in case AI adds extra text)
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
+    const questBreakdown = safeParseJSON(content);
+    if (!questBreakdown) {
       throw new Error("No valid JSON found in AI response");
     }
 
-    const questBreakdown = JSON.parse(jsonMatch[0]);
     return questBreakdown;
   } catch (error) {
     console.error("AI breakdown error:", error);
@@ -307,7 +336,7 @@ export function filterUnsafeTasks(tasks: Array<{ title?: string; text?: string }
  */
 export async function getProductivityTips(context: string): Promise<string[]> {
   try {
-    const completion = await withRetry(() => groq.chat.completions.create({
+    const completion = await createChatCompletion({
       model: LIGHT_MODEL,
       messages: [
         { role: "system", content: "You are a productivity coach. Provide 3-5 actionable, encouraging tips based on the user's context. Return as a JSON array of strings." },
@@ -316,7 +345,7 @@ export async function getProductivityTips(context: string): Promise<string[]> {
       temperature: 0.7,
       max_completion_tokens: 512,
       top_p: 1,
-    }));
+    });
 
     const content = completion.choices?.[0]?.message?.content;
 
@@ -324,13 +353,13 @@ export async function getProductivityTips(context: string): Promise<string[]> {
       return [];
     }
 
-    // Try to parse as JSON array
-    try {
-      return JSON.parse(content);
-    } catch {
-      // If not JSON, split by newlines
-      return content.split('\n').filter(line => line.trim());
+    const parsed = safeParseJSON<string[]>(content);
+    if (Array.isArray(parsed)) {
+      return parsed;
     }
+
+    // If not JSON array, split by newlines
+    return content.split('\n').filter(line => line.trim());
   } catch (error) {
     console.error("Productivity tips error:", error);
     return [];
@@ -386,7 +415,7 @@ ${shardData.deadline ? `Deadline: ${shardData.deadline}\n` : ''}\nMini-Goals:\n$
 Please suggest XP rewards and timelines for this quest structure.`;
 
   try {
-    const completion = await withRetry(() => groq.chat.completions.create({
+    const completion = await createChatCompletion({
       model: LIGHT_MODEL,
       messages: [
         { role: "system", content: enrichmentPrompt },
@@ -395,7 +424,7 @@ Please suggest XP rewards and timelines for this quest structure.`;
       temperature: 0.5,
       max_completion_tokens: 2048,
       top_p: 1,
-    }));
+    });
 
     const content = completion.choices?.[0]?.message?.content;
 
@@ -403,13 +432,11 @@ Please suggest XP rewards and timelines for this quest structure.`;
       throw new Error("No content returned from AI");
     }
 
-    // Extract JSON from the response
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
+    const enrichment = safeParseJSON(content);
+    if (!enrichment) {
       throw new Error("No valid JSON found in AI response");
     }
 
-    const enrichment = JSON.parse(jsonMatch[0]);
     return enrichment;
   } catch (error) {
     console.error("AI enrichment error:", error);
@@ -457,21 +484,18 @@ Stats:
 Return ONLY a JSON array of strings. No extra text.
 Example: ["🔥 You're on a 5-day streak — don't break it now!", "📈 Completion up 12% vs last week!"]`;
 
-    const completion = await withRetry(() => groq.chat.completions.create({
+    const completion = await createChatCompletion({
       model: LIGHT_MODEL,
       messages: [{ role: "user", content: prompt }],
       temperature: 0.8,
       max_completion_tokens: 512,
       top_p: 1,
-    }));
+    });
 
     const content = completion.choices?.[0]?.message?.content;
     if (!content) return [];
 
-    const jsonMatch = content.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) return [];
-
-    const insights = JSON.parse(jsonMatch[0]);
+    const insights = safeParseJSON<string[]>(content, []);
     return Array.isArray(insights) ? insights.slice(0, 5) : [];
   } catch (error) {
     console.error("Productivity insights error:", error);
@@ -506,21 +530,18 @@ Return ONLY valid JSON:
   "xpReward": 30
 }`;
 
-    const completion = await withRetry(() => groq.chat.completions.create({
+    const completion = await createChatCompletion({
       model: LIGHT_MODEL,
       messages: [{ role: "user", content: prompt }],
       temperature: 0.6,
       max_completion_tokens: 512,
       top_p: 1,
-    }));
+    });
 
     const content = completion.choices?.[0]?.message?.content;
     if (!content) return null;
 
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return null;
-
-    return JSON.parse(jsonMatch[0]);
+    return safeParseJSON(content);
   } catch (error) {
     console.error("Reflection mission error:", error);
     return null;
@@ -557,28 +578,20 @@ Return ONLY a JSON array in this exact format:
 
 No additional text, just the JSON array.`;
 
-    const completion = await withRetry(() => groq.chat.completions.create({
+    const completion = await createChatCompletion({
       model: LIGHT_MODEL,
       messages: [{ role: "user", content: prompt }],
       temperature: 0.7,
       max_completion_tokens: 1024,
       top_p: 1,
-    }));
+    });
 
     const content = completion.choices[0]?.message?.content;
     if (!content) {
       throw new Error("No content returned from AI");
     }
 
-    // Extract JSON array from response
-    const jsonMatch = content.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) {
-      throw new Error("No valid JSON array found in AI response");
-    }
-
-    const tasks = JSON.parse(jsonMatch[0]);
-    
-    // Validate and limit to 5 tasks
+    const tasks = safeParseJSON<any[]>(content);
     if (!Array.isArray(tasks) || tasks.length === 0) {
       throw new Error("Invalid tasks format from AI");
     }
@@ -633,7 +646,7 @@ export async function generateInactivityNudge(
   staleDays: number
 ): Promise<string> {
   try {
-    const completion = await withRetry(() => groq.chat.completions.create({
+    const completion = await createChatCompletion({
       model: LIGHT_MODEL,
       messages: [{
         role: "user",
@@ -642,7 +655,7 @@ export async function generateInactivityNudge(
       temperature: 0.8,
       max_completion_tokens: 256,
       top_p: 1,
-    }));
+    });
     return completion.choices[0]?.message?.content?.trim() || COACH_TEMPLATES.inactivity(shardTitle);
   } catch {
     return COACH_TEMPLATES.inactivity(shardTitle);
@@ -659,7 +672,7 @@ export async function generateSimplifiedTasks(
 ): Promise<string[]> {
   try {
     const taskList = incompleteTasks.slice(0, 5).join(", ");
-    const completion = await withRetry(() => groq.chat.completions.create({
+    const completion = await createChatCompletion({
       model: LIGHT_MODEL,
       messages: [{
         role: "user",
@@ -668,11 +681,9 @@ export async function generateSimplifiedTasks(
       temperature: 0.7,
       max_completion_tokens: 256,
       top_p: 1,
-    }));
+    });
     const content = completion.choices[0]?.message?.content || "";
-    const match = content.match(/\[[\s\S]*\]/);
-    if (!match) return [];
-    const parsed = JSON.parse(match[0]);
+    const parsed = safeParseJSON<string[]>(content);
     return Array.isArray(parsed) ? parsed.slice(0, 5) : [];
   } catch {
     return [];
@@ -687,7 +698,7 @@ export async function generateStretchGoal(
   streak: number
 ): Promise<string> {
   try {
-    const completion = await withRetry(() => groq.chat.completions.create({
+    const completion = await createChatCompletion({
       model: LIGHT_MODEL,
       messages: [{
         role: "user",
@@ -696,7 +707,7 @@ export async function generateStretchGoal(
       temperature: 0.8,
       max_completion_tokens: 128,
       top_p: 1,
-    }));
+    });
     return completion.choices[0]?.message?.content?.trim() || COACH_TEMPLATES.milestone(streak);
   } catch {
     return COACH_TEMPLATES.milestone(streak);
@@ -735,7 +746,7 @@ export async function chatAboutShard(
   history?: string
 ): Promise<{ reply: string; proposal: { summary?: string; actions: any[] } | null }> {
   try {
-    const completion = await withRetry(() => groq.chat.completions.create({
+    const completion = await createChatCompletion({
       model: HEAVY_MODEL,
       messages: [
         { role: "system", content: QUEST_ASSISTANT_PROMPT },
@@ -744,14 +755,13 @@ export async function chatAboutShard(
       temperature: 0.6,
       max_completion_tokens: 1500,
       top_p: 1,
-    }));
+    });
 
     const content = completion.choices?.[0]?.message?.content || "";
-    const match = content.match(/\{[\s\S]*\}/);
-    if (!match) {
+    const parsed = safeParseJSON(content);
+    if (!parsed) {
       return { reply: content.trim() || "I'm not sure how to help with that — try rephrasing?", proposal: null };
     }
-    const parsed = JSON.parse(match[0]);
     const proposal = parsed.proposal && Array.isArray(parsed.proposal.actions) && parsed.proposal.actions.length > 0
       ? { summary: parsed.proposal.summary, actions: parsed.proposal.actions }
       : null;
@@ -772,7 +782,7 @@ export async function generateChatSummary(
   shardProgress?: number
 ): Promise<string> {
   try {
-    const completion = await withRetry(() => groq.chat.completions.create({
+    const completion = await createChatCompletion({
       model: LIGHT_MODEL,
       messages: [{
         role: "user",
@@ -794,7 +804,7 @@ Write 2-4 sentences in a friendly, motivating tone. Start with a relevant emoji.
       temperature: 0.6,
       max_completion_tokens: 256,
       top_p: 1,
-    }));
+    });
 
     const content = completion.choices[0]?.message?.content?.trim();
     if (!content) throw new Error("No content");
