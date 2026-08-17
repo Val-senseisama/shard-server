@@ -147,6 +147,12 @@ export interface NotifyInput {
   emailData?: Record<string, any>;
   /** Skip the push, still record in-app (e.g. low-value bulk updates). */
   inAppOnly?: boolean;
+  /**
+   * Tray grouping key. Pushes sharing one replace each other on the device
+   * rather than stacking — see `sendNotificationToTokens`. Use it wherever a
+   * newer push makes an older one redundant (chat, per-shard updates).
+   */
+  collapseKey?: string;
 }
 
 export interface NotifyResult {
@@ -321,7 +327,8 @@ export async function notify(input: NotifyInput): Promise<NotifyResult> {
           },
         },
         channelForType(type),
-        await getUnreadBadgeCount(input.userId)
+        await getUnreadBadgeCount(input.userId),
+        input.collapseKey
       );
     }
 

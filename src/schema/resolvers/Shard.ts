@@ -9,7 +9,8 @@ import MiniGoal from "../../models/MiniGoal.js";
 import { logEvent } from "../../Helpers/Telemetry.js";
 import Chat, { Message } from "../../models/Chat.js";
 import { User } from "../../models/User.js";
-import { breakDownGoalWithAI, checkAIUsage, trackAIUsage, enrichManualShard, UserContext } from "../../Helpers/AIHelper.js";
+import { breakDownGoalWithAI, checkAIUsage, trackAIUsage, enrichManualShard, UserContext, QuestBriefInput } from "../../Helpers/AIHelper.js";
+import { proposeIntakeQuestions } from "../../Helpers/Intake.js";
 import { tierOf, countActiveShards, upgradeError, FREE_ACTIVE_SHARD_CAP } from "../../Helpers/Entitlements.js";
 import { enqueueReflectionMission } from "../../Helpers/CronJobs.js";
 import { moderate } from "../../Helpers/ContentModerator.js";
@@ -306,10 +307,70 @@ async function _scheduleShardTasks(shardId: string, userId: string) {
   };
 }
 
+/**
+ * The `brief` and `rhythm` fields to spread onto a new shard.
+ *
+ * Two fields rather than one because they answer different questions:
+ * `brief.rhythm` is what the user *said* at intake, `shard.rhythm` is what the
+ * plan is *built against*. They start equal and diverge the first time anyone
+ * reschedules — and a reschedule that fell back to the intake answer would
+ * silently revert to a pace the user had already abandoned.
+ *
+ * Returns `{}` for a skipped or absent interview, so every existing creation
+ * path is untouched.
+ */
+function briefFields(brief?: QuestBriefInput): Record<string, unknown> {
+  if (!brief) return {};
+
+  const answered =
+    brief.done || brief.why || brief.blockers || brief.rhythm || brief.skipped?.length;
+  if (!answered) return {};
+
+  const rhythm =
+    brief.rhythm && typeof brief.rhythm.sessionMinutes === "number"
+      ? {
+          days: (brief.rhythm.days ?? []).filter((d) => d >= 0 && d <= 6),
+          sessionMinutes: brief.rhythm.sessionMinutes,
+          timeOfDay: brief.rhythm.timeOfDay,
+        }
+      : undefined;
+
+  return {
+    brief: { ...brief, capturedAt: new Date() },
+    ...(rhythm ? { rhythm } : {}),
+  };
+}
+
 export default {
   Mutation: {
+    /**
+     * Which intake questions to ask for this goal.
+     *
+     * Deliberately cheap and uncharged: it writes nothing, spends no credit, and
+     * never fails in a way the client has to handle — `proposeIntakeQuestions`
+     * returns fallback questions rather than throwing. Charging for this would
+     * mean a user who abandons the interview has burned one of fifteen monthly
+     * credits for nothing, which is the worst possible place to spend one.
+     */
+    async startQuestIntake(_, { goal, deadline }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+
+      // The goal reaches an LLM here, so it gets the same gate as createShard.
+      const goalMod = moderate(goal, 'goal');
+      if (!goalMod.allowed) {
+        return {
+          success: false,
+          message: goalMod.crisisMessage || goalMod.reason || 'This goal could not be processed.',
+          questions: [],
+        };
+      }
+
+      const questions = await proposeIntakeQuestions(goal, deadline);
+      return { success: true, questions };
+    },
+
     // Create a new quest (Shard) with AI breakdown
-    async createShard(_, { goal, deadline, image, participants, isPrivate, isAnonymous, questType, cadence }, context) {
+    async createShard(_, { goal, deadline, image, participants, isPrivate, isAnonymous, questType, cadence, brief }, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
       try {
@@ -366,6 +427,21 @@ export default {
           };
         }
 
+        // The brief's free-text answers are the user's own words heading for the
+        // same prompt, so they get the same gate. Checked before the AI call so a
+        // blocked brief never spends a credit.
+        for (const field of [brief?.done, brief?.why, brief?.blockers, brief?.rhythm?.raw]) {
+          if (!field) continue;
+          const mod = moderate(field, 'goal');
+          if (!mod.allowed) {
+            return {
+              success: false,
+              message: mod.crisisMessage || mod.reason || 'That answer could not be processed.',
+              isCrisis: mod.severity === 'crisis',
+            };
+          }
+        }
+
         // Build user context for AI personalisation
         const u = user as any;
         const userContext: UserContext = {
@@ -389,7 +465,7 @@ export default {
           },
         };
 
-        const questBreakdown = await breakDownGoalWithAI(goal, deadline, userContext);
+        const questBreakdown = await breakDownGoalWithAI(goal, deadline, userContext, brief);
 
         // Deduct credit only after a successful AI call — prevents losing credits on failures
         if (user?.role !== 'admin') {
@@ -420,6 +496,7 @@ export default {
             questType: questType || "standard",
             cadence,
             rewards: [{ type: "xp", value: questBreakdown.mainQuest.xpReward }],
+            ...briefFields(brief),
           })
         );
 
@@ -1491,6 +1568,116 @@ export default {
       };
     },
 
+    /**
+     * Move a whole mini-goal, carrying its open tasks with it.
+     *
+     * `updateMiniGoal` already accepted a `dueDate`, but it only wrote the field
+     * on the mini-goal — and nothing schedules off that field. The schedule, the
+     * streak, the backlog and the widget are all built from `task.dueDate`, so
+     * "rescheduling" a mini-goal moved a label and left every task where it was.
+     *
+     * The shift is a **uniform delta**, not a redistribution. A plan's shape is
+     * information the user put there — two tasks a day apart mean something that
+     * two tasks squeezed to the same afternoon do not — so every open task moves
+     * by the same amount and the spacing survives.
+     *
+     * The anchor is the LAST open task, because that is what a user means by "when
+     * this mini-goal is done". Anchoring on the first would make "move it to
+     * Friday" start the work on Friday rather than finish it then.
+     *
+     * Completed tasks never move: they are a record of when work actually
+     * happened, and rewriting that would corrupt the streak's history.
+     */
+    async rescheduleMiniGoal(_, { miniGoalId, newDueDate }, context) {
+      if (!context.id) ThrowError("Please login to continue.");
+
+      const [mgErr, miniGoal] = await catchError(MiniGoal.findById(miniGoalId));
+      if (mgErr || !miniGoal) return { success: false, message: "Mini-goal not found." };
+
+      const [shardErr, shard] = await catchError(
+        Shard.findById(miniGoal.shardId).select("owner participants").lean()
+      );
+      if (shardErr || !shard) return { success: false, message: "Quest not found." };
+
+      const isOwner = (shard as any).owner.toString() === context.id;
+      const isCollaborator = ((shard as any).participants ?? []).some(
+        (p: any) => p.user.toString() === context.id && p.role === "collaborator"
+      );
+      if (!isOwner && !isCollaborator) {
+        return { success: false, message: "You don't have permission to change this mini-goal." };
+      }
+
+      const target = new Date(Number(newDueDate) || newDueDate);
+      if (Number.isNaN(target.getTime())) {
+        return { success: false, message: "Invalid date." };
+      }
+
+      const tasks = miniGoal.tasks as any[];
+      const movable = tasks.filter((t) => t && !t.completed && !t.deleted && t.dueDate);
+
+      // Nothing to carry — this is just a label change, and the old behaviour is
+      // the right one.
+      if (movable.length === 0) {
+        (miniGoal as any).dueDate = target;
+        await miniGoal.save();
+        await cacheInvalidate.shard(miniGoal.shardId.toString());
+        return { success: true, message: "Mini-goal rescheduled." };
+      }
+
+      const anchor = movable.reduce(
+        (latest, t) => Math.max(latest, new Date(t.dueDate).getTime()),
+        0
+      );
+      const delta = target.getTime() - anchor;
+
+      // Moving a mini-goal earlier is legitimate, but because the anchor is the
+      // last task, a big enough shift drags the earlier ones into the past —
+      // where they would land as instantly overdue work the user never actually
+      // missed. Refuse with the reason rather than silently clamping them all
+      // onto today, which would destroy the spacing this whole mutation exists
+      // to preserve.
+      const startOfToday = new Date();
+      startOfToday.setHours(0, 0, 0, 0);
+      const wouldStrand = movable.filter(
+        (t) => new Date(t.dueDate).getTime() + delta < startOfToday.getTime()
+      ).length;
+      if (wouldStrand > 0) {
+        return {
+          success: false,
+          message:
+            wouldStrand === 1
+              ? "That would put a task in the past. Pick a later date."
+              : `That would put ${wouldStrand} tasks in the past. Pick a later date.`,
+        };
+      }
+
+      for (const task of movable) {
+        // Same bookkeeping resolveOverdueTask does for a single task, so
+        // RescheduledBadge can still say where a task came from. Only stamped on
+        // the first move: `originalDueDate` means "where this started", not
+        // "where it was last time".
+        if (!task.rescheduled) task.originalDueDate = task.dueDate;
+        task.dueDate = new Date(new Date(task.dueDate).getTime() + delta);
+        task.rescheduled = true;
+        task.overdue = false;
+        task.overdueSince = undefined;
+      }
+
+      (miniGoal as any).dueDate = target;
+
+      await miniGoal.save();
+      await recomputeShardProgress(miniGoal.shardId.toString());
+      await cacheInvalidate.shard(miniGoal.shardId.toString());
+
+      return {
+        success: true,
+        message:
+          movable.length === 1
+            ? "Mini-goal rescheduled. 1 task moved."
+            : `Mini-goal rescheduled. ${movable.length} tasks moved.`,
+      };
+    },
+
     async scheduleTasks(_, { shardId }, context) {
       return _scheduleShardTasks(shardId, context.id);
     },
@@ -2127,6 +2314,19 @@ export default {
 
         miniGoals.forEach((mg: any) => {
           mg.tasks.forEach((task: any, taskIndex: number) => {
+            // Soft-deleted tasks are gone from the user's plan. Helpers/Progress
+            // already excludes them from the bar and `myShards` filters them, but
+            // neither schedule resolver did — so a dropped task kept turning up
+            // on Home, in the backlog and on the widget, which made the "drop"
+            // action of resolveOverdueTask look like it had done nothing at all.
+            //
+            // Skipped in place rather than by compacting the array, because
+            // `taskIndex` is this loop's index into the ORIGINAL tasks array and
+            // that is exactly what completeTask and resolveOverdueTask address a
+            // task by. Rebuilding the list would renumber every task after a
+            // deleted one and silently target the wrong work.
+            if (task.deleted) return;
+
             if (task.dueDate) {
               // Handle different dueDate formats (Date object, number, or string)
               let dueDateValue: Date;
@@ -2367,6 +2567,19 @@ export default {
           const shard = shardMap.get(mg.shardId.toString());
 
           mg.tasks.forEach((task: any, taskIndex: number) => {
+            // Soft-deleted tasks are gone from the user's plan. Helpers/Progress
+            // already excludes them from the bar and `myShards` filters them, but
+            // neither schedule resolver did — so a dropped task kept turning up
+            // on Home, in the backlog and on the widget, which made the "drop"
+            // action of resolveOverdueTask look like it had done nothing at all.
+            //
+            // Skipped in place rather than by compacting the array, because
+            // `taskIndex` is this loop's index into the ORIGINAL tasks array and
+            // that is exactly what completeTask and resolveOverdueTask address a
+            // task by. Rebuilding the list would renumber every task after a
+            // deleted one and silently target the wrong work.
+            if (task.deleted) return;
+
             if (task.dueDate) {
               // Handle different dueDate formats (Date object, number, or string)
               let dueDateValue: Date;

@@ -11,6 +11,8 @@ import { breakDownGoalWithAI, checkAIUsage, trackAIUsage } from "../../Helpers/A
 import { tierOf, upgradeError } from "../../Helpers/Entitlements.js";
 import { User } from "../../models/User.js";
 import { cache, cacheKeys, cacheInvalidate } from "../../Helpers/Cache.js";
+import { recordActivity } from "../../Helpers/Streak.js";
+import { notifyStreakProgress } from "../../Helpers/Notify.js";
 
 export default {
   Mutation: {
@@ -187,12 +189,30 @@ export default {
         completedAt: new Date(),
       });
 
+      // Side quests are qualifying activity for the daily streak.
+      //
+      // They were not, which was a plain omission rather than a decision:
+      // Streak.ts has always documented the qualifying set as "task, mini-goal,
+      // habit check-in, side quest", and this was the one path that never called
+      // it. It is also the worst one to miss — unlocks.ts calls side quests "the
+      // daily-habit mechanic, not an extra", so this is exactly what a user
+      // reaches for on a day the planner scheduled nothing, and it silently did
+      // not keep their streak alive.
+      //
+      // Before awardXP, matching completeTask: a comeback bonus granted by this
+      // activity has to apply to the XP that same activity earns.
+      const streak = await recordActivity(context.id);
+
       // Award XP
       const xpResult = await awardXP(
         context.id,
         sideQuest.xpReward,
         `Completed side quest: ${sideQuest.title}`
       );
+
+      if (streak.counted) {
+        notifyStreakProgress(context.id, streak).catch(() => {});
+      }
 
       // Invalidate cache
       await cache.del(`user:${context.id}:sidequests`);

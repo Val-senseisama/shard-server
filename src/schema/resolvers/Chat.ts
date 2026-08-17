@@ -15,7 +15,8 @@ import { moderate } from "../../Helpers/ContentModerator.js";
 import { generateChatSummary, checkAIUsage, trackAIUsage } from "../../Helpers/AIHelper.js";
 import { tierOf } from "../../Helpers/Entitlements.js";
 import { Types } from "mongoose";
-import { notifyMany } from "../../Helpers/Notify.js";
+import { notifyChatMessage } from "../../Helpers/MessagePush.js";
+import { isViewingChat } from "../../server/WebSocketServer.js";
 
 const cacheInvalidateChat = cacheInvalidate.chat;
 const cacheInvalidateUserChats = cacheInvalidate.userChats;
@@ -50,14 +51,17 @@ async function resolveChat(chatId: string) {
 }
 
 /**
- * Parse @mentions in a message and notify mentioned users.
+ * Resolve @mentions in a message to participant user ids.
+ *
+ * Resolution only — the push is sent from `sendMessage` alongside the ordinary
+ * message push. Sending it here meant mentions were notified before the message
+ * row existed, so a fast tap opened a chat that didn't yet contain the message
+ * being announced, and the two chat pushes couldn't see each other to coalesce.
  */
-async function processMentions(
+async function resolveMentions(
   content: string,
   participants: string[],
-  senderId: string,
-  chatId: string,
-  senderUsername: string
+  senderId: string
 ): Promise<string[]> {
   const atMatches = content.match(/@(\w+)/g);
   if (!atMatches) return [];
@@ -83,22 +87,7 @@ async function processMentions(
     }
   }
 
-  const uniqueMentions = [...new Set(mentionedIds)];
-
-  if (uniqueMentions.length > 0) {
-    notifyMany(uniqueMentions, {
-      kind: "message",
-      title: `@${senderUsername} mentioned you`,
-      body: content.length > 60 ? content.substring(0, 60) + "..." : content,
-      data: { chatId, screen: "/(screens)/shard/[id]/chat", isMention: "true" },
-      emailData: { actorName: senderUsername },
-      // Chat is transactional and per-message — never collapse it into a
-      // once-a-day slot.
-      dedupeKey: null,
-    }).catch((e) => logError("notify:mention", e));
-  }
-
-  return uniqueMentions;
+  return [...new Set(mentionedIds)];
 }
 
 export default {
@@ -271,12 +260,10 @@ export default {
       // Process @mentions
       let mentionedIds: string[] = [];
       if (type === "text" || !type) {
-        mentionedIds = await processMentions(
+        mentionedIds = await resolveMentions(
           content,
           chat.participants.map((p: any) => p.toString()),
-          context.id,
-          chatId.toString(),
-          sender?.username || "Someone"
+          context.id
         );
       }
 
@@ -306,26 +293,54 @@ export default {
         chat.participants.map((p: any) => cacheInvalidateUserChats(p.toString()))
       );
 
-      // Notify participants
-      const otherParticipants = chat.participants.filter(
-        (p: any) => p.toString() !== context.id
+      // ── Notify participants ───────────────────────────────────────────────
+      //
+      // Three filters, in order: don't notify yourself; don't notify anyone with
+      // this chat open on screen (they are watching the message arrive — the
+      // socket broadcast below is their notification); and don't send a mentioned
+      // user the weaker "new message" on top of their mention.
+      const senderName = sender?.username || "Someone";
+      const chatIdStr = chatId.toString();
+      const shardIdStr = (chat as any).shardId?.toString();
+      // Group chats carry a name; direct chats don't, and "X in undefined" is
+      // worse copy than plain "X".
+      const chatName = chat.type === "direct" ? undefined : (chat as any).name || undefined;
+      const pushData = { chatId: chatIdStr, screen: "/(screens)/shard/[id]/chat" };
+
+      const attentive = (id: string) => isViewingChat(id, chatIdStr, shardIdStr);
+
+      const otherParticipants = chat.participants
+        .map((p: any) => p.toString())
+        .filter((id: string) => id !== context.id && !attentive(id));
+
+      const mentionRecipients = otherParticipants.filter((id: string) =>
+        mentionedIds.includes(id)
+      );
+      const messageRecipients = otherParticipants.filter(
+        (id: string) => !mentionedIds.includes(id)
       );
 
-      // Mentioned users were already notified with the mention copy — don't
-      // send them a second, weaker "new message" on top.
-      const recipientIds = otherParticipants
-        .map((p: any) => p.toString())
-        .filter((id) => !mentionedIds.includes(id));
+      if (mentionRecipients.length > 0) {
+        notifyChatMessage({
+          userIds: mentionRecipients,
+          chatId: chatIdStr,
+          senderName,
+          preview: content,
+          chatName,
+          data: pushData,
+          isMention: true,
+        });
+      }
 
-      if (recipientIds.length > 0) {
-        await notifyMany(recipientIds, {
-          kind: "message",
-          title: `New message from ${sender?.username || "Someone"}`,
-          body: content.length > 50 ? content.substring(0, 50) + "..." : content,
-          data: { chatId: chatId.toString(), screen: "/(screens)/shard/[id]/chat" },
-          emailData: { actorName: sender?.username },
-          dedupeKey: null,
-        }).catch((e) => logError("notify:message", e));
+      if (messageRecipients.length > 0) {
+        notifyChatMessage({
+          userIds: messageRecipients,
+          chatId: chatIdStr,
+          senderName,
+          preview: content,
+          chatName,
+          data: pushData,
+        });
       }
 
       // Real-time broadcast — includes replyTo so clients can render quote previews

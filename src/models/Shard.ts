@@ -5,6 +5,50 @@ interface Participant {
   role: "collaborator" | "accountability_partner";
 }
 
+/**
+ * When the user can actually work on this, and for how long at a stretch.
+ *
+ * Shared by the intake interview (what they said) and the shard itself (what the
+ * plan was built with) — see the note on `ShardDocument.rhythm` for why those are
+ * deliberately two fields rather than one.
+ */
+export interface Rhythm {
+  /** 0–6, Sunday = 0. Empty when the user's answer couldn't be parsed. */
+  days: number[];
+  sessionMinutes: number;
+  timeOfDay?: "morning" | "afternoon" | "evening";
+}
+
+/**
+ * What the user told us about the goal BEFORE the plan existed.
+ *
+ * Captured by the intake interview and kept so every later AI touch can read it
+ * instead of re-deriving intent from the shard title. Every field is optional:
+ * each question is skippable, and the whole interview can be skipped or fail.
+ */
+export interface QuestBrief {
+  /** "What has to be true for this to count as finished?" */
+  done?: string;
+  /** "What changes for you when this is done?" — the line nudges should quote. */
+  why?: string;
+  /** As given at intake. `raw` is the user's own words, kept for the prompt. */
+  rhythm?: Rhythm & { raw?: string };
+  /** "What normally stops you finishing something like this?" */
+  blockers?: string;
+  /** Slots we offered and the user skipped — so we don't re-ask, and can measure. */
+  skipped?: string[];
+  capturedAt: Date;
+}
+
+const RhythmSchema = new Schema<Rhythm>(
+  {
+    days: { type: [Number], default: [] },
+    sessionMinutes: { type: Number, required: true },
+    timeOfDay: { type: String, enum: ["morning", "afternoon", "evening"] },
+  },
+  { _id: false }
+);
+
 export interface ShardDocument extends Document {
   title: string;
   image?: string;
@@ -43,6 +87,18 @@ export interface ShardDocument extends Document {
   isPrivate: boolean;
   isAnonymous: boolean;
   version: number;
+  /** What the user said at intake. Absent for shards created before intake shipped. */
+  brief?: QuestBrief;
+  /**
+   * The pace this shard is actually planned against — what a reschedule defaults
+   * to.
+   *
+   * Deliberately NOT `brief.rhythm`: the brief records what the user *said*
+   * during intake, this records what the plan was *built with*. They start equal
+   * and diverge the first time anyone changes days, and conflating them would
+   * make a later reflow silently revert to a rhythm the user abandoned.
+   */
+  rhythm?: Rhythm;
 }
 
 const ShardSchema = new Schema<ShardDocument>(
@@ -101,6 +157,32 @@ const ShardSchema = new Schema<ShardDocument>(
     isPrivate: { type: Boolean, default: false },
     isAnonymous: { type: Boolean, default: false },
     version: { type: Number, default: 1 },
+    brief: {
+      type: new Schema<QuestBrief>(
+        {
+          done: String,
+          why: String,
+          rhythm: {
+            type: new Schema(
+              {
+                days: { type: [Number], default: [] },
+                sessionMinutes: Number,
+                timeOfDay: { type: String, enum: ["morning", "afternoon", "evening"] },
+                raw: String,
+              },
+              { _id: false }
+            ),
+            required: false,
+          },
+          blockers: String,
+          skipped: { type: [String], default: undefined },
+          capturedAt: { type: Date, required: true },
+        },
+        { _id: false }
+      ),
+      required: false,
+    },
+    rhythm: { type: RhythmSchema, required: false },
   },
   { timestamps: true }
 );

@@ -93,7 +93,15 @@ export default `#graphql
     updatePreferences(input: PreferencesInput!): MessageResponse!
     
     # Shard mutations
-    createShard(goal: String!, deadline: String, image: String, participants: [ParticipantInput!], isPrivate: Boolean, isAnonymous: Boolean, questType: String, cadence: String): CreateShardResponse!
+    """
+    Ask which intake questions matter for this goal.
+
+    Stateless and free — it writes nothing and spends no AI credit. The client
+    holds the answers and passes them to createShard as a brief, so an abandoned
+    interview leaves nothing behind and costs the user nothing.
+    """
+    startQuestIntake(goal: String!, deadline: String): QuestIntakeResponse!
+    createShard(goal: String!, deadline: String, image: String, participants: [ParticipantInput!], isPrivate: Boolean, isAnonymous: Boolean, questType: String, cadence: String, brief: QuestBriefInput): CreateShardResponse!
     createShardManual(input: CreateShardInput!): CreateShardResponse!
     updateShard(id: ID!, input: UpdateShardInput!): ShardResponse!
     deleteShard(id: ID!): MessageResponse!
@@ -121,6 +129,12 @@ export default `#graphql
     """Restore a streak broken within the repair window."""
     repairStreak: RepairStreakResponse!
     triggerCoachNudge(shardId: ID!): CoachNudgeResult!
+    """Move a mini-goal and carry its open tasks with it, preserving the spacing
+    between them. newDueDate is epoch millis as a string, and becomes the new due
+    date of the LAST open task — which is what a user means by when a mini-goal
+    is done. Completed tasks never move; rewriting them would corrupt the record
+    of when work actually happened."""
+    rescheduleMiniGoal(miniGoalId: ID!, newDueDate: String!): MessageResponse!
     scheduleTasks(shardId: ID!): GenerateTasksResponse!
     generateWeeklyTasks(miniGoalId: ID!, weekNumber: Int, action: String): GenerateTasksResponse!
     deleteTask(miniGoalId: ID!, taskTitle: String!): MessageResponse!
@@ -459,6 +473,46 @@ export default `#graphql
     needsUpgrade: Boolean
     miniGoals: [MiniGoalPreview!]
     aiCallsRemaining: Int
+  }
+
+  type QuestIntakeResponse {
+    success: Boolean!
+    message: String
+    "Ordered, 2-4 entries. Render in this order; never reorder client-side."
+    questions: [IntakeQuestion!]!
+  }
+
+  type IntakeQuestion {
+    "Stable slot id: done | why | aids | rhythm | blockers. Keys the answer."
+    slot: String!
+    "Model-authored wording, specific to this goal."
+    prompt: String!
+    "Which control to render: text | rhythm | resources."
+    inputKind: String!
+    placeholder: String
+  }
+
+  """
+  The intake answers, sent back at creation. Every field is optional — each
+  question is skippable and the whole interview can be skipped.
+  """
+  input QuestBriefInput {
+    done: String
+    why: String
+    rhythm: RhythmInput
+    blockers: String
+    "Slots offered and skipped. Drives the skip-rate metric; never re-asked."
+    skipped: [String!]
+  }
+
+  input RhythmInput {
+    "0-6, Sunday = 0."
+    days: [Int!]
+    sessionMinutes: Int
+    "morning | afternoon | evening"
+    timeOfDay: String
+    "The user's own words, kept for the prompt when days can't be parsed."
+    raw: String
   }
 
   input CreateShardInput {

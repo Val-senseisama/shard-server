@@ -207,7 +207,14 @@ export const sendNotificationToTokens = async (
     data?: Record<string, string>;
   },
   channelId: string = 'default',
-  badge?: number
+  badge?: number,
+  /**
+   * Groups pushes that supersede one another — pass the same key (e.g.
+   * `chat:<id>`) and the newest one REPLACES the previous in the tray instead of
+   * stacking under it. Without this, a chat that gets ten messages leaves ten
+   * separate rows the user has to clear one by one.
+   */
+  collapseKey?: string
 ): Promise<boolean> => {
   if (!isInitialized) initializeFirebase();
   if (!isInitialized) return false;
@@ -225,27 +232,52 @@ export const sendNotificationToTokens = async (
         body: notification.body,
       },
       data: notification.data || {},
-      android: { notification: { channelId, ...(badge != null ? { notificationCount: badge } : {}) } },
-      ...(badge != null ? { apns: { payload: { aps: { badge } } } } : {}),
+      android: {
+        ...(collapseKey ? { collapseKey } : {}),
+        notification: {
+          channelId,
+          ...(badge != null ? { notificationCount: badge } : {}),
+          // `tag` is the tray-level replace key on Android; `collapseKey` only
+          // governs what FCM does to undelivered messages in transit.
+          ...(collapseKey ? { tag: collapseKey } : {}),
+        },
+      },
+      ...(badge != null || collapseKey
+        ? {
+            apns: {
+              // APNs caps this at 64 bytes and rejects the whole request if it
+              // is longer.
+              ...(collapseKey
+                ? { headers: { 'apns-collapse-id': collapseKey.slice(0, 64) } }
+                : {}),
+              payload: { aps: { ...(badge != null ? { badge } : {}) } },
+            },
+          }
+        : {}),
       tokens: tokens,
     };
 
     const response = await admin.messaging().sendEachForMulticast(message);
-    
+
     if (response.failureCount > 0) {
-      const failedTokens: string[] = [];
+      // Only prune tokens FCM says are permanently dead. The previous version
+      // pulled every token that failed for any reason, so one transient
+      // `messaging/internal-error` or a quota blip permanently unregistered a
+      // live device — the user silently stopped receiving push forever, and
+      // nothing surfaced it because re-registration only happens on app launch.
+      const deadTokens: string[] = [];
       response.responses.forEach((resp, idx) => {
-        if (!resp.success) {
-          failedTokens.push(tokens[idx]);
-        }
+        if (resp.success) return;
+        if (isPermanentTokenFailure(resp.error?.code)) deadTokens.push(tokens[idx]);
       });
-      console.warn('⚠️ Some notifications failed:', response.failureCount);
-      
-      // Cleanup invalid tokens
-      await cleanupInvalidTokens(failedTokens);
+      console.warn(
+        `⚠️ Some notifications failed: ${response.failureCount} (${deadTokens.length} dead token(s) pruned)`
+      );
+
+      if (deadTokens.length > 0) await cleanupInvalidTokens(deadTokens);
     }
 
-    return true;
+    return response.successCount > 0;
   } catch (error) {
     logError('sendNotificationToTokens', error);
     return false;
@@ -253,7 +285,18 @@ export const sendNotificationToTokens = async (
 };
 
 /**
- * Remove invalid tokens from database
+ * Does this FCM error mean the token will never work again?
+ *
+ * Everything else — unavailable, internal, quota, timeouts — is transient and
+ * the token must be kept.
+ */
+const isPermanentTokenFailure = (code?: string): boolean =>
+  code === 'messaging/registration-token-not-registered' ||
+  code === 'messaging/invalid-registration-token' ||
+  code === 'messaging/invalid-argument';
+
+/**
+ * Remove permanently dead tokens from database
  */
 const cleanupInvalidTokens = async (tokens: string[]) => {
   try {

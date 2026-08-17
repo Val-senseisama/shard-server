@@ -24,6 +24,29 @@ const userActiveChats = new Map<string, Set<string>>();
 const lastHeartbeatWrite = new Map<string, number>();
 const HEARTBEAT_DB_INTERVAL = 60_000; // write lastActive at most once per minute per user
 
+/**
+ * userId → the chat they currently have OPEN AND FOCUSED, with a timestamp.
+ *
+ * Deliberately separate from `userActiveChats`. Room membership is a poor proxy
+ * for attention: `chats:join` subscribes to every chat at once so the chat list
+ * can badge itself, and `userActiveChats` survives reconnects on purpose. A user
+ * is "in" a dozen rooms while looking at none of them.
+ *
+ * This map means "eyes on this screen, right now", and is what suppresses a push
+ * for a message the recipient is watching arrive.
+ */
+const userViewingChat = new Map<string, { chatId: string; at: number }>();
+
+/**
+ * How long a viewing claim stays fresh without a refresh.
+ *
+ * The client re-asserts it on every heartbeat (30s), so anything older than a
+ * couple of missed beats means the app was backgrounded or killed without a
+ * clean `chat:unviewing` — exactly the case where the push SHOULD fire. Erring
+ * short is the safe direction: a stale claim silently swallows notifications.
+ */
+const VIEWING_TTL_MS = 90_000;
+
 export function setupWebSocketServer(httpServer: HTTPServer) {
   const io = new SocketIOServer(httpServer, {
     cors: {
@@ -125,6 +148,31 @@ export function setupWebSocketServer(httpServer: HTTPServer) {
       if (!chatId || !mongoose.isValidObjectId(chatId)) return;
       socket.leave(`chat:${chatId}`);
       userActiveChats.get(userId)?.delete(chatId);
+      // Leaving the room implies the screen is gone, so drop the viewing claim
+      // too — otherwise it lingers until the TTL and eats pushes in between.
+      const viewing = userViewingChat.get(userId);
+      if (viewing?.chatId === chatId) userViewingChat.delete(userId);
+    });
+
+    // ─── Attention tracking ───────────────────────────────────────────────────
+    // Emitted by the chat screen on focus/blur. Room membership can't stand in
+    // for this (see userViewingChat above).
+
+    socket.on("chat:viewing", (chatId: string) => {
+      if (!chatId || !mongoose.isValidObjectId(chatId)) return;
+      // No membership check needed: the claim can only ever suppress the
+      // claimant's OWN notifications, so the worst a forged one does is silence
+      // the sender's own pushes.
+      userViewingChat.set(userId, { chatId, at: Date.now() });
+    });
+
+    socket.on("chat:unviewing", (chatId?: string) => {
+      const viewing = userViewingChat.get(userId);
+      if (!viewing) return;
+      // A bare unviewing clears whatever was claimed; a targeted one only clears
+      // a match, so a stale blur from a screen the user already left can't
+      // cancel the claim of the screen they just opened.
+      if (!chatId || viewing.chatId === chatId) userViewingChat.delete(userId);
     });
 
     // Join multiple chats at once — each validated individually
@@ -153,8 +201,20 @@ export function setupWebSocketServer(httpServer: HTTPServer) {
     });
 
     // Heartbeat — throttled to one DB write per minute to avoid hammering Mongo
-    socket.on("heartbeat", () => {
+    socket.on("heartbeat", (payload?: { viewingChatId?: string | null }) => {
       const now = Date.now();
+
+      // Re-assert the viewing claim so it stays fresh while the screen is open.
+      // Riding the heartbeat rather than its own timer is what makes the claim
+      // self-expiring: background the app and the JS timer suspends, the claim
+      // goes stale, and pushes resume without needing a clean blur event.
+      const viewingChatId = payload?.viewingChatId;
+      if (viewingChatId && mongoose.isValidObjectId(viewingChatId)) {
+        userViewingChat.set(userId, { chatId: viewingChatId, at: now });
+      } else if (viewingChatId === null) {
+        userViewingChat.delete(userId);
+      }
+
       const last = lastHeartbeatWrite.get(userId) ?? 0;
       if (now - last >= HEARTBEAT_DB_INTERVAL) {
         lastHeartbeatWrite.set(userId, now);
@@ -174,6 +234,7 @@ export function setupWebSocketServer(httpServer: HTTPServer) {
           // Last socket for this user — they're fully offline
           userSockets.delete(userId);
           lastHeartbeatWrite.delete(userId);
+          userViewingChat.delete(userId);
           User.findByIdAndUpdate(userId, { lastActive: new Date() }).catch(() => {});
           socket.broadcast.emit("user:offline", { userId, username });
           console.log(`❌ ${username} fully disconnected`);
@@ -208,6 +269,33 @@ export function emitToChat(io: SocketIOServer, chatId: string, event: string, da
 export function isUserOnline(userId: string): boolean {
   const sockets = userSockets.get(userId);
   return !!(sockets && sockets.size > 0);
+}
+
+/**
+ * Is this user looking at one of these chats right now?
+ *
+ * Variadic because the mobile client addresses a shard chat by the SHARD id
+ * until `getChat` resolves, then upgrades to the chat document's own `_id` — so
+ * the claim on file may be either. Callers pass both and let this sort it out.
+ *
+ * Returns false for a claim older than VIEWING_TTL_MS. A stale claim is
+ * indistinguishable from a killed app, and the failure modes are not symmetric:
+ * a wrongly-suppressed message is one the user never learns about, while a
+ * wrongly-sent one is a redundant buzz.
+ *
+ * In-process only. With multiple server instances a user's socket may live on a
+ * different instance than the one handling their friend's `sendMessage`, and
+ * this returns false there — degrading to today's behaviour (a redundant push),
+ * never to a swallowed one. Moving it to Redis is the fix if that starts to bite.
+ */
+export function isViewingChat(userId: string, ...chatIds: (string | null | undefined)[]): boolean {
+  const viewing = userViewingChat.get(userId);
+  if (!viewing) return false;
+  if (Date.now() - viewing.at > VIEWING_TTL_MS) {
+    userViewingChat.delete(userId);
+    return false;
+  }
+  return chatIds.some((id) => !!id && id === viewing.chatId);
 }
 
 export function getOnlineUsers(): SocketUser[] {
