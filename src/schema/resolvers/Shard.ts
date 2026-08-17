@@ -33,6 +33,9 @@ import {
   shardCompletionXP,
   MINI_GOAL_COMPLETION_XP,
 } from "../../Helpers/Progress.js";
+
+export const DEFAULT_SHARD_IMAGE =
+  "https://images.unsplash.com/photo-1517836357463-d25dfeac3438?w=800&auto=format&fit=crop&q=80";
 import SocialShare from "../../models/SocialShare.js";
 import { OPEN_STATUSES } from "../../Helpers/ShardLifecycle.js";
 
@@ -484,7 +487,7 @@ export default {
             participants: participants
               ? participants.map((p: any) => ({ user: p.user, role: p.role }))
               : [],
-            image,
+            image: image || DEFAULT_SHARD_IMAGE,
             timeline: {
               startDate: new Date(),
               endDate: deadline ? new Date(deadline) : undefined,
@@ -678,7 +681,7 @@ export default {
             participants: input.participants
               ? input.participants.map((p: any) => ({ user: p.user, role: p.role }))
               : [],
-            image: input.image,
+            image: input.image || DEFAULT_SHARD_IMAGE,
             timeline: {
               startDate: input.timeline?.startDate ? new Date(input.timeline.startDate) : new Date(),
               endDate: input.timeline?.endDate ? new Date(input.timeline.endDate) : undefined,

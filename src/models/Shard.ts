@@ -35,10 +35,32 @@ export interface QuestBrief {
   rhythm?: Rhythm & { raw?: string };
   /** "What normally stops you finishing something like this?" */
   blockers?: string;
+  /** What they're already following. Free text today; ResourceRef[] when links land. */
+  aids?: string;
   /** Slots we offered and the user skipped — so we don't re-ask, and can measure. */
   skipped?: string[];
+  /** User opted in to learning-material suggestions. Off by default — see AIHelper. */
+  wantsSuggestions?: boolean;
   capturedAt: Date;
 }
+
+/**
+ * Where the curriculum came from. `web` is the fallback for any host we don't
+ * recognise, handled by unfurl.ts + paste/screenshot.
+ *
+ * NOT a "manual" member: hand-typed plans are the existing `manual` creation mode
+ * and never become a Curriculum.
+ */
+export type CourseProvider = "youtube" | "udemy" | "coursera" | "edx" | "web";
+
+/**
+ * How much we actually know about the curriculum. Drives UI copy — never hide
+ * this from the user.
+ *
+ * Orthogonal to `provider`: this axis is CONFIDENCE, that one is PROVENANCE.
+ * `exact` happens to mean YouTube today only because YouTube is the only open API.
+ */
+export type Fidelity = "exact" | "imported" | "inferred";
 
 const RhythmSchema = new Schema<Rhythm>(
   {
@@ -99,6 +121,30 @@ export interface ShardDocument extends Document {
    * make a later reflow silently revert to a rhythm the user abandoned.
    */
   rhythm?: Rhythm;
+  /**
+   * Set when the shard was built from an imported course. Absent on all non-course
+   * shards — every existing shard continues to work with this missing.
+   *
+   * `refreshedAt` drives the YouTube 30-day policy clock (§7.6): we re-fetch
+   * video metadata for active course shards within 30 days of import.
+   */
+  source?: {
+    provider: CourseProvider;
+    fidelity: Fidelity;
+    url?: string;
+    title: string;
+    author?: string;
+    /** YouTube playlistId, course slug, etc. */
+    externalId?: string;
+    importedAt: Date;
+    /** When we last refreshed metadata from the provider. */
+    refreshedAt?: Date;
+  };
+  /**
+   * Set on the first section (mini-goal) completion for course shards, so the
+   * Pro moment fires exactly once per shard, ever.
+   */
+  proMomentShownAt?: Date;
 }
 
 const ShardSchema = new Schema<ShardDocument>(
@@ -175,7 +221,9 @@ const ShardSchema = new Schema<ShardDocument>(
             required: false,
           },
           blockers: String,
+          aids: String,
           skipped: { type: [String], default: undefined },
+          wantsSuggestions: Boolean,
           capturedAt: { type: Date, required: true },
         },
         { _id: false }
@@ -183,6 +231,31 @@ const ShardSchema = new Schema<ShardDocument>(
       required: false,
     },
     rhythm: { type: RhythmSchema, required: false },
+    source: {
+      type: new Schema(
+        {
+          provider: {
+            type: String,
+            enum: ["youtube", "udemy", "coursera", "edx", "web"],
+            required: true,
+          },
+          fidelity: {
+            type: String,
+            enum: ["exact", "imported", "inferred"],
+            required: true,
+          },
+          url: String,
+          title: { type: String, required: true },
+          author: String,
+          externalId: String,
+          importedAt: { type: Date, required: true },
+          refreshedAt: Date,
+        },
+        { _id: false }
+      ),
+      required: false,
+    },
+    proMomentShownAt: Date,
   },
   { timestamps: true }
 );
@@ -194,5 +267,12 @@ ShardSchema.index({ "timeline.endDate": 1 });
 // The lifecycle sweep and campaigns both select open shards by staleness.
 ShardSchema.index({ status: 1, lastActivityAt: 1 });
 ShardSchema.index({ owner: 1, status: 1 });
+// Course-shard jobs (drift detection, 30-day refresh, Pro-moment check).
+// Partial — `status` is always present, so compound sparse would only skip
+// documents missing BOTH keys, which is not what we want.
+ShardSchema.index(
+  { "source.provider": 1, status: 1 },
+  { partialFilterExpression: { "source.provider": { $exists: true } } }
+);
 
 export default model<ShardDocument>("Shard", ShardSchema);

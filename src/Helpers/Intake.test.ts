@@ -124,6 +124,55 @@ describe("intake question validation", () => {
   });
 });
 
+describe("answer suggestions", () => {
+  it("keeps up to three, in the model's order", () => {
+    const [q] = validateIntakeQuestions({
+      questions: [
+        { slot: "done", prompt: "What does done look like?", suggestions: ["a", "b", "c", "d"] },
+        { slot: "why", prompt: "Why?" },
+      ],
+    });
+
+    expect(q.suggestions).toEqual(["a", "b", "c"]);
+  });
+
+  it("drops suggestions for the rhythm slot", () => {
+    // That one is answered with day chips; a text suggestion under a set of
+    // controls is just noise.
+    const [q] = validateIntakeQuestions({
+      questions: [
+        { slot: "rhythm", prompt: "Which days?", suggestions: ["Mon and Wed"] },
+        { slot: "done", prompt: "Done?" },
+      ],
+    });
+
+    expect(q.suggestions).toBeUndefined();
+  });
+
+  it("survives junk without dropping the question", () => {
+    const [q] = validateIntakeQuestions({
+      questions: [
+        { slot: "done", prompt: "Done?", suggestions: [null, 42, "   ", "real one"] },
+        { slot: "why", prompt: "Why?" },
+      ],
+    });
+
+    expect(q.prompt).toBe("Done?");
+    expect(q.suggestions).toEqual(["real one"]);
+  });
+
+  it("omits the field entirely when nothing usable survives", () => {
+    const [q] = validateIntakeQuestions({
+      questions: [
+        { slot: "done", prompt: "Done?", suggestions: "not an array" },
+        { slot: "why", prompt: "Why?" },
+      ],
+    });
+
+    expect(q.suggestions).toBeUndefined();
+  });
+});
+
 describe("brief rendering for the architect prompt", () => {
   it("returns nothing when there is nothing to say", () => {
     expect(formatBriefForPrompt(undefined)).toBe("");

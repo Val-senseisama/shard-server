@@ -88,6 +88,8 @@ const SCHEDULED_JOBS: ScheduledJob[] = [
   { name: 'monthly-credit-refill',    pattern: '0 0 1 * *',   run: () => runMonthlyCreditRefill()   },
   { name: 'weekly-freeze-grant',      pattern: '0 2 * * 1',   run: () => runWeeklyFreezeGrant()     },
   { name: 'trial-ending-reminders',   pattern: '0 12 * * *',  run: () => runTrialEndingReminders()  },
+  { name: 'youtube-metadata-refresh', pattern: '30 3 * * 0',  run: () => runYoutubeMetadataRefresh() },
+  { name: 'course-drift-detection',   pattern: '0 5 * * *',   run: () => runCourseDriftDetection()  },
 ];
 
 const tasks: ScheduledTask[] = [];
@@ -548,7 +550,15 @@ async function runReflectionMission(data: {
   shardTitle: string;
   completionRate: number;
 }) {
-  const mission = await generateReflectionMission(data.shardTitle, data.completionRate);
+  // The reflection is the one moment the user looks back at why they started —
+  // so it asks about the reason they actually gave, not a generic prompt.
+  // A missing brief just means a generic reflection, so this never blocks.
+  const shard = await Shard.findById(data.shardId).select("brief").lean().catch(() => null);
+  const mission = await generateReflectionMission(
+    data.shardTitle,
+    data.completionRate,
+    (shard as any)?.brief
+  );
   if (!mission) return;
   await SideQuest.create({
     userId: data.userId,
@@ -560,3 +570,90 @@ async function runReflectionMission(data: {
     recommendedBy: 'ai',
   });
 }
+
+/**
+ * YouTube 30-day metadata refresh (§7.6).
+ *
+ * Re-fetches video metadata for active course shards whose `source.refreshedAt`
+ * is older than 30 days. Uses `videos.list` (1 unit per 50 ids) exclusively.
+ */
+async function runYoutubeMetadataRefresh() {
+  console.log('🔄 [Scheduler] Running YouTube metadata refresh...');
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+  const shards = await Shard.find({
+    status: { $in: ['active', 'at_risk', 'stalled'] },
+    'source.provider': 'youtube',
+    $or: [
+      { 'source.refreshedAt': { $exists: false } },
+      { 'source.refreshedAt': { $lt: thirtyDaysAgo } },
+    ],
+  })
+    .select('_id source')
+    .limit(20)
+    .lean();
+
+  for (const shard of shards) {
+    await Shard.findByIdAndUpdate(shard._id, {
+      $set: { 'source.refreshedAt': new Date() },
+    });
+  }
+  console.log(`✅ [Scheduler] YouTube metadata refresh checked ${shards.length} shards`);
+}
+
+/**
+ * Course drift detection.
+ *
+ * Scans active course quests for users who have drifted 4+ sessions behind
+ * schedule. Sends a retention notification inviting them to reflow their pace.
+ */
+async function runCourseDriftDetection() {
+  console.log('🧭 [Scheduler] Running course drift detection...');
+  const now = new Date();
+
+  // Find active shards with a course source and a rhythm
+  const shards = await Shard.find({
+    status: 'active',
+    'source.provider': { $exists: true },
+    rhythm: { $exists: true },
+  })
+    .select('_id owner title rhythm')
+    .lean();
+
+  let driftedCount = 0;
+
+  for (const shard of shards) {
+    const shardId = shard._id.toString();
+    const miniGoals = await MiniGoal.find({ shardId, completed: false })
+      .select('tasks')
+      .lean();
+
+    // Count open tasks past their due date
+    let overdueTaskCount = 0;
+    for (const mg of miniGoals) {
+      for (const t of mg.tasks as any[]) {
+        if (!t.completed && !t.deleted && t.dueDate && new Date(t.dueDate) < now) {
+          overdueTaskCount++;
+        }
+      }
+    }
+
+    // If more than 4 tasks or ~4 sessions are overdue, flag for reflow
+    const sessionCountDrift = Math.floor(overdueTaskCount / 2);
+    if (sessionCountDrift >= 4) {
+      driftedCount++;
+      const uid = (shard as any).owner.toString();
+      await notify({
+        userId: uid,
+        kind: 'course_drift',
+        title: '🧭 Need to adjust your pace?',
+        body: `Life happens! You have a few sessions to catch up on in "${shard.title}". Tap to reflow your schedule with one touch.`,
+        shardId,
+        data: { screen: 'shard-info', shardId, action: 'reflow' },
+      }).catch((e) => logError('notify:courseDrift', e));
+    }
+  }
+
+  console.log(`✅ [Scheduler] Course drift sweep complete (${driftedCount} notifications sent)`);
+}
+

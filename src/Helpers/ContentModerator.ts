@@ -95,9 +95,30 @@ function matches(text: string, patterns: RegExp[]): boolean {
  * @param text        The input to check
  * @param context     Where the text came from — affects which checks run
  */
+/**
+ * Severely harmful patterns for imported content.
+ *
+ * `CRIMINAL_PATTERNS` is tuned for someone *stating an intention* ("I want to
+ * hack into a system") — not for the table of contents of a published course.
+ * They false-positive on exactly the courses people buy:
+ *   - "Scam Detection for Beginners" → /phish|scam|defraud/
+ *   - "How to hack into a system (ethically)" → /how to hack into/
+ *   - Security and chemistry curricula trip the synthesis / weapons patterns.
+ *
+ * So for imported curriculum text we run ONLY the genuinely severe families:
+ * CSAM/exploitation, trafficking, targeted violence against a named person.
+ * Hate speech is always checked (separate pass). Everything else is skipped.
+ */
+const IMPORTED_CONTENT_SEVERE_PATTERNS: RegExp[] = [
+  /\b(child\s+(porn|sex|exploit|grooming)|csam)\b/i,
+  /\bhuman\s+trafficking\b/i,
+  /\bsex\s+trafficking\b/i,
+  /\b(murder|kill|assault|stalk)\s+.{0,30}(someone|person|him|her|them)\b/i,
+];
+
 export function moderate(
   text: string,
-  context: 'goal' | 'chat' | 'public_profile' | 'task' = 'goal'
+  context: 'goal' | 'chat' | 'public_profile' | 'task' | 'imported_content' = 'goal'
 ): ModerationResult {
   if (!text || !text.trim()) return { allowed: true, severity: 'pass' };
 
@@ -123,16 +144,25 @@ export function moderate(
     };
   }
 
-  // 3. Criminal activity — blocked in goal and task contexts
-  if (context !== 'chat' && matches(text, CRIMINAL_PATTERNS)) {
+  // 3. Criminal activity — blocked in goal and task contexts.
+  //    Imported content gets a narrower check (see IMPORTED_CONTENT_SEVERE_PATTERNS).
+  if (context === 'imported_content') {
+    if (matches(text, IMPORTED_CONTENT_SEVERE_PATTERNS)) {
+      return {
+        allowed: false,
+        severity: 'block',
+        reason: 'This content cannot be imported.',
+      };
+    }
+    // Skip CRIMINAL_PATTERNS for imported content — they false-positive on
+    // legitimate course titles (pen-testing, security, chemistry curricula).
+  } else if (context !== 'chat' && matches(text, CRIMINAL_PATTERNS)) {
     return {
       allowed: false,
       severity: 'block',
       reason: 'We can\'t help with goals that involve illegal or harmful activities.',
     };
-  }
-  // Also check chat for the most serious criminal patterns
-  if (context === 'chat' && matches(text, CRIMINAL_PATTERNS)) {
+  } else if (context === 'chat' && matches(text, CRIMINAL_PATTERNS)) {
     return {
       allowed: false,
       severity: 'block',

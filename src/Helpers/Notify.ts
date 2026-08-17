@@ -61,6 +61,7 @@ export type NotifyKind =
   | "empty_schedule"
   | "friend_overtook"
   | "partner_progress"
+  | "course_drift"
   | "shard_update";
 
 export type Priority = "transactional" | "celebratory" | "retention";
@@ -107,6 +108,7 @@ const KINDS: Record<NotifyKind, KindSpec> = {
   empty_schedule:      { priority: "retention", prefKey: "questDeadlines" },
   friend_overtook:     { priority: "retention", prefKey: "shardUpdates" },
   partner_progress:    { priority: "retention", prefKey: "shardUpdates" },
+  course_drift:        { priority: "retention", prefKey: "questDeadlines" },
   shard_update:        { priority: "retention", prefKey: "shardUpdates" },
 };
 

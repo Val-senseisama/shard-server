@@ -14,6 +14,8 @@ import SupportResolvers from "./resolvers/Support.js";
 import AdminResolvers from "./resolvers/Admin.js";
 import TeamResolvers from "./resolvers/Team.js";
 import QuestAIResolvers from "./resolvers/QuestAI.js";
+import QuestDraftResolvers from "./resolvers/QuestDraft.js";
+import CourseImportResolvers from "./resolvers/CourseImport.js";
 import TelemetryResolvers from "./resolvers/Telemetry.js";
 import LeaderboardResolvers from "./resolvers/Leaderboard.js";
 import { GraphQLScalarType, Kind } from "graphql";
@@ -88,6 +90,8 @@ const allMutations: Record<string, Function> = {
     ...AdminResolvers.Mutation,
     ...TeamResolvers.Mutation,
     ...QuestAIResolvers.Mutation,
+    ...QuestDraftResolvers.Mutation,
+    ...CourseImportResolvers.Mutation,
     ...TelemetryResolvers.Mutation,
 };
 

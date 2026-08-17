@@ -45,7 +45,14 @@ export interface CampaignContext {
   previousStreak: number;
   streakBrokenAt?: Date;
   /** Most recently touched open shard, for message copy and deep links. */
-  focusShard?: { id: string; title: string; staleDays: number };
+  /**
+   * The focus shard, plus what the user said it was FOR.
+   *
+   * `why` is the difference between "You have 3 tasks overdue" and quoting the
+   * reason they gave for starting. A nudge that repeats the user's own words is
+   * a different object from a status report.
+   */
+  focusShard?: { id: string; title: string; staleDays: number; why?: string };
 }
 
 export interface CampaignMessage {
@@ -130,10 +137,16 @@ export const CAMPAIGNS: Campaign[] = [
     match: (ctx) => ctx.openShardCount > 0 && [7, 14, 30].includes(ctx.daysSinceActive),
     build: (ctx) => {
       const title = ctx.focusShard?.title;
+      // When they told us why this mattered, say it back. "You said you wanted
+      // this so you could X" lands differently from a status report — it's the
+      // whole reason the intake asks.
+      const why = ctx.focusShard?.why?.trim();
       const copy: Record<number, string> = {
-        7: title
-          ? `"${title}" hasn't moved in a week. Pick the smallest task on it and close that one.`
-          : "Your quests haven't moved in a week. Pick the smallest task and close that one.",
+        7: why
+          ? `You started "${title}" because: ${trimTo(why, 90)} Still true? One small task gets it moving.`
+          : title
+            ? `"${title}" hasn't moved in a week. Pick the smallest task on it and close that one.`
+            : "Your quests haven't moved in a week. Pick the smallest task and close that one.",
         14: title
           ? `Two weeks since you touched "${title}". Want to simplify it, or park it and start something else?`
           : "Two weeks away. Want to simplify what's open, or park it and start something else?",
@@ -240,7 +253,7 @@ export async function buildContext(user: any): Promise<CampaignContext> {
     owner: userId,
     status: { $in: ["active", "paused", "at_risk", "stalled"] },
   })
-    .select("_id title lastActivityAt")
+    .select("_id title lastActivityAt brief.why")
     .sort({ lastActivityAt: -1 })
     .lean();
 
@@ -252,6 +265,7 @@ export async function buildContext(user: any): Promise<CampaignContext> {
       id: s._id.toString(),
       title: s.title,
       staleDays: Math.floor((now - last) / DAY),
+      why: s.brief?.why,
     };
   }
 
@@ -297,6 +311,12 @@ export async function buildContext(user: any): Promise<CampaignContext> {
 }
 
 /** Fields `buildContext` and the campaigns read. */
+/** Keeps a quoted reason inside a notification body. */
+function trimTo(text: string, max: number): string {
+  const clean = text.replace(/\s+/g, " ").trim();
+  return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
+}
+
 export const CAMPAIGN_USER_FIELDS =
   "timezone createdAt lastActive currentStreak longestStreak previousStreak lastStreakDayKey streakFreezeTokens streakBrokenAt subscriptionTier trialStartedAt trialEndsAt firstQuestCompletedAt";
 

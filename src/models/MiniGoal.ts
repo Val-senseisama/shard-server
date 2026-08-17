@@ -1,5 +1,25 @@
 import { Schema, model, Types, Document } from "mongoose";
 
+/**
+ * A link to a piece of learning material — a YouTube video, article, book,
+ * or user-supplied note. Stored on both mini-goals (as `resources[]`) and
+ * individual tasks (as `resource`).
+ *
+ * Additive and optional everywhere: every existing shard works with this absent.
+ */
+export interface ResourceRef {
+  kind: "youtube_video" | "youtube_playlist" | "article" | "book" | "note";
+  /** "user" = supplied by the learner; "system" = we found/inserted it. */
+  source: "user" | "system";
+  url?: string;
+  title: string;
+  /** Required for YouTube — attribution per compliance. */
+  author?: string;
+  durationSeconds?: number;
+  thumbnail?: string;
+  fetchedAt?: Date;
+}
+
 interface Task {
   title: string;
   dueDate?: Date;
@@ -25,6 +45,18 @@ interface Task {
   overdueSince?: Date;
   // Assignment
   assignedTo?: string; // userId string
+  /** The lecture / reading this task IS. Populated for course-import tasks. */
+  resource?: ResourceRef;
+  /** Duration of the content, in seconds. Drives pacer packing. */
+  estimatedSeconds?: number;
+  /** True when this task was synthesized by the enrichment pass — a practice
+   * checkpoint the original course doesn't contain. */
+  synthesized?: boolean;
+  /**
+   * Groups a catch-up batch so `undoCatchUp` can address the whole set.
+   * Only set by `catchUpToTask`; absent on tasks completed individually.
+   */
+  catchUpBatchId?: string;
 }
 
 export interface MiniGoalDocument extends Document {
@@ -40,7 +72,37 @@ export interface MiniGoalDocument extends Document {
   version: number;
   createdAt: Date;
   updatedAt: Date;
+  /**
+   * Learning material for this section. Populated from the imported curriculum
+   * or added later by the user. Default [] so callers never have to null-check.
+   */
+  resources: ResourceRef[];
+  /**
+   * Position of this mini-goal in the original curriculum's section list.
+   * Used by `catchUpToTask` to establish curriculum order across mini-goals —
+   * the lexicographic pair `(sourceSectionIndex, taskIndex)` defines "before".
+   * Absent on non-course shards; fall back to `createdAt` ordering there.
+   */
+  sourceSectionIndex?: number;
 }
+
+const ResourceRefSchema = new Schema<ResourceRef>(
+  {
+    kind: {
+      type: String,
+      enum: ["youtube_video", "youtube_playlist", "article", "book", "note"],
+      required: true,
+    },
+    source: { type: String, enum: ["user", "system"], required: true },
+    url: String,
+    title: { type: String, required: true },
+    author: String,
+    durationSeconds: Number,
+    thumbnail: String,
+    fetchedAt: Date,
+  },
+  { _id: false }
+);
 
 const TaskSchema = new Schema<Task>(
   {
@@ -61,6 +123,11 @@ const TaskSchema = new Schema<Task>(
     overdueSince: Date,
     // Assignment
     assignedTo: { type: String, default: null },
+    // Course-import fields
+    resource: { type: ResourceRefSchema, required: false },
+    estimatedSeconds: Number,
+    synthesized: Boolean,
+    catchUpBatchId: String,
   },
   { _id: false }
 );
@@ -77,6 +144,8 @@ const MiniGoalSchema = new Schema<MiniGoalDocument>(
     assignedTo: { type: Schema.Types.ObjectId, ref: "User" }, // Collaborator assigned
     overdueNotifiedAt: Date,
     version: { type: Number, default: 1 },
+    resources: { type: [ResourceRefSchema], default: [] },
+    sourceSectionIndex: Number,
   },
   { timestamps: true }
 );

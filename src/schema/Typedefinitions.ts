@@ -101,6 +101,46 @@ export default `#graphql
     interview leaves nothing behind and costs the user nothing.
     """
     startQuestIntake(goal: String!, deadline: String): QuestIntakeResponse!
+    """
+    Generate a plan into a DRAFT. Writes no quest.
+
+    Spends the AI credit, because the plan is real work — but nothing appears in
+    the user's quest list until commitQuestDraft. Abandoning a draft costs a
+    credit and nothing else; it does not occupy a free-tier quest slot.
+    """
+    startQuestDraft(
+      goal: String!
+      deadline: String
+      image: String
+      participants: [ParticipantInput!]
+      questType: String
+      cadence: String
+      isPrivate: Boolean
+      isAnonymous: Boolean
+      brief: QuestBriefInput
+    ): QuestDraftResponse!
+    """Edit a draft in place. No model call, no credit, no quest written."""
+    editQuestDraft(draftId: ID!, edit: DraftEditInput!): QuestDraftResponse!
+    """
+    Change the plan by describing what's wrong with it.
+
+    Capped per draft and free within the credit already spent on generation —
+    charging per refinement would teach people not to ask for the change that
+    makes the plan fit.
+    """
+    refineQuestDraft(draftId: ID!, instruction: String!): QuestDraftRefineResponse!
+    """Undo the last refinement. One level deep."""
+    undoQuestDraft(draftId: ID!): QuestDraftResponse!
+    """
+    Correct what you told us about a quest after the fact.
+
+    Never rewrites the plan. An edited brief changes what every later AI touch
+    reads — the coach, reflections, weekly tasks, nudge copy — and if the user
+    wants the plan itself redone, that is their separate, explicit choice.
+    """
+    updateShardBrief(shardId: ID!, brief: QuestBriefInput!): ShardResponse!
+    """Turn a reviewed draft into a real quest. Idempotent per draft."""
+    commitQuestDraft(draftId: ID!): CreateShardResponse!
     createShard(goal: String!, deadline: String, image: String, participants: [ParticipantInput!], isPrivate: Boolean, isAnonymous: Boolean, questType: String, cadence: String, brief: QuestBriefInput): CreateShardResponse!
     createShardManual(input: CreateShardInput!): CreateShardResponse!
     updateShard(id: ID!, input: UpdateShardInput!): ShardResponse!
@@ -172,6 +212,39 @@ export default `#graphql
     completeTask(shardId: ID!, miniGoalId: ID!, taskIndex: Int!): CompleteTaskResponse!
     uncompleteTask(shardId: ID!, miniGoalId: ID!, taskIndex: Int!): CompleteTaskResponse!
     clearPendingAchievements: MessageResponse!
+
+    # Course import mutations
+    """
+    Resolve a link, pasted text, or screenshots into a reviewable curriculum.
+    Writes a CurriculumDraft (7-day TTL) and returns its id so the client can
+    hand it to createShardFromCurriculum. Free — no credit charged here.
+    """
+    importCurriculum(input: ImportCurriculumInput!): ImportCurriculumResponse!
+    """
+    Preview dates for a curriculum + rhythm. Pure: no writes, no credit spend.
+    Debounce 400ms on the pace step — this is called on every chip tap.
+    """
+    paceCurriculum(input: PaceCurriculumInput!): PacedPlanPreview!
+    """
+    Commit a reviewed curriculum as a shard. Charges one credit on success.
+    The draft is deleted on success; a failed/declined commit leaves it alive
+    so the user can resume from the review screen.
+    """
+    createShardFromCurriculum(input: CreateFromCurriculumInput!): CreateShardResponse!
+    """
+    Mark a task and everything before it in curriculum order as complete.
+    One XP award, one celebration, one undo toast — not N of each.
+    Addressed by (miniGoalId, taskIndex) because tasks have no _id.
+    """
+    catchUpToTask(shardId: ID!, miniGoalId: ID!, taskIndex: Int!): CatchUpResponse!
+    """Reverse a catch-up. Same 5-minute window as uncompleteTask."""
+    undoCatchUp(batchId: ID!): CatchUpResponse!
+    """
+    Re-spread remaining incomplete items over remaining days.
+    Always user-initiated. When rhythm is omitted, uses shard.rhythm.
+    When supplied, persists it to shard.rhythm for future reflows.
+    """
+    reflowSchedule(shardId: ID!, rhythm: RhythmInput): CreateShardResponse!
     
     # Team mutations
     createTeam(name: String!, memberIds: [ID!]!): TeamResponse!
@@ -373,6 +446,16 @@ export default `#graphql
     questType: String
     cadence: String
     habitStreak: Int
+    "What the user said at intake. Absent on quests made before the interview."
+    brief: QuestBrief
+  }
+
+  type QuestBrief {
+    done: String
+    why: String
+    blockers: String
+    aids: String
+    wantsSuggestions: Boolean
   }
 
   type ShardProgress {
@@ -475,6 +558,91 @@ export default `#graphql
     aiCallsRemaining: Int
   }
 
+  """
+  Ids, never indexes: array position is exactly what changes when you reorder,
+  so an index-addressed edit racing a reorder edits the wrong thing.
+  """
+  input DraftEditInput {
+    "renameQuest | renamePhase | removePhase | reorderPhase | redatePhase | setDeadline | editTask | addTask | removeTask"
+    op: String!
+    phaseId: ID
+    taskId: ID
+    value: String
+    toIndex: Int
+    "For redatePhase and setDeadline. Epoch millis or ISO."
+    dueDate: String
+  }
+
+  type QuestDraftResponse {
+    success: Boolean!
+    message: String
+    needsUpgrade: Boolean
+    isCrisis: Boolean
+    draft: QuestDraft
+  }
+
+  type QuestDraft {
+    id: ID!
+    goal: String!
+    deadline: String
+    plan: DraftPlan
+    "What the user has asked for so far, in order."
+    refinements: [String!]!
+    refinementsRemaining: Int!
+    canUndo: Boolean!
+  }
+
+  type QuestDraftRefineResponse {
+    success: Boolean!
+    message: String
+    draft: QuestDraft
+    "What actually changed, so the user isn't left diffing it by eye."
+    changes: [PlanChange!]!
+    refinementsRemaining: Int
+  }
+
+  type PlanChange {
+    "added | removed | changed | reordered"
+    kind: String!
+    phaseId: ID!
+    title: String!
+  }
+
+  type DraftPlan {
+    mainQuest: DraftMainQuest!
+    miniQuests: [DraftMiniQuest!]!
+    "Honest arithmetic, e.g. this lands two weeks past the deadline."
+    warning: String
+  }
+
+  type DraftMainQuest {
+    title: String!
+    description: String
+    estimatedDuration: String
+    xpReward: Int
+  }
+
+  type DraftMiniQuest {
+    "Stable across edits — array position is not, once you can reorder."
+    id: ID!
+    title: String!
+    description: String
+    estimatedDuration: String
+    xpReward: Int
+    steps: [DraftStep!]!
+    "What to search for. Never a URL. Only when the user opted in."
+    searchHint: String
+    "Set by hand. Overrides the scheduler at commit."
+    dueDate: String
+  }
+
+  type DraftStep {
+    id: ID!
+    text: String!
+    estimatedDuration: String
+    xpReward: Int
+  }
+
   type QuestIntakeResponse {
     success: Boolean!
     message: String
@@ -490,6 +658,8 @@ export default `#graphql
     "Which control to render: text | rhythm | resources."
     inputKind: String!
     placeholder: String
+    "2-3 tappable answers in the user's voice. Absent for the rhythm slot."
+    suggestions: [String!]
   }
 
   """
@@ -501,8 +671,12 @@ export default `#graphql
     why: String
     rhythm: RhythmInput
     blockers: String
+    "What they're already following, as free text. A pasted link lands here too."
+    aids: String
     "Slots offered and skipped. Drives the skip-rate metric; never re-asked."
     skipped: [String!]
+    "Opt in to learning-material suggestions. Off by default; it gates the expensive path."
+    wantsSuggestions: Boolean
   }
 
   input RhythmInput {
@@ -513,6 +687,130 @@ export default `#graphql
     timeOfDay: String
     "The user's own words, kept for the prompt when days can't be parsed."
     raw: String
+  }
+
+  # ── Course import types ──────────────────────────────────────────────────────
+
+  type CurriculumItem {
+    kind: String!
+    title: String!
+    durationSeconds: Int
+    url: String
+    externalId: String
+    optional: Boolean
+    synthesized: Boolean
+  }
+
+  type CurriculumSection {
+    title: String!
+    items: [CurriculumItem!]!
+  }
+
+  """
+  A normalised course curriculum. Every import source produces this shape;
+  everything downstream (enrichment, pacer, shard writer) is identical.
+  """
+  type Curriculum {
+    provider: String!
+    fidelity: String!
+    title: String!
+    author: String
+    url: String
+    thumbnail: String
+    sections: [CurriculumSection!]!
+    totalSeconds: Int
+    fetchedAt: String!
+  }
+
+  input CurriculumItemInput {
+    kind: String!
+    title: String!
+    durationSeconds: Int
+    url: String
+    externalId: String
+    optional: Boolean
+    synthesized: Boolean
+  }
+
+  input CurriculumSectionInput {
+    title: String!
+    items: [CurriculumItemInput!]!
+  }
+
+  input CurriculumInput {
+    provider: String!
+    fidelity: String!
+    title: String!
+    author: String
+    url: String
+    thumbnail: String
+    sections: [CurriculumSectionInput!]!
+    totalSeconds: Int
+    fetchedAt: String!
+  }
+
+  input ImportCurriculumInput {
+    "YouTube playlist URL, Udemy link, or any URL to unfurl."
+    url: String
+    "Raw text pasted from a course page or syllabus."
+    pastedText: String
+    "Cloudinary URLs for curriculum screenshots (vision adapter, P2)."
+    imageUrls: [String!]
+    "What the user wants out of the course — drives optional marking in enrichment."
+    goal: String
+  }
+
+  type ImportCurriculumResponse {
+    success: Boolean!
+    message: String
+    "Opaque id to pass to paceCurriculum and createShardFromCurriculum."
+    draftId: ID
+    curriculum: Curriculum
+    needsUpgrade: Boolean
+    "Set when something was lossy — e.g. '3 unavailable videos skipped'."
+    notice: String
+  }
+
+  input PaceCurriculumInput {
+    "The draft returned by importCurriculum."
+    draftId: ID!
+    rhythm: RhythmInput!
+    deadline: String
+    maxTasksPerDay: Int
+  }
+
+  type PacedMiniGoalPreview {
+    title: String!
+    dueDate: String!
+    taskCount: Int!
+    totalSeconds: Int!
+  }
+
+  type PacedPlanPreview {
+    miniGoals: [PacedMiniGoalPreview!]!
+    sessionCount: Int!
+    projectedEndDate: String!
+    warning: String
+  }
+
+  input CreateFromCurriculumInput {
+    draftId: ID!
+    "The user's edited curriculum (checked-off items, inline title edits)."
+    curriculum: CurriculumInput!
+    rhythm: RhythmInput!
+    brief: QuestBriefInput
+    image: String
+    participants: [ParticipantInput!]
+    isPrivate: Boolean
+    isAnonymous: Boolean
+  }
+
+  type CatchUpResponse {
+    success: Boolean!
+    message: String
+    tasksCompleted: Int
+    xpAwarded: Int
+    batchId: ID
   }
 
   input CreateShardInput {

@@ -5,6 +5,7 @@ import MiniGoal from "../../models/MiniGoal.js";
 import { User } from "../../models/User.js";
 import Chat, { Message } from "../../models/Chat.js";
 import { tierOf, upgradeError } from "../../Helpers/Entitlements.js";
+import { formatBriefForPrompt } from "../../Helpers/Intake.js";
 import { chatAboutShard } from "../../Helpers/AIHelper.js";
 import { moderate } from "../../Helpers/ContentModerator.js";
 import { cacheInvalidate } from "../../Helpers/Cache.js";
@@ -278,9 +279,14 @@ export default {
         return { success: false, message: "That task is not part of this quest.", messages: [] };
       }
 
-      const shardContext = scoped
-        ? buildTaskContext(shard, scoped)
-        : buildShardContext(shard, (miniGoals as any[]) || []);
+      // The brief is what the user said this quest was FOR. Without it the coach
+      // re-derives intent from the title on every reply, which is how it ends up
+      // giving advice the user already ruled out at intake.
+      const shardContext =
+        (scoped
+          ? buildTaskContext(shard, scoped)
+          : buildShardContext(shard, (miniGoals as any[]) || [])) +
+        formatBriefForPrompt((shard as any)?.brief);
 
       const [, recent] = await catchError(
         Message.find({ chatId: chat._id, type: { $in: ["text", "ai_reply"] }, deleted: false })
