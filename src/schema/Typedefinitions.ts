@@ -798,6 +798,13 @@ export default `#graphql
     "The user's edited curriculum (checked-off items, inline title edits)."
     curriculum: CurriculumInput!
     rhythm: RhythmInput!
+    """
+    Must carry the same deadline and cap the client sent to paceCurriculum.
+    The commit re-paces, so anything omitted here produces a quest that differs
+    from the plan the user just approved.
+    """
+    deadline: String
+    maxTasksPerDay: Int
     brief: QuestBriefInput
     image: String
     participants: [ParticipantInput!]
@@ -1156,6 +1163,15 @@ export default `#graphql
     rarity: String!
     earned: Boolean!
     pending: Boolean!
+    """
+    How far along the unlock condition the user is, and what it takes.
+    A padlock with no number is a dead end — this is what makes a locked
+    achievement a goal instead of a mystery. Always clamped to the target, and
+    reported as full once earned: a current streak can fall back below the
+    threshold that unlocked it, and an earned badge must never read 2/7.
+    """
+    progress: Int!
+    target: Int!
   }
 
   type AchievementsResponse {

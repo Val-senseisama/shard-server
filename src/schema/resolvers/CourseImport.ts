@@ -46,7 +46,7 @@ import {
   allTasksComplete,
   recomputeShardProgress,
 } from "../../Helpers/Progress.js";
-import { awardXP, UNDO_WINDOW_MINUTES } from "./XP.js";
+import { awardXP, checkAchievements, UNDO_WINDOW_MINUTES } from "./XP.js";
 import { recordActivity } from "../../Helpers/Streak.js";
 import { logEvent } from "../../Helpers/Telemetry.js";
 
@@ -431,6 +431,8 @@ export async function createShardFromCurriculumResolver(
       draftId: string;
       curriculum: any; // user's edited version
       rhythm: { days?: number[]; sessionMinutes?: number; timeOfDay?: string };
+      deadline?: string;
+      maxTasksPerDay?: number;
       brief?: QuestBriefInput;
       image?: string;
       participants?: { user: string; role: string }[];
@@ -488,11 +490,11 @@ export async function createShardFromCurriculumResolver(
     timeOfDay: input.rhythm.timeOfDay as any,
   };
 
-  const deadline = input.brief?.rhythm
-    ? undefined
-    : (user as any)?.preferences?.deadline
-    ? new Date((user as any).preferences.deadline)
-    : undefined;
+  // Re-pace with the SAME inputs the preview used. `paceCurriculum` takes a
+  // deadline and a per-day cap; if the commit doesn't take them too, the user
+  // approves a plan with optional items dropped to hit their date and receives
+  // one with those items back in and a later end date.
+  const deadline = input.deadline ? new Date(input.deadline) : undefined;
 
   const plan = pace({
     curriculum,
@@ -500,7 +502,8 @@ export async function createShardFromCurriculumResolver(
     startDate: new Date(),
     timezone: (user as any)?.timezone ?? "UTC",
     deadline,
-    maxTasksPerDay: (user as any)?.preferences?.maxTasksPerDay ?? 4,
+    maxTasksPerDay:
+      input.maxTasksPerDay ?? (user as any)?.preferences?.maxTasksPerDay ?? 4,
   });
 
   if (plan.miniGoals.length === 0) {
@@ -572,6 +575,11 @@ export async function createShardFromCurriculumResolver(
   if ((user as any)?.role !== "admin") {
     await trackAIUsage(context.id, userTier).catch(() => {});
   }
+
+  // Same hook createShard and commitQuestDraft both fire. Without it, creating
+  // your first quest through the course flow doesn't unlock "First Shard" — the
+  // stat is right, but nothing evaluates it until some unrelated action does.
+  checkAchievements(context.id).catch(() => {});
 
   // Delete the draft — it's been committed.
   await CurriculumDraft.findByIdAndDelete(input.draftId).catch(() => {});
@@ -747,6 +755,12 @@ export async function catchUpToTaskResolver(
   // One XP award for the whole batch.
   const xpResult = await awardXP(context.id, totalXP, `Catch-up on ${shard ? (shard as any).title ?? "quest" : "quest"}`);
   await recordActivity(context.id);
+  // A catch-up can complete a dozen tasks and several mini-goals at once, which
+  // is exactly when a count threshold gets crossed. Undo reverses the tasks but
+  // not the unlock — deliberate: achievements are permanent by design (see the
+  // note in XP.ts), and revoking one is a worse experience than granting it a
+  // few minutes early.
+  checkAchievements(context.id).catch(() => {});
 
   logEvent({
     name: "catchup_used",

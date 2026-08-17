@@ -139,18 +139,117 @@ function isUnavailable(item: YtPlaylistItem): boolean {
   );
 }
 
+function unescapeXml(s: string): string {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+}
+
 /**
- * Import a YouTube playlist as a Curriculum.
- *
- * @param playlistId - The YouTube playlist ID (from `list=` query parameter).
- * @param channelName - Optional: pre-fetched channel name for attribution.
- * @param goal - What the user wants out of the course (drives optional marking).
- * @returns { curriculum, notice } — notice is set when videos were skipped.
+ * Fallback importer using YouTube's public playlist RSS Atom feed.
+ * Requires no API key or quota and works for all public YouTube playlists.
  */
-export async function importYouTubePlaylist(
+export async function importYouTubePlaylistViaFeed(
   playlistId: string,
   channelName?: string,
-  goal?: string
+  _goal?: string
+): Promise<{ curriculum: Curriculum; notice?: string }> {
+  const feedUrl = `https://www.youtube.com/feeds/videos.xml?playlist_id=${encodeURIComponent(playlistId)}`;
+  const res = await fetch(feedUrl, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      Accept: "application/xml, text/xml, */*",
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`YouTube RSS feed returned status ${res.status}`);
+  }
+
+  const xml = await res.text();
+  const titleMatch = xml.match(/<title>([^<]+)<\/title>/);
+  const authorMatch = xml.match(/<author>[\s\S]*?<name>([^<]+)<\/name>/);
+
+  const playlistTitle = titleMatch ? unescapeXml(titleMatch[1].trim()) : "YouTube Playlist";
+  const playlistAuthor =
+    channelName || (authorMatch ? unescapeXml(authorMatch[1].trim()) : undefined);
+
+  const entries: Array<{ videoId: string; title: string }> = [];
+  const entryRegex = /<entry>([\s\S]*?)<\/entry>/g;
+  let m: RegExpExecArray | null;
+
+  while ((m = entryRegex.exec(xml)) !== null) {
+    const entryXml = m[1];
+    const vidMatch = entryXml.match(/<yt:videoId>([^<]+)<\/yt:videoId>/);
+    const itemTitleMatch = entryXml.match(/<title>([^<]+)<\/title>/);
+    if (vidMatch && vidMatch[1]) {
+      const videoId = vidMatch[1].trim();
+      const rawTitle = itemTitleMatch ? itemTitleMatch[1].trim() : "Untitled Video";
+      if (!UNAVAILABLE_TITLES.has(rawTitle)) {
+        entries.push({
+          videoId,
+          title: unescapeXml(rawTitle),
+        });
+      }
+    }
+  }
+
+  if (entries.length === 0) {
+    const curriculum: Curriculum = {
+      provider: "youtube",
+      fidelity: "exact",
+      title: playlistTitle,
+      author: playlistAuthor,
+      sections: [],
+      fetchedAt: new Date(),
+    };
+    return {
+      curriculum,
+      notice: "This playlist appears to be empty or private.",
+    };
+  }
+
+  const items: CurriculumItem[] = entries.map((e) => ({
+    kind: "lecture" as const,
+    title: e.title,
+    url: `https://www.youtube.com/watch?v=${e.videoId}&list=${playlistId}`,
+    externalId: e.videoId,
+  }));
+
+  const section: CurriculumSection = {
+    title: playlistTitle || "Playlist",
+    items,
+  };
+
+  const curriculum: Curriculum = {
+    provider: "youtube",
+    fidelity: "exact",
+    title: playlistTitle,
+    author: playlistAuthor,
+    url: `https://www.youtube.com/playlist?list=${playlistId}`,
+    sections: [section],
+    fetchedAt: new Date(),
+  };
+
+  return {
+    curriculum,
+  };
+}
+
+/**
+ * Import a YouTube playlist via YouTube Data API v3.
+ */
+async function importYouTubePlaylistViaApi(
+  playlistId: string,
+  channelName?: string,
+  _goal?: string
 ): Promise<{ curriculum: Curriculum; notice?: string }> {
   // Pre-flight quota check (conservative: assume 4 units for a 200-item list).
   await checkQuota(4);
@@ -295,6 +394,34 @@ export async function importYouTubePlaylist(
     curriculum,
     notice: noticeParts.length > 0 ? noticeParts.join("; ") : undefined,
   };
+}
+
+/**
+ * Import a YouTube playlist as a Curriculum.
+ *
+ * @param playlistId - The YouTube playlist ID (from `list=` query parameter).
+ * @param channelName - Optional: pre-fetched channel name for attribution.
+ * @param goal - What the user wants out of the course (drives optional marking).
+ * @returns { curriculum, notice } — notice is set when videos were skipped.
+ */
+export async function importYouTubePlaylist(
+  playlistId: string,
+  channelName?: string,
+  goal?: string
+): Promise<{ curriculum: Curriculum; notice?: string }> {
+  if (process.env.YOUTUBE_API_KEY) {
+    try {
+      return await importYouTubePlaylistViaApi(playlistId, channelName, goal);
+    } catch (err) {
+      if (err instanceof YoutubeQuotaExhaustedError) {
+        throw err;
+      }
+      logError("importYouTubePlaylist:api_fallback_to_feed", err);
+      return await importYouTubePlaylistViaFeed(playlistId, channelName, goal);
+    }
+  }
+
+  return await importYouTubePlaylistViaFeed(playlistId, channelName, goal);
 }
 
 /**

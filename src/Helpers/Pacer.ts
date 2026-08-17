@@ -127,6 +127,13 @@ function addDays(date: Date, n: number): Date {
 const SESSION_OVERFLOW_FACTOR = 1.2;
 
 /**
+ * A session budget below this is treated as a bad input rather than an
+ * instruction. Zero would give every item its own day, turning a 40-video
+ * playlist into a 40-week plan — a worse answer than ignoring the number.
+ */
+const MIN_SESSION_MINUTES = 10;
+
+/**
  * Pack items from `items` into sessions, respecting `sessionSeconds` budget and
  * `maxTasksPerDay`. Returns groups of items per session.
  *
@@ -135,14 +142,18 @@ const SESSION_OVERFLOW_FACTOR = 1.2;
  *   - An item longer than one session gets its own session (overflow allowed).
  *   - Respect `maxTasksPerDay` even when duration would allow more.
  *   - Never reorder items to fit.
+ *
+ * Generic over anything carrying a duration so the caller can pack entries that
+ * remember which section they came from — sessions span section boundaries, so
+ * the provenance has to survive the packing.
  */
-function packIntoSessions(
-  items: CurriculumItem[],
+function packIntoSessions<T extends { durationSeconds?: number }>(
+  items: T[],
   sessionSeconds: number,
   maxTasksPerDay: number
-): CurriculumItem[][] {
-  const sessions: CurriculumItem[][] = [];
-  let current: CurriculumItem[] = [];
+): T[][] {
+  const sessions: T[][] = [];
+  let current: T[] = [];
   let currentSeconds = 0;
 
   for (const item of items) {
@@ -195,7 +206,7 @@ export function pace(input: PacingInput): PacedPlan {
     };
   }
 
-  const sessionSeconds = rhythm.sessionMinutes * 60;
+  const sessionSeconds = Math.max(rhythm.sessionMinutes || 0, MIN_SESSION_MINUTES) * 60;
   const allItems: CurriculumItem[] = curriculum.sections.flatMap((s) => s.items);
   const totalItems = allItems.length;
 
@@ -225,42 +236,58 @@ export function pace(input: PacingInput): PacedPlan {
     sections: CurriculumSection[],
     dates: Date[]
   ): { miniGoals: PacedMiniGoal[]; sessionCount: number } {
-    const miniGoals: PacedMiniGoal[] = [];
-    let dateIdx = 0;
+    // Pack across the whole curriculum, not section by section.
+    //
+    // Packing per section forces every section to start a new day, so a
+    // syllabus of twenty one-item sections becomes twenty days regardless of
+    // how long the user said their sessions are — the plan silently ignores
+    // the rhythm it was built from. Sections are milestones, not sittings;
+    // finishing one and starting the next in the same sitting is normal.
+    type Entry = {
+      item: CurriculumItem;
+      sectionIdx: number;
+      durationSeconds?: number;
+    };
 
+    const flat: Entry[] = [];
     sections.forEach((section, sectionIdx) => {
-      const sessions = packIntoSessions(
-        section.items,
-        sessionSeconds,
-        maxTasksPerDay
-      );
-
-      const tasks: PacedTask[] = [];
-      for (const sessionItems of sessions) {
-        const sessionDate = dates[dateIdx] ?? dates[dates.length - 1];
-        dateIdx++;
-
-        for (const item of sessionItems) {
-          tasks.push({
-            title: item.title,
-            dueDate: sessionDate,
-            estimatedSeconds: item.durationSeconds,
-            synthesized: item.synthesized,
-          });
-        }
-      }
-
-      if (tasks.length > 0) {
-        miniGoals.push({
-          title: section.title,
-          dueDate: tasks[tasks.length - 1].dueDate,
-          tasks,
-          sourceSectionIndex: sectionIdx,
-        });
+      for (const item of section.items) {
+        flat.push({ item, sectionIdx, durationSeconds: item.durationSeconds });
       }
     });
 
-    return { miniGoals, sessionCount: dateIdx };
+    const sessions = packIntoSessions(flat, sessionSeconds, maxTasksPerDay);
+
+    // Tasks keep curriculum order within a section because `flat` is in
+    // curriculum order and packing never reorders.
+    const bySection = new Map<number, PacedTask[]>();
+    sessions.forEach((entries, sessionIdx) => {
+      const sessionDate = dates[sessionIdx] ?? dates[dates.length - 1];
+      for (const entry of entries) {
+        const tasks = bySection.get(entry.sectionIdx) ?? [];
+        tasks.push({
+          title: entry.item.title,
+          dueDate: sessionDate,
+          estimatedSeconds: entry.item.durationSeconds,
+          synthesized: entry.item.synthesized,
+        });
+        bySection.set(entry.sectionIdx, tasks);
+      }
+    });
+
+    const miniGoals: PacedMiniGoal[] = [];
+    sections.forEach((section, sectionIdx) => {
+      const tasks = bySection.get(sectionIdx);
+      if (!tasks || tasks.length === 0) return;
+      miniGoals.push({
+        title: section.title,
+        dueDate: tasks[tasks.length - 1].dueDate,
+        tasks,
+        sourceSectionIndex: sectionIdx,
+      });
+    });
+
+    return { miniGoals, sessionCount: sessions.length };
   }
 
   const { miniGoals: firstPassGoals, sessionCount: firstPassSessions } =
@@ -305,15 +332,14 @@ export function pace(input: PacingInput): PacedPlan {
       .filter((i) => i.optional).length;
 
     if (trimmedEnd <= deadline) {
-      // Dropping optional sections saves it.
-      const weeks = Math.round(
-        (projectedEndDate.getTime() - deadline.getTime()) / (7 * 24 * 60 * 60 * 1000)
-      );
+      // Dropping the optional items saves it — so this plan is NOT late, and
+      // must not be described as late. It says what we removed and what the
+      // full version would have cost.
       return {
         miniGoals: trimmedGoals,
         sessionCount: trimmedSessions,
         projectedEndDate: trimmedEnd,
-        warning: `Finishes around ${formatDate(projectedEndDate)} at this pace — ${weeks > 0 ? `about ${weeks} week${weeks > 1 ? "s" : ""} past your deadline` : "past your deadline"}. Dropped ${optionalCount} optional section${optionalCount > 1 ? "s" : ""} to fit.`,
+        warning: `Dropped ${optionalCount} optional item${optionalCount > 1 ? "s" : ""} to hit your deadline. With everything included this would run to about ${formatDate(projectedEndDate)}.`,
       };
     }
   }
@@ -322,10 +348,14 @@ export function pace(input: PacingInput): PacedPlan {
   const overWeeks = Math.round(
     (projectedEndDate.getTime() - deadline.getTime()) / (7 * 24 * 60 * 60 * 1000)
   );
-  const neededDays = rhythm.days.length;
+  // The ordinal has to name the day they'd be ADDING — telling someone who
+  // already works three days a week to "add a third day" reads as a bug,
+  // because it is one.
+  const ORDINALS = ["", "first", "second", "third", "fourth", "fifth", "sixth", "seventh"];
+  const currentDays = rhythm.days.length;
   const suggestExtraDays =
-    neededDays < 6
-      ? ` Add a ${neededDays >= 5 ? "sixth" : neededDays >= 4 ? "fifth" : "third"} day, or move the deadline.`
+    currentDays < 6
+      ? ` Add a ${ORDINALS[currentDays + 1]} day, or move the deadline.`
       : " Move the deadline.";
 
   return {

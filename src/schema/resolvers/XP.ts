@@ -642,25 +642,37 @@ export default {
     async getAchievements(_, __, context) {
       if (!context.id) ThrowError("Please login to continue.");
 
-      const user = await User.findById(context.id)
-        .select("achievements pendingAchievements")
-        .lean();
+      const [user, stats] = await Promise.all([
+        User.findById(context.id).select("achievements pendingAchievements").lean(),
+        // Same stats checkAchievements evaluates, so the bar on screen and the
+        // unlock that fires can never disagree.
+        buildUserStats(context.id),
+      ]);
 
       const earned = new Set(user?.achievements ?? []);
       const pending = new Set(user?.pendingAchievements ?? []);
 
       return {
         success: true,
-        achievements: ACHIEVEMENTS.map((a) => ({
-          id: a.id,
-          name: a.name,
-          description: a.description,
-          icon: a.icon,
-          category: a.category,
-          rarity: a.rarity,
-          earned: earned.has(a.id),
-          pending: pending.has(a.id),
-        })),
+        achievements: ACHIEVEMENTS.map((a) => {
+          const target = a.condition.threshold;
+          const isEarned = earned.has(a.id);
+          const current = stats?.[a.condition.stat] ?? 0;
+          return {
+            id: a.id,
+            name: a.name,
+            description: a.description,
+            icon: a.icon,
+            category: a.category,
+            rarity: a.rarity,
+            earned: isEarned,
+            pending: pending.has(a.id),
+            // Earned reads full even if the underlying stat has since fallen —
+            // streaks reset, badges don't.
+            progress: isEarned ? target : Math.min(current, target),
+            target,
+          };
+        }),
       };
     },
 

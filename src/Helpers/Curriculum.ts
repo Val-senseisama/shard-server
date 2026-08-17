@@ -190,6 +190,13 @@ export function applyEnrichmentDiff(
   );
 
   // Splice practice items in reverse order to keep earlier indices valid.
+  //
+  // Identity, not the `synthesized` flag, marks what WE inserted: a curriculum
+  // can arrive already carrying synthesized items (a second enrichment pass, or
+  // an adapter that adds its own practice steps). Reading the flag would count
+  // those as insertions, shifting every original index after them and silently
+  // filing the tail of the course under the wrong sections.
+  const insertedItems = new Set<CurriculumItem>();
   const sortedPractice = [...practice].sort((a, b) => b.afterIndex - a.afterIndex);
   for (const p of sortedPractice) {
     const inserted: CurriculumItem = {
@@ -198,6 +205,7 @@ export function applyEnrichmentDiff(
       durationSeconds: p.estimatedMinutes * 60,
       synthesized: true,
     };
+    insertedItems.add(inserted);
     enrichedFlat.splice(p.afterIndex + 1, 0, inserted);
   }
 
@@ -208,7 +216,7 @@ export function applyEnrichmentDiff(
   const origIndexMap: number[] = []; // origIndexMap[flatPos] = original index
   let origIdx = 0;
   for (let i = 0; i < enrichedFlat.length; i++) {
-    if (enrichedFlat[i].synthesized) {
+    if (insertedItems.has(enrichedFlat[i])) {
       origIndexMap.push(-1); // no original index
     } else {
       origIndexMap.push(origIdx++);
@@ -223,8 +231,17 @@ export function applyEnrichmentDiff(
     for (let i = 0; i < enrichedFlat.length; i++) {
       const oi = origIndexMap[i];
       if (oi === -1) {
-        // synthesized — belongs to whichever range its predecessor belongs to
-        const prevOi = origIndexMap[i - 1] ?? -1;
+        // Inserted — belongs to whichever range its predecessor belongs to.
+        // Walk back past any other insertions: two practice items can share an
+        // `afterIndex`, and asking the one in front (also an insertion, so -1)
+        // would put this one in no section at all, dropping it.
+        let prevOi = -1;
+        for (let j = i - 1; j >= 0; j--) {
+          if (origIndexMap[j] !== -1) {
+            prevOi = origIndexMap[j];
+            break;
+          }
+        }
         if (prevOi >= start && prevOi <= end) items.push(enrichedFlat[i]);
       } else if (oi >= start && oi <= end) {
         items.push(enrichedFlat[i]);

@@ -93,4 +93,75 @@ describe("Curriculum helper & Enrichment Diff", () => {
     const result = applyEnrichmentDiff(baseCurriculum, overlappingDiff);
     expect(result).toEqual(baseCurriculum);
   });
+
+  it("indexes correctly when the curriculum already contains synthesized items", () => {
+    // A second enrichment pass, or an adapter that adds its own practice steps.
+    // Inferring "we inserted this" from the `synthesized` flag would treat the
+    // pre-existing one as an insertion and shift every index after it.
+    const withSynthesized: Curriculum = {
+      ...baseCurriculum,
+      sections: [
+        {
+          title: "All Videos",
+          items: [
+            { kind: "lecture", title: "HTML Basics", durationSeconds: 600 },
+            { kind: "practice", title: "Old Practice", durationSeconds: 300, synthesized: true },
+            { kind: "lecture", title: "CSS Basics", durationSeconds: 800 },
+            { kind: "lecture", title: "JS Basics", durationSeconds: 1200 },
+          ],
+        },
+      ],
+    };
+
+    const result = applyEnrichmentDiff(withSynthesized, {
+      sections: [
+        { title: "Foundations", itemRange: [0, 1] },
+        { title: "Languages", itemRange: [2, 3] },
+      ],
+    });
+
+    expect(result.sections.map((s) => s.title)).toEqual(["Foundations", "Languages"]);
+    expect(result.sections[0].items.map((i) => i.title)).toEqual([
+      "HTML Basics",
+      "Old Practice",
+    ]);
+    expect(result.sections[1].items.map((i) => i.title)).toEqual([
+      "CSS Basics",
+      "JS Basics",
+    ]);
+    // Nothing lost: every original item survives regrouping.
+    expect(result.sections.flatMap((s) => s.items)).toHaveLength(4);
+  });
+
+  it("keeps both practice items when two share an afterIndex", () => {
+    // 20 items so the 15% practice cap allows two insertions.
+    const long: Curriculum = {
+      ...baseCurriculum,
+      sections: [
+        {
+          title: "All Videos",
+          items: Array.from({ length: 20 }, (_, i) => ({
+            kind: "lecture" as const,
+            title: `Video ${i + 1}`,
+            durationSeconds: 600,
+          })),
+        },
+      ],
+    };
+
+    const result = applyEnrichmentDiff(long, {
+      sections: [{ title: "Everything", itemRange: [0, 19] }],
+      practice: [
+        { afterIndex: 1, title: "Practice A", estimatedMinutes: 10 },
+        { afterIndex: 1, title: "Practice B", estimatedMinutes: 10 },
+      ],
+    });
+
+    const titles = result.sections.flatMap((s) => s.items.map((i) => i.title));
+    // 20 originals + 2 practice. Attributing an insertion to the item directly
+    // in front of it would leave the second one in no section at all.
+    expect(titles).toHaveLength(22);
+    expect(titles).toContain("Practice A");
+    expect(titles).toContain("Practice B");
+  });
 });

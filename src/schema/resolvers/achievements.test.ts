@@ -45,6 +45,7 @@ import MiniGoal from "../../models/MiniGoal.js";
 import Friendship from "../../models/Friendship.js";
 import { notify } from "../../Helpers/Notify.js";
 import { checkAchievements } from "./XP.js";
+import XPResolvers from "./XP.js";
 
 const USER = "507f1f77bcf86cd799439011";
 const OTHER = "507f1f77bcf86cd799439022";
@@ -185,5 +186,52 @@ describe("checkAchievements — silent grants for backfill", () => {
     // pendingAchievements is what surfaces the celebration on next app open —
     // silent must not mean invisible.
     expect(update.$push.pendingAchievements.$each).toContain("friends_1");
+  });
+});
+
+// ─── getAchievements progress ────────────────────────────────────────────────
+
+describe("getAchievements — progress toward the next unlock", () => {
+  const ctx = { id: USER };
+
+  async function fetch(overrides: any = {}, earned: string[] = []) {
+    vi.mocked(User.findById).mockReturnValue(
+      lean(baseUser({ ...overrides, achievements: earned }))
+    );
+    const res: any = await (XPResolvers as any).Query.getAchievements({}, {}, ctx);
+    return new Map<string, any>(res.achievements.map((a: any) => [a.id, a]));
+  }
+
+  it("reports the live stat against each threshold", async () => {
+    vi.mocked(Shard.find).mockReturnValue(
+      find([{ _id: "s1", owner: { toString: () => USER } }]) as any
+    );
+    vi.mocked(MiniGoal.aggregate).mockResolvedValue([{ _id: null, total: 7 }] as any);
+
+    const byId = await fetch();
+
+    // "7 / 10" is what turns a padlock into a goal.
+    expect(byId.get("tasks_10")).toMatchObject({ progress: 7, target: 10, earned: false });
+  });
+
+  it("clamps progress to the target rather than reporting 5000 / 10", async () => {
+    vi.mocked(Shard.find).mockReturnValue(
+      find([{ _id: "s1", owner: { toString: () => USER } }]) as any
+    );
+    vi.mocked(MiniGoal.aggregate).mockResolvedValue([{ _id: null, total: 5000 }] as any);
+
+    const byId = await fetch();
+
+    expect(byId.get("tasks_10").progress).toBe(10);
+  });
+
+  it("reports an earned badge as full even after the streak that won it broke", async () => {
+    // Earned streak_7, current streak since reset to 2. A trophy that reads
+    // "2 / 7" next to a tick is worse than no number at all.
+    const byId = await fetch({ currentStreak: 2 }, ["streak_7"]);
+
+    expect(byId.get("streak_7")).toMatchObject({ progress: 7, target: 7, earned: true });
+    // The unearned rung above it still shows honest progress.
+    expect(byId.get("streak_14")).toMatchObject({ progress: 2, target: 14, earned: false });
   });
 });
