@@ -269,7 +269,9 @@ export default {
         }
       }
 
-      const [, miniGoals] = await catchError(MiniGoal.find({ shardId }).sort({ createdAt: 1 }).lean());
+      const [, miniGoals] = await catchError(
+        MiniGoal.find({ shardId }).sort({ order: 1, createdAt: 1 }).lean()
+      );
 
       // Scope the context to one task when asked about one. Handing the model the
       // entire quest to answer "why is this step blocked?" buries the subject in

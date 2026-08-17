@@ -558,7 +558,10 @@ export async function createShardFromCurriculumResolver(
         dueDate: mg.dueDate,
         progress: 0,
         completed: false,
+        // Provenance and sequence start equal here and are allowed to diverge:
+        // reordering a plan changes where a section sits, not where it came from.
         sourceSectionIndex: mg.sourceSectionIndex,
+        order: mg.sourceSectionIndex,
         tasks: mg.tasks.map((t) => ({
           title: t.title,
           dueDate: t.dueDate,
@@ -609,24 +612,32 @@ export async function createShardFromCurriculumResolver(
 // ─── catchUpToTask ────────────────────────────────────────────────────────────
 
 /**
- * Resolve the curriculum-order prefix ending at (miniGoalId, taskIndex).
+ * Resolve the plan-order prefix ending at (miniGoalId, taskIndex).
  *
- * "Before" is the lexicographic pair (sourceSectionIndex, taskIndex). For
- * shards without sourceSectionIndex (non-course), fall back to createdAt ordering.
+ * "Before" is the lexicographic pair `(order, taskIndex)`, where `order` is the
+ * same field the shard screen sorts by — so the tasks the user can see above the
+ * one they tapped are exactly the tasks this completes. Shards created before
+ * `order` existed fall back to `createdAt`.
+ *
+ * Exported for its own tests: this function decides how many of someone's tasks
+ * get marked done in one go, so its definition of "before" is worth pinning.
  */
-async function resolveCatchUpPrefix(
+export async function resolveCatchUpPrefix(
   shardId: string,
   targetMiniGoalId: string,
   targetTaskIndex: number
 ): Promise<Array<{ miniGoalId: string; taskIndex: number }>> {
   const miniGoals = await MiniGoal.find({ shardId })
-    .select("_id tasks sourceSectionIndex createdAt version")
+    .select("_id tasks order createdAt version")
     .lean();
 
-  // Sort by (sourceSectionIndex, createdAt).
+  // "Before" is defined by plan order, not by which insert won the race.
+  // `order` is the same field the shard screen sorts by, so the set the user
+  // sees above the task they tapped is exactly the set that gets completed.
+  // `createdAt` still breaks ties for shards predating the backfill.
   const sorted = [...miniGoals].sort((a, b) => {
-    const ai = (a as any).sourceSectionIndex ?? Infinity;
-    const bi = (b as any).sourceSectionIndex ?? Infinity;
+    const ai = (a as any).order ?? Infinity;
+    const bi = (b as any).order ?? Infinity;
     if (ai !== bi) return ai - bi;
     return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
   });
@@ -917,12 +928,15 @@ export async function reflowScheduleResolver(
   const user = await User.findById(context.id, "timezone preferences").lean() as any;
   const timezone = user?.timezone ?? "UTC";
 
-  // Load remaining (incomplete) mini-goals in curriculum order.
+  // Load remaining (incomplete) mini-goals in plan order. The comment used to
+  // claim this ordering without a `.sort()` to back it, so a reflow could
+  // re-spread the remaining work into the wrong sequence.
   const miniGoals = await MiniGoal.find({
     shardId,
     completed: false,
   })
-    .select("_id title tasks sourceSectionIndex dueDate")
+    .select("_id title tasks order sourceSectionIndex dueDate")
+    .sort({ order: 1, createdAt: 1 })
     .lean();
 
   if (miniGoals.length === 0) {

@@ -34,7 +34,19 @@ export class YoutubeQuotaExhaustedError extends Error {
 }
 
 const YT_API_BASE = "https://www.googleapis.com/youtube/v3";
-const MAX_ITEMS = 200;
+/**
+ * Must not exceed the enrichment ceiling in `resolvers/CourseImport.ts`
+ * (`totalItems > 150` returns the curriculum unchanged).
+ *
+ * This was 200, chosen independently of that 150, and the window between them
+ * was a silent cliff: a 151–200 video playlist imported fine, skipped
+ * enrichment, and became ONE ungrouped mini-goal holding 150+ tasks — no
+ * sections, no optional items, no practice checkpoints. Importing fewer videos
+ * and grouping them properly beats importing all of them into a wall of tasks,
+ * and the caller already tells the user with a "capped at N videos (playlist
+ * has more)" notice. Raise both together or neither.
+ */
+const MAX_ITEMS = 150;
 const PAGE_SIZE = 50;
 // Budget is 10,000 units/day. Reserve 80% for imports (8,000); leave the rest
 // for the refresh sweep and other callers.

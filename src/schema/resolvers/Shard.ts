@@ -240,7 +240,7 @@ async function _scheduleShardTasks(shardId: string, userId: string) {
   if (!isOwner && !isParticipant) return { success: false, message: "You don't have access to this quest." };
 
   const [mgError, miniGoals] = await catchError(
-    MiniGoal.find({ shardId, completed: false }).sort({ createdAt: 1 })
+    MiniGoal.find({ shardId, completed: false }).sort({ order: 1, createdAt: 1 })
   );
   if (mgError || !miniGoals || miniGoals.length === 0) return { success: false, message: "No active goals found." };
 
@@ -2200,9 +2200,15 @@ export default {
       }
 
       // Fetch mini-goals directly from database
+      // Sorted, because the client renders these as "1. …, 2. …" straight from
+      // the array. Unsorted, Mongo returns natural order — which for mini-goals
+      // written by a concurrent `Promise.all` is whichever insert landed first,
+      // so an approved plan could come back with its phases shuffled.
+      // `createdAt` is the tiebreak for shards predating `order`.
       const [mgError, minigoalsList] = await catchError(
         MiniGoal.find({ shardId: id })
-          .select("_id title description progress completed tasks")
+          .select("_id title description progress completed tasks order")
+          .sort({ order: 1, createdAt: 1 })
           .lean()
       );
 

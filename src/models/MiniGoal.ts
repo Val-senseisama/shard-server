@@ -79,11 +79,28 @@ export interface MiniGoalDocument extends Document {
   resources: ResourceRef[];
   /**
    * Position of this mini-goal in the original curriculum's section list.
-   * Used by `catchUpToTask` to establish curriculum order across mini-goals —
-   * the lexicographic pair `(sourceSectionIndex, taskIndex)` defines "before".
-   * Absent on non-course shards; fall back to `createdAt` ordering there.
+   *
+   * PROVENANCE, not sequence — "which section of the course did this come from",
+   * used for drift detection and the metadata refresh. Absent on non-course
+   * shards. For ordering, read `order`: the two start equal on course shards and
+   * diverge the moment anything reorders a plan, exactly like `Shard.rhythm` vs
+   * `brief.rhythm`.
    */
   sourceSectionIndex?: number;
+  /**
+   * Position in the plan. The order the user approved, on every shard.
+   *
+   * Mini-goals are written with `Promise.all`, so insertion order is whatever
+   * the network returned first, and readers used to sort by `createdAt` (or not
+   * at all). A four-phase plan could therefore render "1. Phase Three,
+   * 2. Phase One" — and "everything before this task", which is what a catch-up
+   * means, had no stable definition to appeal to.
+   *
+   * Optional because shards created before this field existed don't have it;
+   * every reader sorts `{ order: 1, createdAt: 1 }` so those keep their old
+   * behaviour until the backfill runs.
+   */
+  order?: number;
 }
 
 const ResourceRefSchema = new Schema<ResourceRef>(
@@ -146,12 +163,16 @@ const MiniGoalSchema = new Schema<MiniGoalDocument>(
     version: { type: Number, default: 1 },
     resources: { type: [ResourceRefSchema], default: [] },
     sourceSectionIndex: Number,
+    order: Number,
   },
   { timestamps: true }
 );
 
 // Add indexes
 MiniGoalSchema.index({ shardId: 1 });
+// Every read that shows a plan or resolves "before this task" sorts by this
+// pair, so it should not be a collection scan plus an in-memory sort.
+MiniGoalSchema.index({ shardId: 1, order: 1, createdAt: 1 });
 MiniGoalSchema.index({ completed: 1 });
 MiniGoalSchema.index({ assignedTo: 1 });
 

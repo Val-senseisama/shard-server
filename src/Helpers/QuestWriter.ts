@@ -206,6 +206,10 @@ export async function writeQuest(input: WriteQuestInput): Promise<WriteQuestResu
         dueDate: miniGoalDueDate,
         progress: 0,
         completed: false,
+        // The position in the plan the user approved. These are written
+        // concurrently, so without it the only record of order is whichever
+        // insert happened to land first.
+        order: index,
         tasks,
       });
     })
