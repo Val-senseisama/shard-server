@@ -284,6 +284,11 @@ export default `#graphql
     # Support mutations
     createSupportFlag(input: CreateSupportFlagInput!): SupportFlagResponse!
     updateSupportFlag(flagId: ID!, status: String, assignedTo: ID, resolution: String): SupportFlagResponse!
+
+    # Unauthenticated. Backs the public support form on shard.app, where the
+    # sender has no account (or cannot sign in, which is often why they are
+    # writing). Creates a ticket with guestName / guestEmail and no userId.
+    createPublicSupportRequest(input: PublicSupportInput!): PublicSupportResponse!
   }
 
   # Input types
@@ -1543,6 +1548,22 @@ export default `#graphql
   }
 
   # Support types
+  input PublicSupportInput {
+    name: String!
+    email: String!
+    issueType: String!
+    title: String!
+    description: String!
+    priority: String
+  }
+
+  # Deliberately returns no ticket data. An unauthenticated caller must not be
+  # able to read back ids or confirm which addresses exist in the system.
+  type PublicSupportResponse {
+    success: Boolean!
+    message: String!
+  }
+
   input CreateSupportFlagInput {
     issueType: String!
     title: String!
@@ -1569,7 +1590,12 @@ export default `#graphql
 
   type SupportFlagWithUser {
     id: ID!
-    user: UserInfo!
+    # Nullable: guest tickets from the public form on shard.app have no account
+    # behind them. Was UserInfo! — a single guest ticket made the whole list
+    # error out under the non-null rule.
+    user: UserInfo
+    guestName: String
+    guestEmail: String
     title: String!
     issueType: String!
     priority: String!
@@ -1781,6 +1807,9 @@ export default `#graphql
   type AdminSupportFlagData {
     id: ID!
     user: AdminSupportUserInfo
+    # Present instead of user on tickets from the public form on shard.app.
+    guestName: String
+    guestEmail: String
     title: String!
     issueType: String!
     priority: String!

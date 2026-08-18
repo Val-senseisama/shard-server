@@ -723,6 +723,9 @@ export default {
                 email: f.userId.email,
               }
             : null,
+          // Guest tickets (public form on shard.app) carry these instead of user.
+          guestName: f.guestName ?? null,
+          guestEmail: f.guestEmail ?? null,
           title: f.title,
           issueType: f.issueType,
           priority: f.priority,
