@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 /**
  * Covers createPublicSupportRequest — the mutation behind the public support
- * form on shard.app. It shipped as a comment describing work to be done while
+ * form on shard.zevbii.com. It shipped as a comment describing work to be done while
  * the landing site was already posting to it, so every submission failed. These
  * tests exist so that cannot silently happen again.
  */

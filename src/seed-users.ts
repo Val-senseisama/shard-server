@@ -10,7 +10,7 @@ const seedUsers = async () => {
     const usersToSeed = [
       {
         username: "google_tester",
-        email: "google-test@shard.app",
+        email: "google-test@zevbii.com",
         password: "ShardTest2024!",
         role: "pro",
         subscriptionTier: "pro",
@@ -18,7 +18,7 @@ const seedUsers = async () => {
       },
       {
         username: "demo_admin",
-        email: "admin@shard.app",
+        email: "admin@zevbii.com",
         password: "AdminPass123!",
         role: "admin",
         subscriptionTier: "pro",
@@ -26,7 +26,7 @@ const seedUsers = async () => {
       },
       {
         username: "demo_user",
-        email: "demo@shard.app",
+        email: "demo@zevbii.com",
         password: "DemoUser123!",
         role: "user",
         subscriptionTier: "free",

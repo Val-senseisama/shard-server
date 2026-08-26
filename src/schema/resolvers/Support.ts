@@ -61,7 +61,7 @@ export default {
     },
 
     /**
-     * Create a ticket from the public support form on shard.app.
+     * Create a ticket from the public support form on shard.zevbii.com.
      *
      * Unauthenticated by design: a large share of real support mail is "I can't
      * log in", which an authenticated-only endpoint can never receive. The
@@ -124,7 +124,7 @@ export default {
         logError("createPublicSupportRequest", error);
         return {
           success: false,
-          message: "We couldn't submit that. Please try again, or email support@shard.app.",
+          message: "We couldn't submit that. Please try again, or email support@zevbii.com.",
         };
       }
 

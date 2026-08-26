@@ -164,7 +164,7 @@ export async function unfurlLink(url: string): Promise<UnfurlResult | null> {
         res = await fetch(currentUrl, {
           signal: controller.signal,
           headers: {
-            "User-Agent": "ShardBot/1.0 (link preview; +https://shard.app)",
+            "User-Agent": "ShardBot/1.0 (link preview; +https://shard.zevbii.com)",
             Accept: "text/html",
           },
           redirect: "manual",

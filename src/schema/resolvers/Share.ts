@@ -14,7 +14,38 @@ import { logEvent } from "../../Helpers/Telemetry.js";
  * across platforms and can be tuned without shipping an app build.
  */
 
-const APP_URL = process.env.SITE_URL || "https://shard.app";
+const APP_URL = process.env.SITE_URL || "https://shard.zevbii.com";
+
+/**
+ * The share link, tagged so the loop is measurable.
+ *
+ * Every card used to carry a bare `APP_URL`, so the one growth loop in the
+ * product arrived at the site indistinguishable from direct traffic — we could
+ * count cards shared but never a single visit one earned. The copy is generated
+ * here precisely so it can be tuned without an app build, and that applies to
+ * the query string as much as the sentence in front of it.
+ *
+ * Keep the source names in step with `shard/constants/links.ts` and
+ * `shard-landing/lib/links.ts`; a typo here is a silently mis-attributed
+ * channel, not an error.
+ */
+export function taggedUrl(
+  source: string,
+  campaign = "share_loop",
+  siteUrl: string = APP_URL,
+): string {
+  // Railway's SITE_URL is set by hand, so a trailing slash is a question of when
+  // rather than if — and `https://x.com//?utm...` is a different page to Next.
+  const base = siteUrl.replace(/\/+$/, "");
+  const params = new URLSearchParams({
+    utm_source: source,
+    utm_medium: "social",
+    utm_campaign: campaign,
+  });
+  return `${base}/?${params.toString()}`;
+}
+
+const SHARE_CARD_URL = taggedUrl("share_card");
 
 interface CardMeta {
   shardTitle?: string;
@@ -32,7 +63,7 @@ interface CardMeta {
  * and hit level 7" means nothing to anyone who doesn't already use the app, which
  * is exactly the audience a share is for.
  */
-function renderCard(share: any): {
+export function renderCard(share: any): {
   headline: string;
   subline: string | null;
   shareText: string;
@@ -50,7 +81,7 @@ function renderCard(share: any): {
         : null;
 
     const timing = days ? ` in ${days} day${days === 1 ? "" : "s"}` : "";
-    const shareText = `I finished "${title}"${timing}. Planned it in Shard — tell it a goal, it gives you the plan.\n\n${APP_URL}`;
+    const shareText = `I finished "${title}"${timing}. Planned it in Shard — tell it a goal, it gives you the plan.\n\n${SHARE_CARD_URL}`;
 
     return { headline, subline, shareText };
   }
@@ -59,7 +90,7 @@ function renderCard(share: any): {
   return {
     headline: share.content || "Progress on Shard",
     subline: null,
-    shareText: `${share.content || "Making progress on my goals"}\n\n${APP_URL}`,
+    shareText: `${share.content || "Making progress on my goals"}\n\n${SHARE_CARD_URL}`,
   };
 }
 

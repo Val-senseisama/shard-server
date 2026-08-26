@@ -3,7 +3,7 @@ import { Schema, model, Types, Document } from "mongoose";
 export interface SupportFlagDocument extends Document {
   /**
    * The account that raised the ticket. Optional: the public support form on
-   * shard.app submits without a session, and those tickets carry guestName /
+   * shard.zevbii.com submits without a session, and those tickets carry guestName /
    * guestEmail instead. Anything reading this field must handle null — see the
    * mappers in resolvers/Support.ts and resolvers/Admin.ts.
    */

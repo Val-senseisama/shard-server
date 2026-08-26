@@ -285,7 +285,7 @@ export default `#graphql
     createSupportFlag(input: CreateSupportFlagInput!): SupportFlagResponse!
     updateSupportFlag(flagId: ID!, status: String, assignedTo: ID, resolution: String): SupportFlagResponse!
 
-    # Unauthenticated. Backs the public support form on shard.app, where the
+    # Unauthenticated. Backs the public support form on shard.zevbii.com, where the
     # sender has no account (or cannot sign in, which is often why they are
     # writing). Creates a ticket with guestName / guestEmail and no userId.
     createPublicSupportRequest(input: PublicSupportInput!): PublicSupportResponse!
@@ -1590,7 +1590,7 @@ export default `#graphql
 
   type SupportFlagWithUser {
     id: ID!
-    # Nullable: guest tickets from the public form on shard.app have no account
+    # Nullable: guest tickets from the public form on shard.zevbii.com have no account
     # behind them. Was UserInfo! — a single guest ticket made the whole list
     # error out under the non-null rule.
     user: UserInfo
@@ -1807,7 +1807,7 @@ export default `#graphql
   type AdminSupportFlagData {
     id: ID!
     user: AdminSupportUserInfo
-    # Present instead of user on tickets from the public form on shard.app.
+    # Present instead of user on tickets from the public form on shard.zevbii.com.
     guestName: String
     guestEmail: String
     title: String!
